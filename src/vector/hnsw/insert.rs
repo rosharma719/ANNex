@@ -154,10 +154,7 @@ impl HNSWIndex {
                             if n == idx {
                                 return 0.0;
                             }
-                            let dst_slice = self.vector_slice(n);
-                            let dot: f32 =
-                                src.iter().zip(dst_slice.iter()).map(|(a, b)| a * b).sum();
-                            (1.0 - dot).max(0.0)
+                            self.fast_score(&src, self.vector_slice(n))
                         })
                         .collect();
                     *self.edge_dists_l0[idx].write() = dists;
@@ -190,10 +187,7 @@ impl HNSWIndex {
                                 if nb == n {
                                     return 0.0;
                                 }
-                                let nb_slice = self.vector_slice(nb);
-                                let dot: f32 =
-                                    n_vec.iter().zip(nb_slice.iter()).map(|(a, b)| a * b).sum();
-                                (1.0 - dot).max(0.0)
+                                self.fast_score(&n_vec, self.vector_slice(nb))
                             })
                             .collect();
                         *self.edge_dists_l0[n].write() = n_dists;
@@ -404,10 +398,7 @@ impl HNSWIndex {
                             if n == idx {
                                 return 0.0;
                             }
-                            let dst_slice = self.vector_slice(n);
-                            let dot: f32 =
-                                src.iter().zip(dst_slice.iter()).map(|(a, b)| a * b).sum();
-                            (1.0 - dot).max(0.0)
+                            self.fast_score(&src, self.vector_slice(n))
                         })
                         .collect();
                     *self.edge_dists_l0[idx].write() = dists;
@@ -438,10 +429,7 @@ impl HNSWIndex {
                                 if nb == n {
                                     return 0.0;
                                 }
-                                let nb_slice = self.vector_slice(nb);
-                                let dot: f32 =
-                                    n_vec.iter().zip(nb_slice.iter()).map(|(a, b)| a * b).sum();
-                                (1.0 - dot).max(0.0)
+                                self.fast_score(&n_vec, self.vector_slice(nb))
                             })
                             .collect();
                         *self.edge_dists_l0[n].write() = n_dists;
@@ -470,7 +458,20 @@ impl HNSWIndex {
                                 .unwrap_or(Ordering::Equal)
                         });
                         let selected = self.select_diverse_neighbors(&cands, cap, use_norm, l);
-                        *self.layers[l][n].write() = selected;
+                        *self.layers[l][n].write() = selected.clone();
+                        // Keep edge_dists_l0 in sync with the post-cap neighbor list.
+                        if l == 0 && !self.edge_dists_l0.is_empty() {
+                            let dists: Vec<f32> = selected
+                                .iter()
+                                .map(|&nb| {
+                                    if nb == n {
+                                        return 0.0;
+                                    }
+                                    self.fast_score(&n_vec, self.vector_slice(nb))
+                                })
+                                .collect();
+                            *self.edge_dists_l0[n].write() = dists;
+                        }
                     }
                 }
             }
@@ -915,7 +916,21 @@ impl HNSWIndex {
         });
 
         let selected = self.select_diverse_neighbors(&candidates, cap, true, level);
-        *self.layers[level][node_idx].write() = selected;
+        *self.layers[level][node_idx].write() = selected.clone();
+        // Keep edge_dists_l0 in sync with the post-cap neighbor list.
+        if level == 0 && !self.edge_dists_l0.is_empty() {
+            let node_vec = self.vector_slice(node_idx).to_vec();
+            let dists: Vec<f32> = selected
+                .iter()
+                .map(|&nb| {
+                    if nb == node_idx {
+                        return 0.0;
+                    }
+                    self.fast_score(&node_vec, self.vector_slice(nb))
+                })
+                .collect();
+            *self.edge_dists_l0[node_idx].write() = dists;
+        }
     }
 
     fn sort_layer_neighbors(&mut self, level: usize, node_idx: usize) {
@@ -941,7 +956,21 @@ impl HNSWIndex {
             })
             .collect();
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        *self.layers[level][node_idx].write() = scored.into_iter().map(|(idx, _)| idx).collect();
+        let sorted_indices: Vec<usize> = scored.iter().map(|(idx, _)| *idx).collect();
+        *self.layers[level][node_idx].write() = sorted_indices.clone();
+        // Keep edge_dists_l0 in sync with the reordered neighbor list.
+        if level == 0 && !self.edge_dists_l0.is_empty() {
+            let dists: Vec<f32> = sorted_indices
+                .iter()
+                .map(|&nb| {
+                    if nb == node_idx {
+                        return 0.0;
+                    }
+                    self.fast_score(&node_vec, self.vector_slice(nb))
+                })
+                .collect();
+            *self.edge_dists_l0[node_idx].write() = dists;
+        }
     }
 }
 

@@ -269,7 +269,7 @@ impl HNSWIndex {
 
             let mut worst_score = scratch.result_set.peek().unwrap().0.sort_key;
             let use_ti = level == 0
-                && self.metric != DistanceMetric::Dot
+                && self.metric == DistanceMetric::Cosine // TI bound valid for cosine on pre-normalized vecs
                 && opts.use_ti_skip.unwrap_or_else(ti_skip_enabled)
                 && !self.edge_dists_l0.is_empty();
             let allow_early_exit = self.metric != DistanceMetric::Dot && !disable_early_exit();

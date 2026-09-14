@@ -186,21 +186,42 @@ impl HNSWIndex {
         let edge_dists_l0: Vec<parking_lot::RwLock<Vec<f32>>> = (0..ids.len())
             .map(|_| parking_lot::RwLock::new(Vec::new()))
             .collect();
-        // Backfill edge distances for L0 from stored vectors.
+        // Backfill edge distances for L0 from stored vectors, using the correct metric.
+        let dim = snapshot.dim;
+        let metric = snapshot.metric;
         if let Some(l0) = layers.first() {
             for (idx, nb_lock) in l0.iter().enumerate() {
                 let nb = nb_lock.read();
                 if nb.is_empty() {
                     continue;
                 }
-                let src = &vectors[idx * snapshot.dim..(idx + 1) * snapshot.dim];
+                let src = &vectors[idx * dim..(idx + 1) * dim];
                 let dists: Vec<f32> = nb
                     .iter()
                     .map(|&n| {
-                        let dst = &vectors[n * snapshot.dim..(n + 1) * snapshot.dim];
-                        // For cosine, vectors are pre-normalized; distance = 1 - dot(src, dst)
-                        let dot: f32 = src.iter().zip(dst.iter()).map(|(a, b)| a * b).sum();
-                        (1.0 - dot).max(0.0)
+                        let dst = &vectors[n * dim..(n + 1) * dim];
+                        match metric {
+                            DistanceMetric::Cosine => {
+                                // Vectors are pre-normalized; cosine distance = 1 - dot(src, dst)
+                                let dot: f32 = src.iter().zip(dst.iter()).map(|(a, b)| a * b).sum();
+                                let sim = dot.clamp(-1.0, 1.0);
+                                (1.0 - sim).max(0.0)
+                            }
+                            DistanceMetric::Euclidean => {
+                                // L2 squared distance
+                                src.iter()
+                                    .zip(dst.iter())
+                                    .map(|(a, b)| {
+                                        let d = a - b;
+                                        d * d
+                                    })
+                                    .sum::<f32>()
+                            }
+                            DistanceMetric::Dot => {
+                                // Dot product (raw similarity; TI skip is disabled for Dot anyway)
+                                src.iter().zip(dst.iter()).map(|(a, b)| a * b).sum::<f32>()
+                            }
+                        }
                     })
                     .collect();
                 *edge_dists_l0[idx].write() = dists;

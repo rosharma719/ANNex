@@ -589,16 +589,38 @@ unsafe fn dot_avx2(query: &[f32], vec: &[f32]) -> f32 {
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn dot_avx2_fma(query: &[f32], vec: &[f32]) -> f32 {
     use std::arch::x86_64::*;
-    let mut sum = _mm256_setzero_ps();
+    // 4 accumulators × 8 floats/register = 32 floats/iteration.
+    let mut s0 = _mm256_setzero_ps();
+    let mut s1 = _mm256_setzero_ps();
+    let mut s2 = _mm256_setzero_ps();
+    let mut s3 = _mm256_setzero_ps();
     let mut i = 0;
     let len = query.len().min(vec.len());
+    while i + 32 <= len {
+        let q0 = _mm256_loadu_ps(query.as_ptr().add(i));
+        let q1 = _mm256_loadu_ps(query.as_ptr().add(i + 8));
+        let q2 = _mm256_loadu_ps(query.as_ptr().add(i + 16));
+        let q3 = _mm256_loadu_ps(query.as_ptr().add(i + 24));
+        let v0 = _mm256_loadu_ps(vec.as_ptr().add(i));
+        let v1 = _mm256_loadu_ps(vec.as_ptr().add(i + 8));
+        let v2 = _mm256_loadu_ps(vec.as_ptr().add(i + 16));
+        let v3 = _mm256_loadu_ps(vec.as_ptr().add(i + 24));
+        s0 = _mm256_fmadd_ps(q0, v0, s0);
+        s1 = _mm256_fmadd_ps(q1, v1, s1);
+        s2 = _mm256_fmadd_ps(q2, v2, s2);
+        s3 = _mm256_fmadd_ps(q3, v3, s3);
+        i += 32;
+    }
     while i + 8 <= len {
         let q = _mm256_loadu_ps(query.as_ptr().add(i));
         let v = _mm256_loadu_ps(vec.as_ptr().add(i));
-        sum = _mm256_fmadd_ps(q, v, sum);
+        s0 = _mm256_fmadd_ps(q, v, s0);
         i += 8;
     }
-    let sum128 = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+    s0 = _mm256_add_ps(s0, s1);
+    s2 = _mm256_add_ps(s2, s3);
+    s0 = _mm256_add_ps(s0, s2);
+    let sum128 = _mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0, 1));
     let sum128 = _mm_hadd_ps(sum128, sum128);
     let sum128 = _mm_hadd_ps(sum128, sum128);
     let mut acc = _mm_cvtss_f32(sum128);
@@ -641,17 +663,42 @@ unsafe fn l2_avx2(query: &[f32], vec: &[f32]) -> f32 {
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn l2_avx2_fma(query: &[f32], vec: &[f32]) -> f32 {
     use std::arch::x86_64::*;
-    let mut sum = _mm256_setzero_ps();
+    let mut s0 = _mm256_setzero_ps();
+    let mut s1 = _mm256_setzero_ps();
+    let mut s2 = _mm256_setzero_ps();
+    let mut s3 = _mm256_setzero_ps();
     let mut i = 0;
     let len = query.len().min(vec.len());
+    while i + 32 <= len {
+        let q0 = _mm256_loadu_ps(query.as_ptr().add(i));
+        let q1 = _mm256_loadu_ps(query.as_ptr().add(i + 8));
+        let q2 = _mm256_loadu_ps(query.as_ptr().add(i + 16));
+        let q3 = _mm256_loadu_ps(query.as_ptr().add(i + 24));
+        let v0 = _mm256_loadu_ps(vec.as_ptr().add(i));
+        let v1 = _mm256_loadu_ps(vec.as_ptr().add(i + 8));
+        let v2 = _mm256_loadu_ps(vec.as_ptr().add(i + 16));
+        let v3 = _mm256_loadu_ps(vec.as_ptr().add(i + 24));
+        let d0 = _mm256_sub_ps(q0, v0);
+        let d1 = _mm256_sub_ps(q1, v1);
+        let d2 = _mm256_sub_ps(q2, v2);
+        let d3 = _mm256_sub_ps(q3, v3);
+        s0 = _mm256_fmadd_ps(d0, d0, s0);
+        s1 = _mm256_fmadd_ps(d1, d1, s1);
+        s2 = _mm256_fmadd_ps(d2, d2, s2);
+        s3 = _mm256_fmadd_ps(d3, d3, s3);
+        i += 32;
+    }
     while i + 8 <= len {
         let q = _mm256_loadu_ps(query.as_ptr().add(i));
         let v = _mm256_loadu_ps(vec.as_ptr().add(i));
-        let diff = _mm256_sub_ps(q, v);
-        sum = _mm256_fmadd_ps(diff, diff, sum);
+        let d = _mm256_sub_ps(q, v);
+        s0 = _mm256_fmadd_ps(d, d, s0);
         i += 8;
     }
-    let sum128 = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+    s0 = _mm256_add_ps(s0, s1);
+    s2 = _mm256_add_ps(s2, s3);
+    s0 = _mm256_add_ps(s0, s2);
+    let sum128 = _mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0, 1));
     let sum128 = _mm_hadd_ps(sum128, sum128);
     let sum128 = _mm_hadd_ps(sum128, sum128);
     let mut acc = _mm_cvtss_f32(sum128);
@@ -668,16 +715,41 @@ unsafe fn l2_avx2_fma(query: &[f32], vec: &[f32]) -> f32 {
 #[inline]
 unsafe fn dot_neon(query: &[f32], vec: &[f32]) -> f32 {
     use std::arch::aarch64::*;
-    let mut sum = vdupq_n_f32(0.0);
+    // 4 independent accumulators break the FMA latency chain.
+    // At 4 floats/register × 4 accumulators = 16 floats/iteration.
+    let mut s0 = vdupq_n_f32(0.0);
+    let mut s1 = vdupq_n_f32(0.0);
+    let mut s2 = vdupq_n_f32(0.0);
+    let mut s3 = vdupq_n_f32(0.0);
     let mut i = 0;
     let len = query.len().min(vec.len());
+    while i + 16 <= len {
+        let q0 = vld1q_f32(query.as_ptr().add(i));
+        let q1 = vld1q_f32(query.as_ptr().add(i + 4));
+        let q2 = vld1q_f32(query.as_ptr().add(i + 8));
+        let q3 = vld1q_f32(query.as_ptr().add(i + 12));
+        let v0 = vld1q_f32(vec.as_ptr().add(i));
+        let v1 = vld1q_f32(vec.as_ptr().add(i + 4));
+        let v2 = vld1q_f32(vec.as_ptr().add(i + 8));
+        let v3 = vld1q_f32(vec.as_ptr().add(i + 12));
+        s0 = vmlaq_f32(s0, q0, v0);
+        s1 = vmlaq_f32(s1, q1, v1);
+        s2 = vmlaq_f32(s2, q2, v2);
+        s3 = vmlaq_f32(s3, q3, v3);
+        i += 16;
+    }
+    // Drain remaining full NEON registers.
     while i + 4 <= len {
         let q = vld1q_f32(query.as_ptr().add(i));
         let v = vld1q_f32(vec.as_ptr().add(i));
-        sum = vmlaq_f32(sum, q, v);
+        s0 = vmlaq_f32(s0, q, v);
         i += 4;
     }
-    let mut acc = vaddvq_f32(sum);
+    // Reduce four accumulators to one.
+    s0 = vaddq_f32(s0, s1);
+    s2 = vaddq_f32(s2, s3);
+    s0 = vaddq_f32(s0, s2);
+    let mut acc = vaddvq_f32(s0);
     while i < len {
         acc += query.get_unchecked(i) * vec.get_unchecked(i);
         i += 1;
@@ -690,17 +762,42 @@ unsafe fn dot_neon(query: &[f32], vec: &[f32]) -> f32 {
 #[inline]
 unsafe fn l2_neon(query: &[f32], vec: &[f32]) -> f32 {
     use std::arch::aarch64::*;
-    let mut sum = vdupq_n_f32(0.0);
+    let mut s0 = vdupq_n_f32(0.0);
+    let mut s1 = vdupq_n_f32(0.0);
+    let mut s2 = vdupq_n_f32(0.0);
+    let mut s3 = vdupq_n_f32(0.0);
     let mut i = 0;
     let len = query.len().min(vec.len());
+    while i + 16 <= len {
+        let q0 = vld1q_f32(query.as_ptr().add(i));
+        let q1 = vld1q_f32(query.as_ptr().add(i + 4));
+        let q2 = vld1q_f32(query.as_ptr().add(i + 8));
+        let q3 = vld1q_f32(query.as_ptr().add(i + 12));
+        let v0 = vld1q_f32(vec.as_ptr().add(i));
+        let v1 = vld1q_f32(vec.as_ptr().add(i + 4));
+        let v2 = vld1q_f32(vec.as_ptr().add(i + 8));
+        let v3 = vld1q_f32(vec.as_ptr().add(i + 12));
+        let d0 = vsubq_f32(q0, v0);
+        let d1 = vsubq_f32(q1, v1);
+        let d2 = vsubq_f32(q2, v2);
+        let d3 = vsubq_f32(q3, v3);
+        s0 = vmlaq_f32(s0, d0, d0);
+        s1 = vmlaq_f32(s1, d1, d1);
+        s2 = vmlaq_f32(s2, d2, d2);
+        s3 = vmlaq_f32(s3, d3, d3);
+        i += 16;
+    }
     while i + 4 <= len {
         let q = vld1q_f32(query.as_ptr().add(i));
         let v = vld1q_f32(vec.as_ptr().add(i));
-        let diff = vsubq_f32(q, v);
-        sum = vmlaq_f32(sum, diff, diff);
+        let d = vsubq_f32(q, v);
+        s0 = vmlaq_f32(s0, d, d);
         i += 4;
     }
-    let mut acc = vaddvq_f32(sum);
+    s0 = vaddq_f32(s0, s1);
+    s2 = vaddq_f32(s2, s3);
+    s0 = vaddq_f32(s0, s2);
+    let mut acc = vaddvq_f32(s0);
     while i < len {
         let diff = query.get_unchecked(i) - vec.get_unchecked(i);
         acc += diff * diff;

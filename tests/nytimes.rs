@@ -930,7 +930,8 @@ fn nytimes_adaptive_search_sweep() {
     // Load or build the segment.
     let segment = if Path::new(&harness.snapshot.persist_path).exists() {
         logs.log_info(&format!(
-            "💾 Loading snapshot from {} ...", harness.snapshot.persist_path
+            "💾 Loading snapshot from {} ...",
+            harness.snapshot.persist_path
         ));
         let (seg, _) = Segment::load_from_path_with_metadata(&harness.snapshot.persist_path)
             .expect("failed to load snapshot");
@@ -948,7 +949,8 @@ fn nytimes_adaptive_search_sweep() {
             dim,
         ));
         seg.hnsw_mut().set_m0(harness.build.m0);
-        seg.hnsw_mut().set_stored_cap_l0(harness.build.stored_cap_l0);
+        seg.hnsw_mut()
+            .set_stored_cap_l0(harness.build.stored_cap_l0);
         seg.hnsw_mut().set_ef_construct(harness.search.ef_construct);
         build_nytimes_segment(&mut seg, &base, &logs);
         seg.save_to_path(&harness.snapshot.persist_path).ok();
@@ -958,12 +960,18 @@ fn nytimes_adaptive_search_sweep() {
     let cfg = segment.hnsw().config_summary();
     logs.log_info(&format!(
         "index: {} vectors  M={}  M0={}  ef_construct={}  max_level={}",
-        segment.hnsw().len(), cfg.m, cfg.m0, cfg.ef_construct, cfg.current_max_level,
+        segment.hnsw().len(),
+        cfg.m,
+        cfg.m0,
+        cfg.ef_construct,
+        cfg.current_max_level,
     ));
     logs.log_info(&format!("queries: {}  top_k: {}\n", num_queries, top_k));
 
     // Helper: run a config over all queries, return (recall, avg_ms, p50_ms, p90_ms, p99_ms).
-    let run_config = |segment: &Segment, opts: &SearchRuntimeOptions| -> (f64, f64, f64, f64, f64) {
+    let run_config = |segment: &Segment,
+                      opts: &SearchRuntimeOptions|
+     -> (f64, f64, f64, f64, f64) {
         let mut hits = 0usize;
         let mut total_targets = 0usize;
         let mut latencies: Vec<f64> = Vec::with_capacity(num_queries);
@@ -987,15 +995,27 @@ fn nytimes_adaptive_search_sweep() {
     };
 
     // ── Baseline EF sweep ─────────────────────────────────────────────────
-    println!("{:<36} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "config", "recall", "avg_ms", "p50_ms", "p90_ms", "p99_ms");
+    println!(
+        "{:<36} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "config", "recall", "avg_ms", "p50_ms", "p90_ms", "p99_ms"
+    );
     println!("{}", "─".repeat(80));
 
     for &ef in &[32usize, 64, 128, 256] {
-        let opts = SearchRuntimeOptions { ef_search: Some(ef), ..Default::default() };
+        let opts = SearchRuntimeOptions {
+            ef_search: Some(ef),
+            ..Default::default()
+        };
         let (recall, avg_ms, p50, p90, p99) = run_config(&segment, &opts);
-        println!("{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
-            format!("plain ef={ef}"), recall, avg_ms, p50, p90, p99);
+        println!(
+            "{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
+            format!("plain ef={ef}"),
+            recall,
+            avg_ms,
+            p50,
+            p90,
+            p99
+        );
     }
 
     println!();
@@ -1008,8 +1028,15 @@ fn nytimes_adaptive_search_sweep() {
             ..Default::default()
         };
         let (recall, avg_ms, p50, p90, p99) = run_config(&segment, &opts);
-        println!("{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
-            format!("ef=64 seeds={seeds}"), recall, avg_ms, p50, p90, p99);
+        println!(
+            "{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
+            format!("ef=64 seeds={seeds}"),
+            recall,
+            avg_ms,
+            p50,
+            p90,
+            p99
+        );
     }
 
     println!();
@@ -1026,15 +1053,33 @@ fn nytimes_adaptive_search_sweep() {
         };
         let (recall, avg_ms, p50, p90, p99) = run_config(&segment, &opts);
         // Count trigger rate in a separate pass (cheap).
-        let triggered: usize = queries.iter().take(num_queries).map(|q| {
-            let base_opts = SearchRuntimeOptions { ef_search: Some(32), ..Default::default() };
-            let res = segment.search_with_options(q, top_k, &base_opts).unwrap();
-            if res.first().map(|r| r.sort_key).unwrap_or(0.0) > threshold { 1 } else { 0 }
-        }).sum();
-        println!("{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}  triggered={}/{}",
+        let triggered: usize = queries
+            .iter()
+            .take(num_queries)
+            .map(|q| {
+                let base_opts = SearchRuntimeOptions {
+                    ef_search: Some(32),
+                    ..Default::default()
+                };
+                let res = segment.search_with_options(q, top_k, &base_opts).unwrap();
+                if res.first().map(|r| r.sort_key).unwrap_or(0.0) > threshold {
+                    1
+                } else {
+                    0
+                }
+            })
+            .sum();
+        println!(
+            "{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}  triggered={}/{}",
             format!("adapt 32→128 t={threshold:.2}"),
-            recall, avg_ms, p50, p90, p99,
-            triggered, num_queries);
+            recall,
+            avg_ms,
+            p50,
+            p90,
+            p99,
+            triggered,
+            num_queries
+        );
     }
 
     println!();
@@ -1048,8 +1093,10 @@ fn nytimes_adaptive_search_sweep() {
             ..Default::default()
         };
         let (recall, avg_ms, p50, p90, p99) = run_config(&segment, &opts);
-        println!("{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
-            "adapt 64→256 t=0.40", recall, avg_ms, p50, p90, p99);
+        println!(
+            "{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
+            "adapt 64→256 t=0.40", recall, avg_ms, p50, p90, p99
+        );
     }
 
     // ── Combined: seeds=3 + adaptive 32→128 t=0.45 ───────────────────────
@@ -1062,8 +1109,10 @@ fn nytimes_adaptive_search_sweep() {
             ..Default::default()
         };
         let (recall, avg_ms, p50, p90, p99) = run_config(&segment, &opts);
-        println!("{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
-            "seeds=3 + adapt 32→128 t=0.45", recall, avg_ms, p50, p90, p99);
+        println!(
+            "{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
+            "seeds=3 + adapt 32→128 t=0.45", recall, avg_ms, p50, p90, p99
+        );
     }
 
     // Make sure the segment is not dropped while closures reference it.

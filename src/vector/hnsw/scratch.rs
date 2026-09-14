@@ -7,8 +7,8 @@ use super::types::{NodeCandidate, NodeResult, NodeRoutingEntry};
 const FILTER_MASK_CACHE_CAP: usize = 64;
 
 pub(crate) struct SearchScratch {
-    pub(crate) visited_epoch: Vec<u32>,
-    pub(crate) epoch: u32,
+    pub(crate) visited_epoch: Vec<u8>,
+    pub(crate) epoch: u8,
     pub(crate) candidate_queue: BinaryHeap<NodeCandidate>,
     pub(crate) result_set: BinaryHeap<NodeResult>,
     pub(crate) routing_pq: BinaryHeap<NodeRoutingEntry>,
@@ -61,7 +61,7 @@ impl SearchScratch {
         if self.visited_epoch.len() < len {
             self.visited_epoch.resize(len, 0);
         }
-        if self.epoch == u32::MAX {
+        if self.epoch == u8::MAX {
             self.visited_epoch.fill(0);
             self.epoch = 1;
         } else {
@@ -190,4 +190,34 @@ impl SearchScratch {
 
 thread_local! {
     pub(crate) static SEARCH_SCRATCH: RefCell<SearchScratch> = RefCell::new(SearchScratch::default());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SearchScratch;
+
+    #[test]
+    fn visited_epochs_survive_wrap_growth_and_smaller_indexes() {
+        let mut scratch = SearchScratch::default();
+        scratch.next_epoch(8);
+        assert!(scratch.mark_visited(7));
+        for _ in 0..254 {
+            scratch.next_epoch(2);
+            assert!(scratch.mark_visited(0));
+            assert!(!scratch.mark_visited(0));
+        }
+        // Clear the entire allocation on wrap, including a previous larger index.
+        scratch.next_epoch(2);
+        assert_eq!(scratch.epoch, 1);
+        assert!(scratch.mark_visited(7));
+        scratch.next_epoch(16);
+        assert!(scratch.mark_visited(15));
+        for _ in 0..512 {
+            scratch.next_epoch(16);
+            for idx in 0..16 {
+                assert!(scratch.mark_visited(idx));
+                assert!(!scratch.mark_visited(idx));
+            }
+        }
+    }
 }

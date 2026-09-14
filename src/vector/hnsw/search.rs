@@ -102,7 +102,38 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
     a
 }
 
+// Cache hints only: unsupported architectures retain identical search behavior.
+#[inline(always)]
+fn prefetch_read<T>(ptr: *const T) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: PRFM is a non-faulting cache hint; it does not dereference the pointer.
+    // Inline assembly keeps this available on stable Rust (the intrinsic is nightly).
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{addr}]", addr = in(reg) ptr,
+            options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE is baseline on x86_64 and PREFETCH is a non-faulting hint.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(ptr.cast(), std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = ptr;
+}
+
 impl HNSWIndex {
+    #[inline(always)]
+    fn prefetch_vector(&self, idx: usize) {
+        let vector = self.vector_slice(idx);
+        // Warm the beginning of the vector during batch collection. Bound each
+        // hint so short vectors are supported too; do not assume cache-line size.
+        for offset in [0, 16, 32, 48] {
+            if let Some(value) = vector.get(offset) {
+                prefetch_read(value);
+            }
+        }
+    }
+
     fn exact_scan(&self, query: &[f32], normalize_scores: bool, top_k: usize) -> Vec<ScoredPoint> {
         let dim = self.dim;
         let mut brute: Vec<ScoredPoint> = (0..self.len())
@@ -282,7 +313,12 @@ impl HNSWIndex {
                             && !rotate_neighbor_scans
                             && !stride_enabled;
                         if use_simple_scan {
-                            for &neighbor in neighbors.iter() {
+                            for (position, &neighbor) in neighbors.iter().enumerate() {
+                                if let Some(&next) = neighbors.get(position + 2)
+                                    && let Some(entry) = scratch.visited_epoch.get(next)
+                                {
+                                    prefetch_read(entry);
+                                }
                                 if self.deleted.get(neighbor).copied().unwrap_or(false)
                                     || !scratch.mark_visited(neighbor)
                                 {
@@ -290,6 +326,7 @@ impl HNSWIndex {
                                 }
                                 visited_count += 1;
 
+                                self.prefetch_vector(neighbor);
                                 batch[batch_len] = neighbor;
                                 batch_len += 1;
                                 if batch_len == BATCH {
@@ -391,6 +428,12 @@ impl HNSWIndex {
                                 let mut offset = start;
                                 let cap_hit = window >= cap;
                                 'neighbor_scan: while neighbors_examined < window {
+                                    if neighbors_examined + 2 < window {
+                                        let next = neighbors[(offset + 2 * stride) % degree];
+                                        if let Some(entry) = scratch.visited_epoch.get(next) {
+                                            prefetch_read(entry);
+                                        }
+                                    }
                                     let neighbor = neighbors[offset];
                                     neighbors_examined += 1;
                                     offset = (offset + stride) % degree;
@@ -404,6 +447,7 @@ impl HNSWIndex {
                                     }
                                     visited_count += 1;
 
+                                    self.prefetch_vector(neighbor);
                                     batch[batch_len] = neighbor;
                                     batch_len += 1;
                                     if batch_len == BATCH {

@@ -75,11 +75,16 @@ fn bench_dot_kernel_throughput() {
         let qps = NUM_QUERIES as f64 / elapsed;
         let avg_us = elapsed * 1e6 / NUM_QUERIES as f64;
         println!("  round {round}: {qps:.0} QPS  {avg_us:.1} µs/query");
-        if qps > best_qps { best_qps = qps; }
+        if qps > best_qps {
+            best_qps = qps;
+        }
     }
     println!("  best: {best_qps:.0} QPS");
 
     // Also estimate distance calls/second from QPS × avg_visited.
     println!("\nNote: at ef=64 on {N} vectors, each query visits ~1000-2000 nodes.");
-    println!("Distance calls/sec ≈ QPS × ~1500 ≈ {:.0}M/s", best_qps * 1500.0 / 1e6);
+    println!(
+        "Distance calls/sec ≈ QPS × ~1500 ≈ {:.0}M/s",
+        best_qps * 1500.0 / 1e6
+    );
 }

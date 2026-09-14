@@ -60,6 +60,11 @@ pub struct HNSWIndex {
     pub(crate) deleted: Vec<bool>,
     // Maintained on deletion and recomputed on snapshot load; keeps query setup O(1).
     pub(crate) deleted_count: usize,
+    /// Parallel to layers[0]: edge_dists_l0[idx] holds the distance from node idx to
+    /// each of its L0 neighbors, co-indexed with layers[0][idx].
+    /// Protected by the same logical lock as layers[0][idx]: always write under
+    /// layers[0][idx].write() and read under layers[0][idx].read().
+    pub(crate) edge_dists_l0: Vec<parking_lot::RwLock<Vec<f32>>>,
     pub(crate) point_to_idx: HashMap<PointId, usize>,
     pub(crate) idx_to_point: Vec<PointId>,
     pub(crate) exact_fallback_enabled: bool,
@@ -129,6 +134,7 @@ impl HNSWIndex {
             dim,
             deleted: Vec::new(),
             deleted_count: 0,
+            edge_dists_l0: Vec::new(),
             point_to_idx: HashMap::new(),
             idx_to_point: Vec::new(),
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),
@@ -265,6 +271,10 @@ impl HNSWIndex {
             if self.layers[level].len() < nodes_len {
                 self.layers[level].push(RwLock::new(Vec::with_capacity(cap)));
             }
+        }
+        while self.edge_dists_l0.len() < nodes_len {
+            self.edge_dists_l0
+                .push(parking_lot::RwLock::new(Vec::new()));
         }
     }
 
@@ -823,6 +833,8 @@ impl HNSWIndex {
         self.vectors.extend_from_slice(&vector);
         self.levels.push(level);
         self.deleted.push(false);
+        self.edge_dists_l0
+            .push(parking_lot::RwLock::new(Vec::new()));
         self.idx_to_point.push(point_id);
         self.point_to_idx.insert(point_id, idx);
         idx

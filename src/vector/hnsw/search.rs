@@ -22,7 +22,7 @@ use super::config::{
     early_exit_patience, log_neighbor_scan_state, log_unfiltered_enabled, neighbor_scan_cap,
     neighbor_scan_patience, neighbor_scan_rotate_enabled, neighbor_scan_stride_enabled,
     next_search_trace_seq, num_entry_seeds_default, search_expansion_cap_override,
-    search_expansion_multiplier, search_trace_logger, trace_every,
+    search_expansion_multiplier, search_trace_logger, ti_skip_enabled, trace_every,
 };
 use super::scratch::SEARCH_SCRATCH;
 use super::stats::{SearchLayerStats, SearchStats, UNFILTERED_SEARCH_AGG, UnfilteredSample};
@@ -268,6 +268,10 @@ impl HNSWIndex {
             }
 
             let mut worst_score = scratch.result_set.peek().unwrap().0.sort_key;
+            let use_ti = level == 0
+                && self.metric != DistanceMetric::Dot
+                && opts.use_ti_skip.unwrap_or_else(ti_skip_enabled)
+                && !self.edge_dists_l0.is_empty();
             let allow_early_exit = self.metric != DistanceMetric::Dot && !disable_early_exit();
             let patience_limit = if allow_early_exit {
                 opts.early_exit_patience.unwrap_or_else(early_exit_patience)
@@ -313,7 +317,21 @@ impl HNSWIndex {
                             && !rotate_neighbor_scans
                             && !stride_enabled;
                         if use_simple_scan {
+                            let ed_guard = if use_ti {
+                                self.edge_dists_l0.get(current.idx).map(|l| l.read())
+                            } else {
+                                None
+                            };
                             for (position, &neighbor) in neighbors.iter().enumerate() {
+                                if use_ti && scratch.result_set.len() >= ef {
+                                    if let Some(ref ed) = ed_guard {
+                                        if let Some(&edge_d) = ed.get(position) {
+                                            if current.sort_key - edge_d > worst_score {
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(&next) = neighbors.get(position + 2)
                                     && let Some(entry) = scratch.visited_epoch.get(next)
                                 {
@@ -427,6 +445,11 @@ impl HNSWIndex {
                                 let mut neighbors_examined = 0usize;
                                 let mut offset = start;
                                 let cap_hit = window >= cap;
+                                let ed_guard_complex = if use_ti {
+                                    self.edge_dists_l0.get(current.idx).map(|l| l.read())
+                                } else {
+                                    None
+                                };
                                 'neighbor_scan: while neighbors_examined < window {
                                     if neighbors_examined + 2 < window {
                                         let next = neighbors[(offset + 2 * stride) % degree];
@@ -434,9 +457,19 @@ impl HNSWIndex {
                                             prefetch_read(entry);
                                         }
                                     }
+                                    let current_offset = offset;
                                     let neighbor = neighbors[offset];
                                     neighbors_examined += 1;
                                     offset = (offset + stride) % degree;
+                                    if use_ti && scratch.result_set.len() >= ef {
+                                        if let Some(ref ed) = ed_guard_complex {
+                                            if let Some(&edge_d) = ed.get(current_offset) {
+                                                if current.sort_key - edge_d > worst_score {
+                                                    continue 'neighbor_scan;
+                                                }
+                                            }
+                                        }
+                                    }
                                     if collect_counters {
                                         adjacency_reads += 1;
                                     }

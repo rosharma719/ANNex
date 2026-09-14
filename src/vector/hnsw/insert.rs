@@ -145,7 +145,23 @@ impl HNSWIndex {
                         linked.push(n);
                     }
                 }
-                *self.layers[l][idx].write() = linked;
+                *self.layers[l][idx].write() = linked.clone();
+                if l == 0 {
+                    let src = self.vector_slice(idx).to_vec();
+                    let dists: Vec<f32> = linked
+                        .iter()
+                        .map(|&n| {
+                            if n == idx {
+                                return 0.0;
+                            }
+                            let dst_slice = self.vector_slice(n);
+                            let dot: f32 =
+                                src.iter().zip(dst_slice.iter()).map(|(a, b)| a * b).sum();
+                            (1.0 - dot).max(0.0)
+                        })
+                        .collect();
+                    *self.edge_dists_l0[idx].write() = dists;
+                }
             }
             if enforce_neighbor_caps() {
                 self.cap_layer_neighbors(l, idx);
@@ -167,6 +183,21 @@ impl HNSWIndex {
                             .unwrap_or(true)
                     });
                     nb_list.insert(pos, idx);
+                    if l == 0 {
+                        let n_dists: Vec<f32> = nb_list
+                            .iter()
+                            .map(|&nb| {
+                                if nb == n {
+                                    return 0.0;
+                                }
+                                let nb_slice = self.vector_slice(nb);
+                                let dot: f32 =
+                                    n_vec.iter().zip(nb_slice.iter()).map(|(a, b)| a * b).sum();
+                                (1.0 - dot).max(0.0)
+                            })
+                            .collect();
+                        *self.edge_dists_l0[n].write() = n_dists;
+                    }
                 }
                 if enforce_neighbor_caps() {
                     self.cap_layer_neighbors(l, n);
@@ -364,7 +395,23 @@ impl HNSWIndex {
                         linked.push(n);
                     }
                 }
-                *self.layers[l][idx].write() = linked;
+                *self.layers[l][idx].write() = linked.clone();
+                if l == 0 {
+                    let src = self.vector_slice(idx).to_vec();
+                    let dists: Vec<f32> = linked
+                        .iter()
+                        .map(|&n| {
+                            if n == idx {
+                                return 0.0;
+                            }
+                            let dst_slice = self.vector_slice(n);
+                            let dot: f32 =
+                                src.iter().zip(dst_slice.iter()).map(|(a, b)| a * b).sum();
+                            (1.0 - dot).max(0.0)
+                        })
+                        .collect();
+                    *self.edge_dists_l0[idx].write() = dists;
+                }
             }
 
             // Write back-edges into neighbors, sorted by distance from each neighbor.
@@ -384,6 +431,21 @@ impl HNSWIndex {
                             .unwrap_or(true)
                     });
                     nb_list.insert(pos, idx);
+                    if l == 0 {
+                        let n_dists: Vec<f32> = nb_list
+                            .iter()
+                            .map(|&nb| {
+                                if nb == n {
+                                    return 0.0;
+                                }
+                                let nb_slice = self.vector_slice(nb);
+                                let dot: f32 =
+                                    n_vec.iter().zip(nb_slice.iter()).map(|(a, b)| a * b).sum();
+                                (1.0 - dot).max(0.0)
+                            })
+                            .collect();
+                        *self.edge_dists_l0[n].write() = n_dists;
+                    }
                 }
                 // Apply diversity cap if enabled — only does work when caps are on.
                 if enforce_neighbor_caps() {

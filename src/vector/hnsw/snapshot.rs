@@ -183,6 +183,30 @@ impl HNSWIndex {
             }
         }
 
+        let edge_dists_l0: Vec<parking_lot::RwLock<Vec<f32>>> = (0..ids.len())
+            .map(|_| parking_lot::RwLock::new(Vec::new()))
+            .collect();
+        // Backfill edge distances for L0 from stored vectors.
+        if let Some(l0) = layers.first() {
+            for (idx, nb_lock) in l0.iter().enumerate() {
+                let nb = nb_lock.read();
+                if nb.is_empty() {
+                    continue;
+                }
+                let src = &vectors[idx * snapshot.dim..(idx + 1) * snapshot.dim];
+                let dists: Vec<f32> = nb
+                    .iter()
+                    .map(|&n| {
+                        let dst = &vectors[n * snapshot.dim..(n + 1) * snapshot.dim];
+                        // For cosine, vectors are pre-normalized; distance = 1 - dot(src, dst)
+                        let dot: f32 = src.iter().zip(dst.iter()).map(|(a, b)| a * b).sum();
+                        (1.0 - dot).max(0.0)
+                    })
+                    .collect();
+                *edge_dists_l0[idx].write() = dists;
+            }
+        }
+
         Self {
             layers,
             vectors,
@@ -202,6 +226,7 @@ impl HNSWIndex {
             dim: snapshot.dim,
             deleted_count: deleted.iter().filter(|&&flag| flag).count(),
             deleted,
+            edge_dists_l0,
             point_to_idx,
             idx_to_point: ids,
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),

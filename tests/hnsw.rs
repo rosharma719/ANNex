@@ -389,3 +389,44 @@ fn test_high_dimensional_accuracy() {
 
     assert_eq!(results[0].id, 1, "Expected ID 1 to be closest to query");
 }
+
+#[test]
+fn ti_skip_matches_baseline_recall() {
+    use annex::vector::hnsw::SearchRuntimeOptions;
+    let mut index = HNSWIndex::new(DistanceMetric::Cosine, 16, 200, 4, 8);
+    let vecs: Vec<Vec<f32>> = (0..200u64)
+        .map(|i| {
+            let mut v = vec![0.0f32; 8];
+            v[i as usize % 8] = 1.0;
+            v[(i as usize + 1) % 8] = 0.5;
+            v
+        })
+        .collect();
+    for (i, v) in vecs.iter().enumerate() {
+        index.insert(i as u64, v.clone()).unwrap();
+    }
+    let query = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let baseline_opts = SearchRuntimeOptions {
+        ef_search: Some(50),
+        use_ti_skip: Some(false),
+        ..Default::default()
+    };
+    let ti_opts = SearchRuntimeOptions {
+        ef_search: Some(50),
+        use_ti_skip: Some(true),
+        ..Default::default()
+    };
+    let baseline = index
+        .search_with_options(&query, 10, &baseline_opts)
+        .unwrap();
+    let ti_result = index.search_with_options(&query, 10, &ti_opts).unwrap();
+    // TI skip is an approximation; top-1 must match exactly.
+    assert_eq!(baseline[0].id, ti_result[0].id, "top-1 must match");
+    // At least 80% recall for the top-10 set.
+    let baseline_ids: std::collections::HashSet<_> = baseline.iter().map(|r| r.id).collect();
+    let overlap = ti_result
+        .iter()
+        .filter(|r| baseline_ids.contains(&r.id))
+        .count();
+    assert!(overlap >= 8, "TI skip recall vs baseline: {}/10", overlap);
+}

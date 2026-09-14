@@ -34,6 +34,11 @@ pub struct SearchRuntimeOptions {
     /// (lower = better) exceeds this value are re-run with `adaptive_ef_high`.
     /// Overrides `VECTORDB_ADAPTIVE_EF_SCORE_THRESHOLD`.
     pub adaptive_ef_score_threshold: Option<f32>,
+    /// Enable triangle-inequality neighbor skip at L0. When true and the index has
+    /// edge distances stored, neighbors whose TI lower bound exceeds `worst_score` are
+    /// skipped before computing `fast_score`. Not valid for Dot metric (no bounded metric).
+    /// Overrides `VECTORDB_TI_SKIP`.
+    pub use_ti_skip: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -44,6 +44,7 @@ static DIVERSITY_ALPHA: OnceLock<Option<f32>> = OnceLock::new();
 static DIVERSITY_ALPHA_LOW: OnceLock<Option<f32>> = OnceLock::new();
 static DIVERSITY_ALPHA_HIGH: OnceLock<Option<f32>> = OnceLock::new();
 static DIVERSITY_PRUNE_FLOOR: OnceLock<Option<usize>> = OnceLock::new();
+static TI_SKIP: OnceLock<bool> = OnceLock::new();
 
 fn hnsw_telemetry() -> &'static HnswTelemetryConfig {
     HNSW_TELEMETRY.get_or_init(HnswTelemetryConfig::from_env)
@@ -237,6 +238,10 @@ pub fn adaptive_ef_score_threshold_default() -> Option<f32> {
     *ADAPTIVE_EF_SCORE_THRESHOLD.get_or_init(|| {
         env_f32("VECTORDB_ADAPTIVE_EF_SCORE_THRESHOLD").filter(|v| v.is_finite() && *v > 0.0)
     })
+}
+
+pub fn ti_skip_enabled() -> bool {
+    *TI_SKIP.get_or_init(|| env_bool("VECTORDB_TI_SKIP").unwrap_or(false))
 }
 
 pub(crate) fn diversity_alpha_for_level(level: usize) -> f32 {

@@ -705,7 +705,7 @@ impl HNSWIndex {
             start: Instant::now(),
         });
 
-        let deleted_count = self.deleted.iter().filter(|d| **d).count();
+        let deleted_count = self.deleted_count();
         let collection_size = self.len().saturating_sub(deleted_count);
         let exact_scan_possible =
             self.exact_fallback_enabled && collection_size <= self.exact_fallback_threshold;
@@ -902,7 +902,7 @@ impl HNSWIndex {
             start: Instant::now(),
         });
 
-        let deleted_count = self.deleted.iter().filter(|d| **d).count();
+        let deleted_count = self.deleted_count();
         let collection_size = self.len().saturating_sub(deleted_count);
         let exact_scan_possible =
             self.exact_fallback_enabled && collection_size <= self.exact_fallback_threshold;

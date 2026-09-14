@@ -200,6 +200,7 @@ impl HNSWIndex {
             level_scale: snapshot.level_scale,
             current_max_level: snapshot.current_max_level,
             dim: snapshot.dim,
+            deleted_count: deleted.iter().filter(|&&flag| flag).count(),
             deleted,
             point_to_idx,
             idx_to_point: ids,

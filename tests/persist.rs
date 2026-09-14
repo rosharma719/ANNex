@@ -884,3 +884,27 @@ fn wal_with_deletes_and_purge_replay() -> Result<(), DBError> {
     let _ = fs::remove_file(wal_path);
     Ok(())
 }
+
+#[test]
+fn deletion_count_survives_duplicate_deletes_and_snapshot_restore() -> Result<(), DBError> {
+    let mut index = HNSWIndex::new(DistanceMetric::Euclidean, 4, 16, 4, 2);
+    for i in 0..10 {
+        index.insert(i, vec![i as f32, 1.0])?;
+    }
+    assert_eq!(index.deleted_count(), 0);
+    index.mark_deleted(3);
+    index.mark_deleted(3);
+    index.mark_deleted(99);
+    assert_eq!(index.deleted_count(), 1);
+    let mut restored = HNSWIndex::from_snapshot(index.to_snapshot());
+    assert_eq!(restored.deleted_count(), 1);
+    assert_eq!(restored.deleted_fraction(), 0.1);
+    restored.insert(10, vec![10.0, 1.0])?;
+    assert_eq!(restored.deleted_count(), 1);
+    for i in 0..11 {
+        restored.mark_deleted(i);
+    }
+    assert_eq!(restored.deleted_count(), 11);
+    assert!(restored.search(&vec![1.0, 1.0], 3)?.is_empty());
+    Ok(())
+}

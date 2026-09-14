@@ -58,6 +58,8 @@ pub struct HNSWIndex {
     pub(crate) current_max_level: usize,
     pub(crate) dim: usize,
     pub(crate) deleted: Vec<bool>,
+    // Maintained on deletion and recomputed on snapshot load; keeps query setup O(1).
+    pub(crate) deleted_count: usize,
     pub(crate) point_to_idx: HashMap<PointId, usize>,
     pub(crate) idx_to_point: Vec<PointId>,
     pub(crate) exact_fallback_enabled: bool,
@@ -126,6 +128,7 @@ impl HNSWIndex {
             current_max_level: 0,
             dim,
             deleted: Vec::new(),
+            deleted_count: 0,
             point_to_idx: HashMap::new(),
             idx_to_point: Vec::new(),
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),
@@ -191,8 +194,11 @@ impl HNSWIndex {
         let Some(idx) = self.idx_of(point_id) else {
             return;
         };
-        if let Some(flag) = self.deleted.get_mut(idx) {
+        if let Some(flag) = self.deleted.get_mut(idx)
+            && !*flag
+        {
             *flag = true;
+            self.deleted_count += 1;
         }
         if Some(idx) == self.entry_point {
             self.entry_point = self.find_highest_level_entry_point();
@@ -314,7 +320,7 @@ impl HNSWIndex {
     }
 
     pub fn deleted_count(&self) -> usize {
-        self.deleted.iter().filter(|d| **d).count()
+        self.deleted_count
     }
 
     pub fn deleted_fraction(&self) -> f64 {

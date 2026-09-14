@@ -18,6 +18,7 @@ use super::config::{
     FILTER_EDGE_LOG_CHUNK, VERBOSE, diversity_alpha_for_level, diversity_prune_floor,
     enforce_neighbor_caps, insert_trace_logger, next_insert_trace_seq, trace_every,
 };
+use super::scratch::SEARCH_SCRATCH;
 use super::stats::{FILTER_EDGE_STATS, FILTER_EDGE_TOTAL_KEYS, FilterEdgeAgg};
 use super::types::{NodeCandidate, SearchRuntimeOptions};
 
@@ -109,10 +110,14 @@ impl HNSWIndex {
         for l in (0..=level).rev() {
             let use_norm =
                 self.metric == DistanceMetric::Cosine || self.metric == DistanceMetric::Dot;
-            let opts = SearchRuntimeOptions::default();
+            // Build-time: don't apply candidate-pool expansion; ef_construct already controls quality.
+            let opts = SearchRuntimeOptions {
+                expansion_mult: Some(1),
+                ..SearchRuntimeOptions::default()
+            };
             let (mut candidates, _) = self.search_layer_unfiltered(
                 self.vector_slice(idx),
-                current_entry,
+                &[current_entry],
                 l,
                 self.ef_construct,
                 &opts,
@@ -124,58 +129,47 @@ impl HNSWIndex {
 
             // Extend the candidate pool with graph-neighbors of the top-m candidates
             // (HNSW Heuristic 2 "extend candidates", §4 of the original paper).
-            {
-                let query_vec: Vec<f32> = self.vector_slice(idx).to_vec();
-                let mut seen: HashSet<usize> = candidates.iter().map(|c| c.idx).collect();
-                seen.insert(idx);
-                let mut extra: Vec<NodeCandidate> = Vec::new();
-                let m_for_layer = if l == 0 { self.m0 } else { self.m };
-                let base_indices: Vec<usize> =
-                    candidates.iter().take(m_for_layer).map(|c| c.idx).collect();
-                for base_idx in base_indices {
-                    let nb_indices: Vec<usize> = self
-                        .layers
-                        .get(l)
-                        .and_then(|layer| layer.get(base_idx))
-                        .map(|rw| rw.read().clone())
-                        .unwrap_or_default();
-                    for nb in nb_indices {
-                        if seen.contains(&nb)
-                            || self.deleted.get(nb).copied().unwrap_or(false)
-                        {
-                            continue;
-                        }
-                        seen.insert(nb);
-                        let raw = self.fast_score(&query_vec, self.vector_slice(nb));
-                        let sort_key = if use_norm { self.normalize_score(raw) } else { raw };
-                        extra.push(NodeCandidate { idx: nb, raw_score: raw, sort_key });
-                    }
-                }
-                candidates.extend(extra);
-                Self::pre_sort_candidates(&mut candidates);
-            }
+            self.extend_candidates(&mut candidates, idx, l, use_norm);
 
             let m_for_layer = if l == 0 { self.m0 } else { self.m };
             let neighbors: Vec<usize> =
                 self.select_diverse_neighbors(&candidates, m_for_layer, use_norm, l);
+            // `neighbors` is already sorted by distance-from-idx (candidates were pre-sorted
+            // and select_diverse preserves order). The self-link has distance 0 so it belongs
+            // at position 0. Constructing the list in sorted order avoids a redundant resort.
             {
-                let mut linked = neighbors.clone();
-                if !linked.contains(&idx) {
-                    linked.push(idx);
+                let mut linked = Vec::with_capacity(neighbors.len() + 1);
+                linked.push(idx);
+                for &n in &neighbors {
+                    if n != idx {
+                        linked.push(n);
+                    }
                 }
                 *self.layers[l][idx].write() = linked;
             }
-            self.sort_layer_neighbors(l, idx);
             if enforce_neighbor_caps() {
                 self.cap_layer_neighbors(l, idx);
             }
 
             for &n in &neighbors {
-                if !self.layers[l][n].read().contains(&idx) {
-                    self.insert_sorted_neighbor(l, n, idx);
-                    if enforce_neighbor_caps() {
-                        self.cap_layer_neighbors(l, n);
-                    }
+                let Some(n_vec) = self.get_vector_by_idx(n) else {
+                    continue;
+                };
+                let n_vec = n_vec.to_vec();
+                let new_score =
+                    self.normalize_score(self.fast_score(&n_vec, self.vector_slice(idx)));
+                {
+                    let mut nb_list = self.layers[l][n].write();
+                    // idx is freshly allocated; it can't already be in nb_list.
+                    let pos = nb_list.partition_point(|&nb| {
+                        self.get_vector_by_idx(nb)
+                            .map(|v| self.normalize_score(self.fast_score(&n_vec, v)) <= new_score)
+                            .unwrap_or(true)
+                    });
+                    nb_list.insert(pos, idx);
+                }
+                if enforce_neighbor_caps() {
+                    self.cap_layer_neighbors(l, n);
                 }
             }
 
@@ -228,10 +222,7 @@ impl HNSWIndex {
     ///
     /// New nodes allocated in the same batch do not see each other as candidates during Phase 2
     /// (they have no graph edges yet), which is the standard trade-off for batch HNSW builds.
-    pub fn par_insert_batch(
-        &mut self,
-        entries: &[(PointId, Vector)],
-    ) -> Result<usize, DBError> {
+    pub fn par_insert_batch(&mut self, entries: &[(PointId, Vector)]) -> Result<usize, DBError> {
         let mut node_infos: Vec<(usize, usize)> = Vec::new(); // (idx, level)
         for (point_id, vector) in entries {
             if self.point_to_idx.contains_key(point_id) {
@@ -270,7 +261,11 @@ impl HNSWIndex {
             }
         };
         let initial_entry = first_batch_node;
-        let link_slice = if skip_first { &node_infos[1..] } else { &node_infos[..] };
+        let link_slice = if skip_first {
+            &node_infos[1..]
+        } else {
+            &node_infos[..]
+        };
 
         // Phase 2: search + link in parallel.
         // Spawn exactly `parallelism` threads regardless of batch size. Each thread processes
@@ -329,7 +324,11 @@ impl HNSWIndex {
         }
         let mut current_entry = initial_entry;
         let use_norm = self.metric == DistanceMetric::Cosine || self.metric == DistanceMetric::Dot;
-        let opts = SearchRuntimeOptions::default();
+        // Build-time: don't apply candidate-pool expansion; ef_construct already controls quality.
+        let opts = SearchRuntimeOptions {
+            expansion_mult: Some(1),
+            ..SearchRuntimeOptions::default()
+        };
 
         // Greedy descent above the insertion level.
         for l in ((level + 1)..=self.current_max_level).rev() {
@@ -340,7 +339,7 @@ impl HNSWIndex {
         for l in (0..=level).rev() {
             let (mut candidates, _) = self.search_layer_unfiltered(
                 self.vector_slice(idx),
-                current_entry,
+                &[current_entry],
                 l,
                 self.ef_construct,
                 &opts,
@@ -351,61 +350,34 @@ impl HNSWIndex {
             Self::pre_sort_candidates(&mut candidates);
 
             // Extend candidates: top-m only (matches sequential insert path).
-            {
-                let query_vec: Vec<f32> = self.vector_slice(idx).to_vec();
-                let mut seen: HashSet<usize> = candidates.iter().map(|c| c.idx).collect();
-                seen.insert(idx);
-                let mut extra: Vec<NodeCandidate> = Vec::new();
-                let m_for_layer = if l == 0 { self.m0 } else { self.m };
-                let base_indices: Vec<usize> =
-                    candidates.iter().take(m_for_layer).map(|c| c.idx).collect();
-                for base_idx in base_indices {
-                    let nb_indices: Vec<usize> = self
-                        .layers
-                        .get(l)
-                        .and_then(|layer| layer.get(base_idx))
-                        .map(|rw| rw.read().clone())
-                        .unwrap_or_default();
-                    for nb in nb_indices {
-                        if seen.contains(&nb)
-                            || self.deleted.get(nb).copied().unwrap_or(false)
-                        {
-                            continue;
-                        }
-                        seen.insert(nb);
-                        let raw = self.fast_score(&query_vec, self.vector_slice(nb));
-                        let sort_key =
-                            if use_norm { self.normalize_score(raw) } else { raw };
-                        extra.push(NodeCandidate { idx: nb, raw_score: raw, sort_key });
-                    }
-                }
-                candidates.extend(extra);
-                Self::pre_sort_candidates(&mut candidates);
-            }
+            self.extend_candidates(&mut candidates, idx, l, use_norm);
 
             let m_for_layer = if l == 0 { self.m0 } else { self.m };
-            let neighbors =
-                self.select_diverse_neighbors(&candidates, m_for_layer, use_norm, l);
+            let neighbors = self.select_diverse_neighbors(&candidates, m_for_layer, use_norm, l);
 
-            // Write new node's neighbor list.
+            // Write new node's neighbor list, sorted with self-link at position 0.
             {
-                let mut linked = neighbors.clone();
-                if !linked.contains(&idx) {
-                    linked.push(idx);
+                let mut linked = Vec::with_capacity(neighbors.len() + 1);
+                linked.push(idx);
+                for &n in &neighbors {
+                    if n != idx {
+                        linked.push(n);
+                    }
                 }
                 *self.layers[l][idx].write() = linked;
             }
 
             // Write back-edges into neighbors, sorted by distance from each neighbor.
             for &n in &neighbors {
-                if self.layers[l][n].read().contains(&idx) {
+                let Some(n_vec) = self.get_vector_by_idx(n) else {
                     continue;
-                }
-                let Some(n_vec) = self.get_vector_by_idx(n) else { continue };
+                };
                 let n_vec = n_vec.to_vec();
-                let new_score = self.normalize_score(self.fast_score(&n_vec, self.vector_slice(idx)));
+                let new_score =
+                    self.normalize_score(self.fast_score(&n_vec, self.vector_slice(idx)));
                 {
                     let mut nb_list = self.layers[l][n].write();
+                    // idx is freshly allocated; it can't already be in nb_list.
                     let pos = nb_list.partition_point(|&nb| {
                         self.get_vector_by_idx(nb)
                             .map(|v| self.normalize_score(self.fast_score(&n_vec, v)) <= new_score)
@@ -423,11 +395,17 @@ impl HNSWIndex {
                             .into_iter()
                             .map(|nb_idx| {
                                 let raw = self.fast_score(&n_vec, self.vector_slice(nb_idx));
-                                NodeCandidate { idx: nb_idx, raw_score: raw, sort_key: self.normalize_score(raw) }
+                                NodeCandidate {
+                                    idx: nb_idx,
+                                    raw_score: raw,
+                                    sort_key: self.normalize_score(raw),
+                                }
                             })
                             .collect();
                         cands.sort_by(|a, b| {
-                            a.sort_key.partial_cmp(&b.sort_key).unwrap_or(Ordering::Equal)
+                            a.sort_key
+                                .partial_cmp(&b.sort_key)
+                                .unwrap_or(Ordering::Equal)
                         });
                         let selected = self.select_diverse_neighbors(&cands, cap, use_norm, l);
                         *self.layers[l][n].write() = selected;
@@ -706,6 +684,71 @@ impl HNSWIndex {
         current
     }
 
+    /// HNSW Heuristic 2 "extend candidates": expand the candidate pool with one-hop neighbors
+    /// of the top-m candidates. Uses thread-local scratch (epoch-based seen set, reusable Vecs)
+    /// to avoid per-call allocations.
+    fn extend_candidates(
+        &self,
+        candidates: &mut Vec<NodeCandidate>,
+        idx: usize,
+        level: usize,
+        use_norm: bool,
+    ) {
+        let m_for_layer = if level == 0 { self.m0 } else { self.m };
+        let nodes_len = self.levels.len();
+        SEARCH_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            scratch.reset_extend_seen(nodes_len);
+            scratch.extend_base.clear();
+            scratch.extend_extra.clear();
+
+            for c in candidates.iter() {
+                scratch.mark_extend_seen(c.idx);
+            }
+            scratch.mark_extend_seen(idx);
+
+            for c in candidates.iter().take(m_for_layer) {
+                scratch.extend_base.push(c.idx);
+            }
+
+            let base_len = scratch.extend_base.len();
+            for i in 0..base_len {
+                let base_idx = scratch.extend_base[i];
+                scratch.extend_neighbors.clear();
+                if let Some(layer) = self.layers.get(level) {
+                    if let Some(rw) = layer.get(base_idx) {
+                        let guard = rw.read();
+                        scratch.extend_neighbors.extend_from_slice(&guard);
+                    }
+                }
+                let nb_count = scratch.extend_neighbors.len();
+                for j in 0..nb_count {
+                    let nb = scratch.extend_neighbors[j];
+                    if self.deleted.get(nb).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    if !scratch.mark_extend_seen(nb) {
+                        continue;
+                    }
+                    let raw = self.fast_score(self.vector_slice(idx), self.vector_slice(nb));
+                    let sort_key = if use_norm {
+                        self.normalize_score(raw)
+                    } else {
+                        raw
+                    };
+                    scratch.extend_extra.push(NodeCandidate {
+                        idx: nb,
+                        raw_score: raw,
+                        sort_key,
+                    });
+                }
+            }
+
+            candidates.extend(scratch.extend_extra.drain(..));
+        });
+        Self::pre_sort_candidates(candidates);
+    }
+
     /// Heuristic neighbor selector that enforces diversity (HNSW heuristic 2).
     pub(crate) fn select_diverse_neighbors(
         &self,
@@ -795,12 +838,18 @@ impl HNSWIndex {
             .map(|nb_idx| {
                 let raw = self.fast_score(&node_vec, self.vector_slice(nb_idx));
                 let sort_key = self.normalize_score(raw);
-                NodeCandidate { idx: nb_idx, raw_score: raw, sort_key }
+                NodeCandidate {
+                    idx: nb_idx,
+                    raw_score: raw,
+                    sort_key,
+                }
             })
             .collect();
 
         candidates.sort_by(|a, b| {
-            a.sort_key.partial_cmp(&b.sort_key).unwrap_or(Ordering::Equal)
+            a.sort_key
+                .partial_cmp(&b.sort_key)
+                .unwrap_or(Ordering::Equal)
         });
 
         let selected = self.select_diverse_neighbors(&candidates, cap, true, level);
@@ -831,27 +880,6 @@ impl HNSWIndex {
             .collect();
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         *self.layers[level][node_idx].write() = scored.into_iter().map(|(idx, _)| idx).collect();
-    }
-
-    fn insert_sorted_neighbor(&mut self, level: usize, node_idx: usize, new_nb: usize) {
-        let (node_vec, new_score) = {
-            let nv = match self.get_vector_by_idx(node_idx) {
-                Some(v) => v.to_vec(),
-                None => return,
-            };
-            let s = match self.get_vector_by_idx(new_nb) {
-                Some(v) => self.normalize_score(self.fast_score(&nv, v)),
-                None => return,
-            };
-            (nv, s)
-        };
-        let current: Vec<usize> = self.layers[level][node_idx].read().clone();
-        let pos = current.partition_point(|&nb| {
-            self.get_vector_by_idx(nb)
-                .map(|v| self.normalize_score(self.fast_score(&node_vec, v)) <= new_score)
-                .unwrap_or(true)
-        });
-        self.layers[level][node_idx].write().insert(pos, new_nb);
     }
 }
 

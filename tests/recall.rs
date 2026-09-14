@@ -6,12 +6,12 @@ use rand::distr::{Distribution, Uniform};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
-use vectordb::payload_storage::filters::Filter;
-use vectordb::segment::segment::Segment;
-use vectordb::utils::payload::PayloadValue;
-use vectordb::utils::types::{DistanceMetric, Vector};
-use vectordb::vector::hnsw::HNSWIndex;
-use vectordb::vector::metric::score;
+use annex::payload_storage::filters::Filter;
+use annex::segment::segment::Segment;
+use annex::utils::payload::PayloadValue;
+use annex::utils::types::{DistanceMetric, Vector};
+use annex::vector::hnsw::HNSWIndex;
+use annex::vector::metric::score;
 
 mod common;
 use common::{env_usize_first, env_usize_list_first, generate_vector_dim};
@@ -217,7 +217,7 @@ fn recall_in_place_filtered() {
         };
         let group = if i % 2 == 0 { "even" } else { "odd" };
         let score_val = i as i64;
-        let mut payload = vectordb::utils::payload::Payload::default();
+        let mut payload = annex::utils::payload::Payload::default();
         payload.set("group", PayloadValue::Str(group.to_string()));
         payload.set("score", PayloadValue::Int(score_val));
         let id = segment.insert(v.clone(), Some(payload)).unwrap();
@@ -250,7 +250,7 @@ fn recall_in_place_filtered() {
         },
         Filter::Compare {
             key: "score".into(),
-            op: vectordb::utils::payload::ScalarComparisonOp::Gte,
+            op: annex::utils::payload::ScalarComparisonOp::Gte,
             value: PayloadValue::Int(score_threshold),
         },
     ]);

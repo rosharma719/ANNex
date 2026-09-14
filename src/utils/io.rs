@@ -58,11 +58,16 @@ where
 }
 
 pub fn adler32(bytes: &[u8]) -> u32 {
+    const NMAX: usize = 5552;
     let mut a: u32 = 1;
     let mut b: u32 = 0;
-    for &byte in bytes {
-        a = (a + byte as u32) % ADLER32_MOD;
-        b = (b + a) % ADLER32_MOD;
+    for chunk in bytes.chunks(NMAX) {
+        for &byte in chunk {
+            a += byte as u32;
+            b += a;
+        }
+        a %= ADLER32_MOD;
+        b %= ADLER32_MOD;
     }
     (b << 16) | a
 }
@@ -86,9 +91,14 @@ impl<W: Write> ChecksumWriter<W> {
 impl<W: Write> Write for ChecksumWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let written = self.inner.write(buf)?;
-        for &byte in &buf[..written] {
-            self.a = (self.a + byte as u32) % ADLER32_MOD;
-            self.b = (self.b + self.a) % ADLER32_MOD;
+        const NMAX: usize = 5552;
+        for chunk in buf[..written].chunks(NMAX) {
+            for &byte in chunk {
+                self.a += byte as u32;
+                self.b += self.a;
+            }
+            self.a %= ADLER32_MOD;
+            self.b %= ADLER32_MOD;
         }
         Ok(written)
     }

@@ -8,17 +8,17 @@ use std::time::Instant;
 use serde::Serialize;
 use serde_json;
 
-use vectordb::payload_storage::filters::Filter;
-use vectordb::segment::segment::Segment;
-use vectordb::utils::env::{
+use annex::payload_storage::filters::Filter;
+use annex::segment::segment::Segment;
+use annex::utils::env::{
     env_bool_first as shared_env_bool_first, env_string,
-    env_string_first as shared_env_string_first,
-    env_usize_first as shared_env_usize_first, env_usize_list_first as shared_env_usize_list_first,
+    env_string_first as shared_env_string_first, env_usize_first as shared_env_usize_first,
+    env_usize_list_first as shared_env_usize_list_first,
 };
-use vectordb::utils::payload::{Payload, PayloadValue, ScalarComparisonOp};
-use vectordb::utils::telemetry::{HarnessTelemetryConfig, HumanLogLevel};
-use vectordb::utils::types::{DistanceMetric, Vector};
-use vectordb::vector::hnsw::HNSWIndex;
+use annex::utils::payload::{Payload, PayloadValue, ScalarComparisonOp};
+use annex::utils::telemetry::{HarnessTelemetryConfig, HumanLogLevel};
+use annex::utils::types::{DistanceMetric, Vector};
+use annex::vector::hnsw::HNSWIndex;
 
 /// Return the first present env var (by key) parsed as usize.
 pub fn env_usize_first(keys: &[&str]) -> Option<usize> {
@@ -137,6 +137,7 @@ impl TestLogConfig {
 pub struct DatasetBuildConfig {
     pub m: usize,
     pub m0: usize,
+    pub stored_cap_l0: usize,
     pub max_level: usize,
 }
 
@@ -144,13 +145,24 @@ impl DatasetBuildConfig {
     pub fn from_env(prefix: &str, default_m: usize, default_max_level: usize) -> Self {
         let m =
             env_usize_first(&["VECTORDB_M", &format!("VECTORDB_{prefix}_M")]).unwrap_or(default_m);
-        let m0 = env_usize_first(&["VECTORDB_M0", &format!("VECTORDB_{prefix}_M0")]).unwrap_or(m * 2);
+        let m0 =
+            env_usize_first(&["VECTORDB_M0", &format!("VECTORDB_{prefix}_M0")]).unwrap_or(m * 2);
+        let stored_cap_l0 = env_usize_first(&[
+            "VECTORDB_STORED_CAP_L0",
+            &format!("VECTORDB_{prefix}_STORED_CAP_L0"),
+        ])
+        .unwrap_or(m0);
         let max_level = env_usize_first(&[
             "VECTORDB_MAX_LEVEL",
             &format!("VECTORDB_{prefix}_MAX_LEVEL"),
         ])
         .unwrap_or(default_max_level);
-        Self { m, m0, max_level }
+        Self {
+            m,
+            m0,
+            stored_cap_l0,
+            max_level,
+        }
     }
 }
 

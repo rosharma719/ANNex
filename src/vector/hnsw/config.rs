@@ -37,6 +37,9 @@ static NEIGHBOR_SCAN_STRIDE: OnceLock<Option<bool>> = OnceLock::new();
 static NEIGHBOR_SCAN_PATIENCE: OnceLock<Option<usize>> = OnceLock::new();
 static NEIGHBOR_SCAN_STATE_LOGGED: OnceLock<()> = OnceLock::new();
 static ENFORCE_NEIGHBOR_CAPS: OnceLock<Option<bool>> = OnceLock::new();
+static NUM_ENTRY_SEEDS: OnceLock<Option<usize>> = OnceLock::new();
+static ADAPTIVE_EF_HIGH: OnceLock<Option<usize>> = OnceLock::new();
+static ADAPTIVE_EF_SCORE_THRESHOLD: OnceLock<Option<f32>> = OnceLock::new();
 static DIVERSITY_ALPHA: OnceLock<Option<f32>> = OnceLock::new();
 static DIVERSITY_ALPHA_LOW: OnceLock<Option<f32>> = OnceLock::new();
 static DIVERSITY_ALPHA_HIGH: OnceLock<Option<f32>> = OnceLock::new();
@@ -75,15 +78,14 @@ pub fn disable_early_exit() -> bool {
 
 pub fn search_expansion_multiplier() -> usize {
     *SEARCH_EXPANSION_MULT
-        .get_or_init(|| env_usize_nonzero("VECTORDB_SEARCH_EXPANSION_MULT").unwrap_or(1))
+        .get_or_init(|| env_usize_nonzero("VECTORDB_SEARCH_EXPANSION_MULT").unwrap_or(2))
 }
 
 pub fn search_expansion_cap_override() -> Option<usize> {
-    *SEARCH_EXPANSION_CAP
-        .get_or_init(|| {
-            env_usize("VECTORDB_SEARCH_EXPANSION_CAP")
-                .and_then(|value| if value == 0 { None } else { Some(value) })
-        })
+    *SEARCH_EXPANSION_CAP.get_or_init(|| {
+        env_usize("VECTORDB_SEARCH_EXPANSION_CAP")
+            .and_then(|value| if value == 0 { None } else { Some(value) })
+    })
 }
 
 pub fn early_exit_patience() -> usize {
@@ -92,25 +94,20 @@ pub fn early_exit_patience() -> usize {
 
 pub(crate) fn filter_expansion_cap() -> Option<usize> {
     // Specific cap for filtered search; 0 means unbounded.
-    *FILTER_EXPANSION_CAP
-        .get_or_init(|| {
-            env_usize("VECTORDB_FILTER_EXPANSION_CAP")
-                .map(|value| if value == 0 { usize::MAX } else { value })
-        })
+    *FILTER_EXPANSION_CAP.get_or_init(|| {
+        env_usize("VECTORDB_FILTER_EXPANSION_CAP")
+            .map(|value| if value == 0 { usize::MAX } else { value })
+    })
 }
 
 pub(crate) fn filter_passing_budget(m: usize) -> usize {
-    (*FILTER_PASSING_BUDGET
-        .get_or_init(|| env_usize("VECTORDB_FILTER_PASSING_BUDGET"))
-        )
-    .unwrap_or_else(|| std::cmp::max(8, m.saturating_mul(2)))
+    (*FILTER_PASSING_BUDGET.get_or_init(|| env_usize("VECTORDB_FILTER_PASSING_BUDGET")))
+        .unwrap_or_else(|| std::cmp::max(8, m.saturating_mul(2)))
 }
 
 pub(crate) fn filter_failing_budget(m: usize) -> usize {
-    (*FILTER_FAILING_BUDGET
-        .get_or_init(|| env_usize("VECTORDB_FILTER_FAILING_BUDGET"))
-        )
-    .unwrap_or_else(|| std::cmp::max(1, m / 8))
+    (*FILTER_FAILING_BUDGET.get_or_init(|| env_usize("VECTORDB_FILTER_FAILING_BUDGET")))
+        .unwrap_or_else(|| std::cmp::max(1, m / 8))
 }
 
 pub(crate) fn filter_search_logger() -> Option<&'static Mutex<BufWriter<File>>> {
@@ -152,13 +149,11 @@ pub(crate) fn exact_fallback_enabled_override() -> Option<bool> {
 }
 
 pub(crate) fn exact_fallback_threshold_override() -> Option<usize> {
-    *EXACT_FALLBACK_THRESHOLD
-        .get_or_init(|| env_usize("VECTORDB_EXACT_FALLBACK_THRESHOLD"))
+    *EXACT_FALLBACK_THRESHOLD.get_or_init(|| env_usize("VECTORDB_EXACT_FALLBACK_THRESHOLD"))
 }
 
 pub(crate) fn filter_entry_candidates() -> Option<usize> {
-    *FILTER_ENTRY_CANDIDATES
-        .get_or_init(|| env_usize_nonzero("VECTORDB_FILTER_ENTRY_CANDIDATES"))
+    *FILTER_ENTRY_CANDIDATES.get_or_init(|| env_usize_nonzero("VECTORDB_FILTER_ENTRY_CANDIDATES"))
 }
 
 pub fn neighbor_scan_cap(level: usize) -> usize {
@@ -174,11 +169,17 @@ pub fn neighbor_scan_cap(level: usize) -> usize {
     }
 }
 
+/// Seed the L0 neighbor-scan cap if it hasn't already been initialized (e.g., from env var
+/// or a prior `neighbor_scan_cap` call). Returns true if the value was applied.
+/// Use `Some(0)` or `None` to mean "no cap".
+pub fn set_neighbor_scan_cap_level0_default(cap: Option<usize>) -> bool {
+    let normalized = cap.and_then(|v| if v == 0 { None } else { Some(v) });
+    NEIGHBOR_SCAN_CAP_LEVEL0.set(normalized).is_ok()
+}
+
 pub fn neighbor_scan_patience() -> usize {
-    (*NEIGHBOR_SCAN_PATIENCE
-        .get_or_init(|| env_usize_nonzero("VECTORDB_NEIGHBOR_SCAN_PATIENCE"))
-        )
-    .unwrap_or(0)
+    (*NEIGHBOR_SCAN_PATIENCE.get_or_init(|| env_usize_nonzero("VECTORDB_NEIGHBOR_SCAN_PATIENCE")))
+        .unwrap_or(0)
 }
 
 pub fn neighbor_scan_rotate_enabled() -> bool {
@@ -219,6 +220,20 @@ pub(crate) fn log_neighbor_scan_state(expansion_mult: usize, expansion_cap: Opti
             expansion_cap.map(|v| v.to_string()).unwrap_or_else(|| "none".into())
         );
     });
+}
+
+pub fn num_entry_seeds_default() -> Option<usize> {
+    *NUM_ENTRY_SEEDS.get_or_init(|| env_usize_nonzero("VECTORDB_NUM_ENTRY_SEEDS"))
+}
+
+pub fn adaptive_ef_high_default() -> Option<usize> {
+    *ADAPTIVE_EF_HIGH.get_or_init(|| env_usize_nonzero("VECTORDB_ADAPTIVE_EF_HIGH"))
+}
+
+pub fn adaptive_ef_score_threshold_default() -> Option<f32> {
+    *ADAPTIVE_EF_SCORE_THRESHOLD.get_or_init(|| {
+        env_f32("VECTORDB_ADAPTIVE_EF_SCORE_THRESHOLD").filter(|v| v.is_finite() && *v > 0.0)
+    })
 }
 
 pub(crate) fn diversity_alpha_for_level(level: usize) -> f32 {

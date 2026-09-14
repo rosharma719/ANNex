@@ -23,6 +23,10 @@ pub struct HnswSnapshot {
     pub m: usize,
     #[serde(default)]
     pub m0: usize,
+    /// Maximum stored neighbors at L0 (excluding self-link). Defaults to m0 when 0.
+    /// Separates build-time minimum connectivity (m0) from maximum stored degree (stored_cap_l0).
+    #[serde(default)]
+    pub stored_cap_l0: usize,
     pub ef: usize,
     pub ef_construct: usize,
     pub max_level_cap: usize,
@@ -46,6 +50,7 @@ pub struct HNSWIndex {
     pub(crate) metric: DistanceMetric,
     pub(crate) m: usize,
     pub(crate) m0: usize,
+    pub(crate) stored_cap_l0: usize,
     pub(crate) ef: usize,
     pub(crate) ef_construct: usize,
     pub(crate) max_level_cap: usize,
@@ -70,6 +75,8 @@ pub struct HnswConfigSummary {
     pub metric: DistanceMetric,
     pub m: usize,
     pub m0: usize,
+    #[serde(default)]
+    pub stored_cap_l0: usize,
     pub ef: usize,
     pub ef_construct: usize,
     pub max_level_cap: usize,
@@ -111,6 +118,7 @@ impl HNSWIndex {
             metric,
             m,
             m0: m * 2,
+            stored_cap_l0: m * 2,
             ef,
             ef_construct: ef,
             max_level_cap,
@@ -223,7 +231,11 @@ impl HNSWIndex {
 
     #[inline]
     pub(crate) fn neighbor_list_capacity(&self, level: usize) -> usize {
-        if level == 0 { self.m0 + 1 } else { self.m + 1 }
+        if level == 0 {
+            self.stored_cap_l0 + 1
+        } else {
+            self.m + 1
+        }
     }
 
     pub(crate) fn ensure_level_capacity(&mut self, level: usize, nodes_len: usize) {
@@ -242,12 +254,10 @@ impl HNSWIndex {
     }
 
     pub(crate) fn extend_layers_for_new_node(&mut self, nodes_len: usize) {
-        let m = self.m;
-        let m0 = self.m0;
-        for (level, layer) in self.layers.iter_mut().enumerate() {
-            let cap = if level == 0 { m0 + 1 } else { m + 1 };
-            if layer.len() < nodes_len {
-                layer.push(RwLock::new(Vec::with_capacity(cap)));
+        for level in 0..self.layers.len() {
+            let cap = self.neighbor_list_capacity(level);
+            if self.layers[level].len() < nodes_len {
+                self.layers[level].push(RwLock::new(Vec::with_capacity(cap)));
             }
         }
     }
@@ -265,6 +275,7 @@ impl HNSWIndex {
             metric: self.metric,
             m: self.m,
             m0: self.m0,
+            stored_cap_l0: self.stored_cap_l0,
             ef: self.ef,
             ef_construct: self.ef_construct,
             max_level_cap: self.max_level_cap,
@@ -276,7 +287,11 @@ impl HNSWIndex {
         }
     }
 
-    pub fn layer_neighbors(&self, level: usize, idx: usize) -> Option<RwLockReadGuard<'_, Vec<usize>>> {
+    pub fn layer_neighbors(
+        &self,
+        level: usize,
+        idx: usize,
+    ) -> Option<RwLockReadGuard<'_, Vec<usize>>> {
         Some(self.layers.get(level)?.get(idx)?.read())
     }
 
@@ -357,6 +372,17 @@ impl HNSWIndex {
 
     pub fn set_m0(&mut self, m0: usize) {
         self.m0 = m0.max(1);
+        if self.stored_cap_l0 < self.m0 {
+            self.stored_cap_l0 = self.m0;
+        }
+    }
+
+    pub fn stored_cap_l0(&self) -> usize {
+        self.stored_cap_l0
+    }
+
+    pub fn set_stored_cap_l0(&mut self, cap: usize) {
+        self.stored_cap_l0 = cap.max(self.m0).max(1);
     }
 
     pub fn flush_unfiltered_search_stats(&self) {

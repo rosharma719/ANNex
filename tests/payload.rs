@@ -1,6 +1,6 @@
+use annex::utils::errors::DBError;
+use annex::utils::payload::*;
 use ordered_float::OrderedFloat;
-use vectordb::utils::errors::DBError;
-use vectordb::utils::payload::*;
 
 #[test]
 fn test_scalar_comparisons() {
@@ -143,8 +143,9 @@ fn test_payload_compare_field() {
     let result = payload.compare_field("x", ScalarComparisonOp::Gte, &PayloadValue::Int(40));
     assert!(result.is_ok() && result.unwrap());
 
+    // Missing fields evaluate to false rather than erroring, matching filter semantics.
     let missing = payload.compare_field("y", ScalarComparisonOp::Eq, &PayloadValue::Int(1));
-    assert!(matches!(missing, Err(DBError::InvalidPayload(_))));
+    assert!(matches!(missing, Ok(false)));
 
     let wrong_type = payload.compare_field(
         "x",

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::to_string_pretty;
 
-use vectordb::analysis::{AnalyzerConfig, analyze_snapshot};
+use annex::analysis::{AnalyzerConfig, analyze_snapshot};
 
 const DEFAULT_BASE: &str = "data/nytimes-256-angular/base.npy";
 const DEFAULT_QUERIES: &str = "data/nytimes-256-angular/queries.npy";

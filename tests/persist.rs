@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 
-use vectordb::payload_storage::filters::Filter;
-use vectordb::segment::{Segment, SnapshotConfig, start_background_snapshots};
-use vectordb::utils::errors::DBError;
-use vectordb::utils::payload::{Payload, PayloadValue};
-use vectordb::utils::types::{DistanceMetric, Vector};
-use vectordb::vector::hnsw::HNSWIndex;
+use annex::payload_storage::filters::Filter;
+use annex::segment::{Segment, SnapshotConfig, start_background_snapshots};
+use annex::utils::errors::DBError;
+use annex::utils::payload::{Payload, PayloadValue};
+use annex::utils::types::{DistanceMetric, Vector};
+use annex::vector::hnsw::HNSWIndex;
 
 fn tmp_path(prefix: &str) -> PathBuf {
     let mut rng = rand::rng();

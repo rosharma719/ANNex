@@ -1,6 +1,6 @@
-use vectordb::utils::errors::DBError;
-use vectordb::utils::types::*;
-use vectordb::vector::metric::*;
+use annex::utils::errors::DBError;
+use annex::utils::types::*;
+use annex::vector::metric::*;
 
 #[test]
 #[should_panic(expected = "Vectors must be the same length")]

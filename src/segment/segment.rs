@@ -100,6 +100,7 @@ struct HnswSnapshotV1 {
 
 impl From<HnswSnapshotV1> for HnswSnapshot {
     fn from(snapshot: HnswSnapshotV1) -> Self {
+        let m0 = snapshot.m * 2;
         Self {
             layers: snapshot.layers,
             vectors: snapshot.vectors,
@@ -107,7 +108,8 @@ impl From<HnswSnapshotV1> for HnswSnapshot {
             entry_point: snapshot.entry_point,
             metric: snapshot.metric,
             m: snapshot.m,
-            m0: snapshot.m * 2,
+            m0,
+            stored_cap_l0: m0,
             ef: snapshot.ef,
             ef_construct: snapshot.ef_construct,
             max_level_cap: snapshot.max_level_cap,
@@ -157,6 +159,9 @@ thread_local! {
 }
 
 impl Segment {
+    /// Construct a `Segment` from a pre-built HNSW index. Prefer
+    /// [`Segment::with_config`] for typical usage.
+    #[doc(hidden)]
     pub fn new(hnsw: HNSWIndex) -> Self {
         let mut segment = Self {
             hnsw,
@@ -173,6 +178,24 @@ impl Segment {
             log::warn!(target: "segment::wal", "failed to enable WAL from env: {}", err);
         }
         segment
+    }
+
+    /// Build a fresh `Segment` with an empty HNSW index configured with the
+    /// given parameters.
+    ///
+    /// * `metric`       — distance metric.
+    /// * `m`            — target neighbours per node at levels > 0.
+    /// * `ef`           — default search candidate list size.
+    /// * `max_level_cap`— maximum HNSW level.
+    /// * `dim`          — vector dimensionality.
+    pub fn with_config(
+        metric: crate::utils::types::DistanceMetric,
+        m: usize,
+        ef: usize,
+        max_level_cap: usize,
+        dim: usize,
+    ) -> Self {
+        Self::new(HNSWIndex::new(metric, m, ef, max_level_cap, dim))
     }
 
     /// Insert a new vector and optional payload. Auto-generates ID.
@@ -612,21 +635,25 @@ impl Segment {
         Ok(())
     }
 
-    /// Immutable reference to underlying HNSW index
+    /// Immutable reference to underlying HNSW index.
+    #[doc(hidden)]
     pub fn hnsw(&self) -> &HNSWIndex {
         &self.hnsw
     }
 
-    /// Immutable reference to point payloads
+    /// Immutable reference to point payloads.
+    #[doc(hidden)]
     pub fn payloads(&self) -> &HashMap<PointId, Payload> {
         &self.payloads
     }
 
     /// Mutable reference to underlying HNSW index (for tuning ef_construct in benches/tests).
+    #[doc(hidden)]
     pub fn hnsw_mut(&mut self) -> &mut HNSWIndex {
         &mut self.hnsw
     }
 
+    #[doc(hidden)]
     pub fn payload_index(&self) -> &PayloadIndex {
         &self.payload_index
     }
@@ -682,6 +709,9 @@ impl Segment {
         let cfg = self.hnsw.config_summary();
         let mut hnsw = HNSWIndex::new(cfg.metric, cfg.m, cfg.ef, cfg.max_level_cap, cfg.dim);
         hnsw.set_m0(cfg.m0);
+        if cfg.stored_cap_l0 > 0 {
+            hnsw.set_stored_cap_l0(cfg.stored_cap_l0);
+        }
         hnsw.set_ef_construct(cfg.ef_construct);
         hnsw.set_exact_fallback_enabled(cfg.exact_fallback_enabled);
         hnsw.set_exact_fallback_threshold(cfg.exact_fallback_threshold);

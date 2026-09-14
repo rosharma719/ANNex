@@ -1,6 +1,6 @@
 mod common;
+use annex::utils::types::DistanceMetric;
 use common::*;
-use vectordb::utils::types::DistanceMetric;
 
 #[test]
 #[ignore]

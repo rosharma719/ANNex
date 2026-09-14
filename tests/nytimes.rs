@@ -14,13 +14,54 @@ use common::{
     summarize_f64, summarize_usize,
 };
 
-use vectordb::segment::segment::Segment;
-use vectordb::utils::types::{DistanceMetric, Vector};
-use vectordb::vector::hnsw::HNSWIndex;
-use vectordb::vector::hnsw::config::{
+use annex::segment::segment::Segment;
+use annex::utils::types::{DistanceMetric, Vector};
+use annex::vector::hnsw::HNSWIndex;
+use annex::vector::hnsw::config::{
     disable_early_exit, early_exit_patience, neighbor_scan_cap, neighbor_scan_rotate_enabled,
     neighbor_scan_stride_enabled, search_expansion_cap_override, search_expansion_multiplier,
+    set_neighbor_scan_cap_level0_default,
 };
+
+// NYTimes benchmark defaults (matches m=16/m0=32/stored_cap=128/efc=300/scan_cap=64).
+// Each value is still overridable via env var.
+const NYT_DEFAULT_M0: usize = 32;
+const NYT_DEFAULT_STORED_CAP_L0: usize = 128;
+const NYT_DEFAULT_EF_CONSTRUCT: usize = 300;
+const NYT_DEFAULT_NEIGHBOR_SCAN_CAP_L0: usize = 64;
+
+fn default_nytimes_snapshot_path() -> String {
+    let m = common::env_usize_first(&["VECTORDB_M", "VECTORDB_NYT_M"]).unwrap_or(16);
+    let m0 = common::env_usize_first(&["VECTORDB_M0", "VECTORDB_NYT_M0"]).unwrap_or(NYT_DEFAULT_M0);
+    let stored_cap =
+        common::env_usize_first(&["VECTORDB_STORED_CAP_L0", "VECTORDB_NYT_STORED_CAP_L0"])
+            .unwrap_or(NYT_DEFAULT_STORED_CAP_L0);
+    let efc = common::env_usize_first(&["VECTORDB_EF_CONSTRUCT", "VECTORDB_NYT_EF_CONSTRUCT"])
+        .unwrap_or(NYT_DEFAULT_EF_CONSTRUCT);
+    format!(
+        "data/nytimes-256-angular/index_m{}_m0_{}_stored_{}_efc{}.bin",
+        m, m0, stored_cap, efc
+    )
+}
+
+fn apply_nytimes_build_defaults(harness: &mut DatasetHarnessConfig) {
+    // Apply NYTimes-specific defaults only when env vars didn't already set them.
+    if common::env_usize_first(&["VECTORDB_M0", "VECTORDB_NYT_M0"]).is_none() {
+        harness.build.m0 = NYT_DEFAULT_M0;
+    }
+    if common::env_usize_first(&["VECTORDB_STORED_CAP_L0", "VECTORDB_NYT_STORED_CAP_L0"]).is_none()
+    {
+        harness.build.stored_cap_l0 = NYT_DEFAULT_STORED_CAP_L0;
+    }
+    if common::env_usize_first(&["VECTORDB_EF_CONSTRUCT", "VECTORDB_NYT_EF_CONSTRUCT"]).is_none() {
+        harness.search.ef_construct = NYT_DEFAULT_EF_CONSTRUCT;
+    }
+    // Seed the L0 scan cap if the env hasn't already locked it in. This is the query-side half
+    // of the stored_cap/scan_cap split: store 128 neighbors, scan only 64 per BFS step.
+    if common::env_usize_first(&["VECTORDB_NEIGHBOR_SCAN_CAP_LEVEL0"]).is_none() {
+        let _ = set_neighbor_scan_cap_level0_default(Some(NYT_DEFAULT_NEIGHBOR_SCAN_CAP_L0));
+    }
+}
 
 fn load_vectors(path: &Path) -> Vec<Vector> {
     let arr: Array2<f32> = read_npy(path).expect("failed to read .npy");
@@ -179,12 +220,13 @@ fn run_nytimes_perf_and_recall(mode: TestMode) {
     let mut harness = DatasetHarnessConfig::from_env(
         "NYT",
         "data/nytimes-256-angular",
-        "data/nytimes-256-angular/index_m16_m0_32_efc100.bin",
+        &default_nytimes_snapshot_path(),
         &[32, 64, 128, 256, 512],
         1000,
         16,
         16,
     );
+    apply_nytimes_build_defaults(&mut harness);
     if matches!(mode, TestMode::BuildOnly) {
         harness.snapshot.use_snapshot = false;
         harness.snapshot.allow_build = true;
@@ -252,6 +294,9 @@ fn run_nytimes_perf_and_recall(mode: TestMode) {
                 segment.hnsw_mut().set_m0(harness.build.m0);
                 segment
                     .hnsw_mut()
+                    .set_stored_cap_l0(harness.build.stored_cap_l0);
+                segment
+                    .hnsw_mut()
                     .set_ef_construct(harness.search.ef_construct);
                 build_nytimes_segment(&mut segment, &base, &logs);
                 if harness.snapshot.save_snapshot {
@@ -299,6 +344,9 @@ fn run_nytimes_perf_and_recall(mode: TestMode) {
             dim,
         ));
         segment.hnsw_mut().set_m0(harness.build.m0);
+        segment
+            .hnsw_mut()
+            .set_stored_cap_l0(harness.build.stored_cap_l0);
         segment
             .hnsw_mut()
             .set_ef_construct(harness.search.ef_construct);
@@ -461,15 +509,16 @@ fn run_nytimes_perf_and_recall(mode: TestMode) {
 fn run_nytimes_recall_only() {
     let t0 = Instant::now();
     let logs = TestLogConfig::from_env();
-    let harness = DatasetHarnessConfig::from_env(
+    let mut harness = DatasetHarnessConfig::from_env(
         "NYT",
         "data/nytimes-256-angular",
-        "data/nytimes-256-angular/index_m16_m0_32_efc100.bin",
+        &default_nytimes_snapshot_path(),
         &[32, 64, 128, 256, 512],
         1000,
         16,
         16,
     );
+    apply_nytimes_build_defaults(&mut harness);
     let top_k = harness.search.top_k.unwrap_or(20);
 
     let queries_path = Path::new(&harness.data_dir).join("queries.npy");
@@ -690,15 +739,16 @@ fn run_nytimes_recall_only() {
 fn run_nytimes_qps_latency_curve() {
     let t0 = Instant::now();
     let logs = TestLogConfig::from_env();
-    let harness = DatasetHarnessConfig::from_env(
+    let mut harness = DatasetHarnessConfig::from_env(
         "NYT",
         "data/nytimes-256-angular",
-        "data/nytimes-256-angular/index_m16_m0_32_efc100.bin",
+        &default_nytimes_snapshot_path(),
         &[32, 64, 128, 256, 512],
         1000,
         16,
         16,
     );
+    apply_nytimes_build_defaults(&mut harness);
     let top_k = harness.search.top_k.unwrap_or(20);
 
     let queries_path = Path::new(&harness.data_dir).join("queries.npy");
@@ -841,4 +891,181 @@ fn run_nytimes_qps_latency_curve() {
         ));
     }
     log_peak_rss("nytimes_qps_complete");
+}
+
+/// Sweeps multi-entry seeds and adaptive EF on the NYT dataset.
+/// Builds a fresh index if no snapshot exists at the default path.
+/// Run with:
+///   VECTORDB_NYT_ALLOW_BUILD=1 cargo test --release --test nytimes \
+///     nytimes_adaptive_search_sweep -- --ignored --nocapture
+#[test]
+#[ignore]
+fn nytimes_adaptive_search_sweep() {
+    use annex::vector::hnsw::SearchRuntimeOptions;
+
+    let logs = TestLogConfig::from_env();
+    let mut harness = DatasetHarnessConfig::from_env(
+        "NYT",
+        "data/nytimes-256-angular",
+        &default_nytimes_snapshot_path(),
+        &[32, 64, 128, 256, 512],
+        1000,
+        16,
+        16,
+    );
+    apply_nytimes_build_defaults(&mut harness);
+    let top_k = harness.search.top_k.unwrap_or(20);
+    let num_queries = harness.search.queries_cap;
+
+    let base_path = Path::new(&harness.data_dir).join("base.npy");
+    let queries_path = Path::new(&harness.data_dir).join("queries.npy");
+    let truth_path = Path::new(&harness.data_dir).join("ground_truth.json");
+    ensure_exists(&queries_path);
+    ensure_exists(&truth_path);
+
+    let queries = load_vectors(&queries_path);
+    let ground_truth = load_ground_truth(&truth_path);
+    let num_queries = num_queries.min(queries.len());
+
+    // Load or build the segment.
+    let segment = if Path::new(&harness.snapshot.persist_path).exists() {
+        logs.log_info(&format!(
+            "💾 Loading snapshot from {} ...", harness.snapshot.persist_path
+        ));
+        let (seg, _) = Segment::load_from_path_with_metadata(&harness.snapshot.persist_path)
+            .expect("failed to load snapshot");
+        seg
+    } else {
+        ensure_exists(&base_path);
+        logs.log_info("🔨 No snapshot found; building index ...");
+        let base = load_vectors(&base_path);
+        let dim = base[0].len();
+        let mut seg = Segment::new(HNSWIndex::new(
+            DistanceMetric::Cosine,
+            harness.build.m,
+            512.max(top_k),
+            harness.build.max_level,
+            dim,
+        ));
+        seg.hnsw_mut().set_m0(harness.build.m0);
+        seg.hnsw_mut().set_stored_cap_l0(harness.build.stored_cap_l0);
+        seg.hnsw_mut().set_ef_construct(harness.search.ef_construct);
+        build_nytimes_segment(&mut seg, &base, &logs);
+        seg.save_to_path(&harness.snapshot.persist_path).ok();
+        seg
+    };
+
+    let cfg = segment.hnsw().config_summary();
+    logs.log_info(&format!(
+        "index: {} vectors  M={}  M0={}  ef_construct={}  max_level={}",
+        segment.hnsw().len(), cfg.m, cfg.m0, cfg.ef_construct, cfg.current_max_level,
+    ));
+    logs.log_info(&format!("queries: {}  top_k: {}\n", num_queries, top_k));
+
+    // Helper: run a config over all queries, return (recall, avg_ms, p50_ms, p90_ms, p99_ms).
+    let run_config = |segment: &Segment, opts: &SearchRuntimeOptions| -> (f64, f64, f64, f64, f64) {
+        let mut hits = 0usize;
+        let mut total_targets = 0usize;
+        let mut latencies: Vec<f64> = Vec::with_capacity(num_queries);
+        for (qi, q) in queries.iter().take(num_queries).enumerate() {
+            let t0 = Instant::now();
+            let approx = segment.search_with_options(q, top_k, opts).unwrap();
+            latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
+            let truth = &ground_truth[qi];
+            let truth_set: HashSet<u64> = truth.iter().take(top_k).map(|&id| id as u64).collect();
+            total_targets += truth_set.len();
+            hits += approx.iter().filter(|r| truth_set.contains(&r.id)).count();
+        }
+        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = latencies.len();
+        let avg_ms = latencies.iter().sum::<f64>() / n as f64;
+        let p50 = latencies[(n as f64 * 0.50) as usize];
+        let p90 = latencies[(n as f64 * 0.90) as usize];
+        let p99 = latencies[(n as f64 * 0.99) as usize];
+        let recall = hits as f64 / total_targets.max(1) as f64;
+        (recall, avg_ms, p50, p90, p99)
+    };
+
+    // ── Baseline EF sweep ─────────────────────────────────────────────────
+    println!("{:<36} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "config", "recall", "avg_ms", "p50_ms", "p90_ms", "p99_ms");
+    println!("{}", "─".repeat(80));
+
+    for &ef in &[32usize, 64, 128, 256] {
+        let opts = SearchRuntimeOptions { ef_search: Some(ef), ..Default::default() };
+        let (recall, avg_ms, p50, p90, p99) = run_config(&segment, &opts);
+        println!("{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
+            format!("plain ef={ef}"), recall, avg_ms, p50, p90, p99);
+    }
+
+    println!();
+
+    // ── Multi-entry seeds sweep at EF=64 ─────────────────────────────────
+    for seeds in [1usize, 2, 3] {
+        let opts = SearchRuntimeOptions {
+            ef_search: Some(64),
+            num_entry_seeds: Some(seeds),
+            ..Default::default()
+        };
+        let (recall, avg_ms, p50, p90, p99) = run_config(&segment, &opts);
+        println!("{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
+            format!("ef=64 seeds={seeds}"), recall, avg_ms, p50, p90, p99);
+    }
+
+    println!();
+
+    // ── Adaptive EF: base=32 → high=128 at various thresholds ────────────
+    // First measure what fraction of queries fire at each threshold.
+    let thresholds = [0.30f32, 0.40, 0.50, 0.55];
+    for threshold in thresholds {
+        let opts = SearchRuntimeOptions {
+            ef_search: Some(32),
+            adaptive_ef_high: Some(128),
+            adaptive_ef_score_threshold: Some(threshold),
+            ..Default::default()
+        };
+        let (recall, avg_ms, p50, p90, p99) = run_config(&segment, &opts);
+        // Count trigger rate in a separate pass (cheap).
+        let triggered: usize = queries.iter().take(num_queries).map(|q| {
+            let base_opts = SearchRuntimeOptions { ef_search: Some(32), ..Default::default() };
+            let res = segment.search_with_options(q, top_k, &base_opts).unwrap();
+            if res.first().map(|r| r.sort_key).unwrap_or(0.0) > threshold { 1 } else { 0 }
+        }).sum();
+        println!("{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}  triggered={}/{}",
+            format!("adapt 32→128 t={threshold:.2}"),
+            recall, avg_ms, p50, p90, p99,
+            triggered, num_queries);
+    }
+
+    println!();
+
+    // ── Adaptive EF: base=64 → high=256 at threshold=0.40 ────────────────
+    {
+        let opts = SearchRuntimeOptions {
+            ef_search: Some(64),
+            adaptive_ef_high: Some(256),
+            adaptive_ef_score_threshold: Some(0.40),
+            ..Default::default()
+        };
+        let (recall, avg_ms, p50, p90, p99) = run_config(&segment, &opts);
+        println!("{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
+            "adapt 64→256 t=0.40", recall, avg_ms, p50, p90, p99);
+    }
+
+    // ── Combined: seeds=3 + adaptive 32→128 t=0.45 ───────────────────────
+    {
+        let opts = SearchRuntimeOptions {
+            ef_search: Some(32),
+            num_entry_seeds: Some(3),
+            adaptive_ef_high: Some(128),
+            adaptive_ef_score_threshold: Some(0.45),
+            ..Default::default()
+        };
+        let (recall, avg_ms, p50, p90, p99) = run_config(&segment, &opts);
+        println!("{:<36} {:>8.4} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
+            "seeds=3 + adapt 32→128 t=0.45", recall, avg_ms, p50, p90, p99);
+    }
+
+    // Make sure the segment is not dropped while closures reference it.
+    drop(segment);
 }

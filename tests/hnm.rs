@@ -11,11 +11,11 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Value, from_slice};
 
-use vectordb::payload_storage::filters::Filter;
-use vectordb::segment::segment::Segment;
-use vectordb::utils::payload::{Payload, PayloadValue, ScalarComparisonOp};
-use vectordb::utils::types::{DistanceMetric, Vector};
-use vectordb::vector::hnsw::HNSWIndex;
+use annex::payload_storage::filters::Filter;
+use annex::segment::segment::Segment;
+use annex::utils::payload::{Payload, PayloadValue, ScalarComparisonOp};
+use annex::utils::types::{DistanceMetric, Vector};
+use annex::vector::hnsw::HNSWIndex;
 
 mod common;
 use common::{

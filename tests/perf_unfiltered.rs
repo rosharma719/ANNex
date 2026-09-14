@@ -2,10 +2,10 @@ use std::env;
 use std::time::Instant;
 
 mod common;
+use annex::segment::segment::Segment;
+use annex::utils::types::DistanceMetric;
+use annex::vector::hnsw::HNSWIndex;
 use common::{generate_vector_dim, log_peak_rss};
-use vectordb::segment::segment::Segment;
-use vectordb::utils::types::DistanceMetric;
-use vectordb::vector::hnsw::HNSWIndex;
 
 /// Heavier unfiltered search latency check to approximate production scale.
 #[test]

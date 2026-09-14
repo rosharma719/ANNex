@@ -18,9 +18,10 @@ pub(crate) struct SearchCounters {
 
 use super::HNSWIndex;
 use super::config::{
-    disable_early_exit, early_exit_patience, log_neighbor_scan_state, log_unfiltered_enabled,
-    neighbor_scan_cap, neighbor_scan_patience, neighbor_scan_rotate_enabled,
-    neighbor_scan_stride_enabled, next_search_trace_seq, search_expansion_cap_override,
+    adaptive_ef_high_default, adaptive_ef_score_threshold_default, disable_early_exit,
+    early_exit_patience, log_neighbor_scan_state, log_unfiltered_enabled, neighbor_scan_cap,
+    neighbor_scan_patience, neighbor_scan_rotate_enabled, neighbor_scan_stride_enabled,
+    next_search_trace_seq, num_entry_seeds_default, search_expansion_cap_override,
     search_expansion_multiplier, search_trace_logger, trace_every,
 };
 use super::scratch::SEARCH_SCRATCH;
@@ -136,7 +137,7 @@ impl HNSWIndex {
     pub(crate) fn search_layer_unfiltered(
         &self,
         query: &[f32],
-        entry: usize,
+        entries: &[usize],
         level: usize,
         ef: usize,
         opts: &SearchRuntimeOptions,
@@ -154,7 +155,10 @@ impl HNSWIndex {
         } else {
             None
         };
-        let expansion_mult = search_expansion_multiplier();
+        let expansion_mult = opts
+            .expansion_mult
+            .unwrap_or_else(search_expansion_multiplier)
+            .max(1);
         let expansion_cap_override = search_expansion_cap_override();
         let expansion_cap_value =
             expansion_cap_override.or_else(|| Some(ef.saturating_mul(expansion_mult).max(ef)));
@@ -177,32 +181,59 @@ impl HNSWIndex {
                 .neighbor_scan_patience
                 .unwrap_or_else(neighbor_scan_patience);
 
-            let start_entry = if self.deleted.get(entry).copied().unwrap_or(false) {
-                self.deleted
-                    .iter()
-                    .position(|deleted| !*deleted)
-                    .unwrap_or(entry)
-            } else {
-                entry
-            };
-
-            let entry_distance = self.fast_score(query, self.vector_slice(start_entry));
-            let entry_score = if normalize {
-                self.normalize_score(entry_distance)
-            } else {
-                entry_distance
-            };
-
-            let initial = NodeCandidate {
-                idx: start_entry,
-                raw_score: entry_distance,
-                sort_key: entry_score,
-            };
-
-            scratch.candidate_queue.push(initial);
-            scratch.result_set.push(NodeResult(initial));
-            if scratch.mark_visited(start_entry) {
+            // Seed all entry points into the candidate queue and result set.
+            // Deleted entries are skipped; if all are deleted, fall back to the first live node.
+            let mut first_seed_idx = 0usize;
+            let mut first_seed_score = 0.0f32;
+            for &entry in entries {
+                let start = if self.deleted.get(entry).copied().unwrap_or(false) {
+                    continue;
+                } else {
+                    entry
+                };
+                if !scratch.mark_visited(start) {
+                    continue;
+                }
                 visited_count += 1;
+                let raw = self.fast_score(query, self.vector_slice(start));
+                let score_val = if normalize {
+                    self.normalize_score(raw)
+                } else {
+                    raw
+                };
+                let candidate = NodeCandidate {
+                    idx: start,
+                    raw_score: raw,
+                    sort_key: score_val,
+                };
+                if scratch.candidate_queue.is_empty() {
+                    first_seed_idx = start;
+                    first_seed_score = score_val;
+                }
+                scratch.candidate_queue.push(candidate);
+                scratch.result_set.push(NodeResult(candidate));
+            }
+            // If all provided entries were deleted, fall back to first live node.
+            if scratch.result_set.is_empty() {
+                let fallback = self.deleted.iter().position(|d| !*d).unwrap_or(0);
+                let raw = self.fast_score(query, self.vector_slice(fallback));
+                let score_val = if normalize {
+                    self.normalize_score(raw)
+                } else {
+                    raw
+                };
+                let candidate = NodeCandidate {
+                    idx: fallback,
+                    raw_score: raw,
+                    sort_key: score_val,
+                };
+                first_seed_idx = fallback;
+                first_seed_score = score_val;
+                scratch.candidate_queue.push(candidate);
+                scratch.result_set.push(NodeResult(candidate));
+                if scratch.mark_visited(fallback) {
+                    visited_count += 1;
+                }
             }
 
             let mut worst_score = scratch.result_set.peek().unwrap().0.sort_key;
@@ -272,8 +303,8 @@ impl HNSWIndex {
 
                                         let improves_result_set = scratch.result_set.len() < ef
                                             || score_val < worst_score;
-                                        let push_candidate =
-                                            self.metric == DistanceMetric::Dot || improves_result_set;
+                                        let push_candidate = self.metric == DistanceMetric::Dot
+                                            || improves_result_set;
 
                                         if push_candidate {
                                             let sp = NodeCandidate {
@@ -334,48 +365,107 @@ impl HNSWIndex {
                         } else {
                             let window = degree.min(cap);
                             if window > 0 {
-                            let need_seed =
-                                (stride_enabled || rotate_neighbor_scans) && window < degree;
-                            let seed = if need_seed {
-                                query_signature
-                                    .unwrap_or_default()
-                                    .wrapping_add(current.idx as u64)
-                                    .wrapping_mul(0x9e3779b97f4a7c15)
-                            } else {
-                                0
-                            };
-                            let start = if rotate_neighbor_scans && window < degree {
-                                (seed % degree as u64) as usize
-                            } else {
-                                0
-                            };
-                            let stride = if stride_enabled && window < degree {
-                                stride_for_degree(degree, seed)
-                            } else {
-                                1
-                            };
-                            let mut patience_triggered = false;
-                            let mut neighbor_no_improve = 0usize;
-                            let mut neighbors_examined = 0usize;
-                            let mut offset = start;
-                            let cap_hit = window >= cap;
-                            'neighbor_scan: while neighbors_examined < window {
-                                let neighbor = neighbors[offset];
-                                neighbors_examined += 1;
-                                offset = (offset + stride) % degree;
-                                if collect_counters {
-                                    adjacency_reads += 1;
-                                }
-                                if self.deleted.get(neighbor).copied().unwrap_or(false)
-                                    || !scratch.mark_visited(neighbor)
-                                {
-                                    continue;
-                                }
-                                visited_count += 1;
+                                let need_seed =
+                                    (stride_enabled || rotate_neighbor_scans) && window < degree;
+                                let seed = if need_seed {
+                                    query_signature
+                                        .unwrap_or_default()
+                                        .wrapping_add(current.idx as u64)
+                                        .wrapping_mul(0x9e3779b97f4a7c15)
+                                } else {
+                                    0
+                                };
+                                let start = if rotate_neighbor_scans && window < degree {
+                                    (seed % degree as u64) as usize
+                                } else {
+                                    0
+                                };
+                                let stride = if stride_enabled && window < degree {
+                                    stride_for_degree(degree, seed)
+                                } else {
+                                    1
+                                };
+                                let mut patience_triggered = false;
+                                let mut neighbor_no_improve = 0usize;
+                                let mut neighbors_examined = 0usize;
+                                let mut offset = start;
+                                let cap_hit = window >= cap;
+                                'neighbor_scan: while neighbors_examined < window {
+                                    let neighbor = neighbors[offset];
+                                    neighbors_examined += 1;
+                                    offset = (offset + stride) % degree;
+                                    if collect_counters {
+                                        adjacency_reads += 1;
+                                    }
+                                    if self.deleted.get(neighbor).copied().unwrap_or(false)
+                                        || !scratch.mark_visited(neighbor)
+                                    {
+                                        continue;
+                                    }
+                                    visited_count += 1;
 
-                                batch[batch_len] = neighbor;
-                                batch_len += 1;
-                                if batch_len == BATCH {
+                                    batch[batch_len] = neighbor;
+                                    batch_len += 1;
+                                    if batch_len == BATCH {
+                                        for &idx in batch.iter().take(batch_len) {
+                                            if collect_counters {
+                                                distance_computations += 1;
+                                            }
+                                            let raw =
+                                                self.fast_score(query, self.vector_slice(idx));
+                                            let score_val = if normalize {
+                                                self.normalize_score(raw)
+                                            } else {
+                                                raw
+                                            };
+
+                                            let improves_result_set = scratch.result_set.len() < ef
+                                                || score_val < worst_score;
+                                            let push_candidate = self.metric == DistanceMetric::Dot
+                                                || improves_result_set;
+
+                                            if push_candidate {
+                                                let sp = NodeCandidate {
+                                                    idx,
+                                                    raw_score: raw,
+                                                    sort_key: score_val,
+                                                };
+                                                scratch.candidate_queue.push(sp);
+
+                                                if improves_result_set {
+                                                    scratch.result_set.push(NodeResult(sp));
+                                                    if scratch.result_set.len() > ef {
+                                                        scratch.result_set.pop();
+                                                    }
+                                                    if let Some(rp) = scratch.result_set.peek() {
+                                                        worst_score = rp.0.sort_key;
+                                                    }
+                                                }
+                                            }
+                                            if neighbor_patience > 0
+                                                && self.metric != DistanceMetric::Dot
+                                            {
+                                                if improves_result_set {
+                                                    neighbor_no_improve = 0;
+                                                } else {
+                                                    neighbor_no_improve += 1;
+                                                    if neighbor_no_improve >= neighbor_patience {
+                                                        patience_triggered = true;
+                                                        patience_breaks += 1;
+                                                        break 'neighbor_scan;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        batch_len = 0;
+                                    }
+                                }
+                                if cap_hit && !patience_triggered && neighbors_examined >= window {
+                                    if collect_counters {
+                                        cap_breaks += 1;
+                                    }
+                                }
+                                if !patience_triggered && batch_len > 0 {
                                     for &idx in batch.iter().take(batch_len) {
                                         if collect_counters {
                                             distance_computations += 1;
@@ -398,7 +488,7 @@ impl HNSWIndex {
                                                 raw_score: raw,
                                                 sort_key: score_val,
                                             };
-                                            scratch.candidate_queue.push(sp);
+                                            scratch.candidate_queue.push(sp.clone());
 
                                             if improves_result_set {
                                                 scratch.result_set.push(NodeResult(sp));
@@ -418,71 +508,15 @@ impl HNSWIndex {
                                             } else {
                                                 neighbor_no_improve += 1;
                                                 if neighbor_no_improve >= neighbor_patience {
-                                                    patience_triggered = true;
-                                                    patience_breaks += 1;
-                                                    break 'neighbor_scan;
+                                                    if collect_counters {
+                                                        patience_breaks += 1;
+                                                    }
+                                                    break;
                                                 }
                                             }
                                         }
                                     }
-                                    batch_len = 0;
                                 }
-                            }
-                            if cap_hit && !patience_triggered && neighbors_examined >= window {
-                                if collect_counters {
-                                    cap_breaks += 1;
-                                }
-                            }
-                            if !patience_triggered && batch_len > 0 {
-                                for &idx in batch.iter().take(batch_len) {
-                                    if collect_counters {
-                                        distance_computations += 1;
-                                    }
-                                    let raw = self.fast_score(query, self.vector_slice(idx));
-                                    let score_val = if normalize {
-                                        self.normalize_score(raw)
-                                    } else {
-                                        raw
-                                    };
-
-                                    let improves_result_set =
-                                        scratch.result_set.len() < ef || score_val < worst_score;
-                                    let push_candidate =
-                                        self.metric == DistanceMetric::Dot || improves_result_set;
-
-                                    if push_candidate {
-                                        let sp = NodeCandidate {
-                                            idx,
-                                            raw_score: raw,
-                                            sort_key: score_val,
-                                        };
-                                        scratch.candidate_queue.push(sp.clone());
-
-                                        if improves_result_set {
-                                            scratch.result_set.push(NodeResult(sp));
-                                            if scratch.result_set.len() > ef {
-                                                scratch.result_set.pop();
-                                            }
-                                            if let Some(rp) = scratch.result_set.peek() {
-                                                worst_score = rp.0.sort_key;
-                                            }
-                                        }
-                                    }
-                                    if neighbor_patience > 0 && self.metric != DistanceMetric::Dot {
-                                        if improves_result_set {
-                                            neighbor_no_improve = 0;
-                                        } else {
-                                            neighbor_no_improve += 1;
-                                            if neighbor_no_improve >= neighbor_patience {
-                                                if collect_counters {
-                                                    patience_breaks += 1;
-                                                }
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
                             }
                         }
                     }
@@ -537,7 +571,7 @@ impl HNSWIndex {
 
             if let Some(ctx) = trace.as_mut() {
                 let ctx = &mut **ctx;
-                let entry = SearchTraceEntry {
+                let trace_entry = SearchTraceEntry {
                     search_id: ctx.id,
                     metric: format!("{:?}", self.metric),
                     ef_search: ef,
@@ -550,9 +584,9 @@ impl HNSWIndex {
                     top_sort_key: None,
                     step: ctx.step,
                     level,
-                    current_idx: entry,
-                    current_point: self.point_id(entry),
-                    current_sort_key: entry_score,
+                    current_idx: first_seed_idx,
+                    current_point: self.point_id(first_seed_idx),
+                    current_sort_key: first_seed_score,
                     visited: visited_count,
                     expanded,
                     candidate_len: scratch.candidate_queue.len(),
@@ -561,7 +595,7 @@ impl HNSWIndex {
                     stop_reason: Some(stop_reason.to_string()),
                     elapsed_ms: ctx.start.elapsed().as_secs_f64() * 1000.0,
                 };
-                log_search_trace(&entry);
+                log_search_trace(&trace_entry);
             }
 
             let counters = SearchCounters {
@@ -715,19 +749,47 @@ impl HNSWIndex {
         }
 
         let final_query = &prepared_query;
-        let ef_search = opts.ef_search.map(|v| v.max(top_k)).unwrap_or(self.ef.max(top_k));
+        let ef_search = opts
+            .ef_search
+            .map(|v| v.max(top_k))
+            .unwrap_or(self.ef.max(top_k));
+
+        let l0_entries = self.collect_l0_seeds(final_query, current, opts, normalize_score_flag)?;
 
         let mut layer_stats = SearchLayerStats::default();
-        let (mut results, _counters) = self.search_layer_unfiltered(
+        let mut results = self.run_l0_search(
             final_query,
-            current,
-            0,
+            &l0_entries,
             ef_search,
             opts,
             normalize_score_flag,
             Some(&mut layer_stats),
             trace_ctx.as_mut(),
         )?;
+
+        // Adaptive EF: re-run L0 with higher budget for hard queries.
+        let adapt_high = opts.adaptive_ef_high.or_else(adaptive_ef_high_default);
+        let adapt_threshold = opts
+            .adaptive_ef_score_threshold
+            .or_else(adaptive_ef_score_threshold_default);
+        if let (Some(high_ef), Some(threshold)) = (adapt_high, adapt_threshold) {
+            let best_so_far = results.first().map(|c| c.sort_key).unwrap_or(f32::MAX);
+            if best_so_far > threshold && high_ef > ef_search {
+                let retry = self.run_l0_search(
+                    final_query,
+                    &l0_entries,
+                    high_ef,
+                    opts,
+                    normalize_score_flag,
+                    None,
+                    None,
+                )?;
+                if retry.first().map(|c| c.sort_key).unwrap_or(f32::MAX) < best_so_far {
+                    results = retry;
+                }
+            }
+        }
+
         results.sort_by(|a, b| {
             a.sort_key
                 .partial_cmp(&b.sort_key)
@@ -735,21 +797,14 @@ impl HNSWIndex {
                 .then_with(|| self.point_id(a.idx).cmp(&self.point_id(b.idx)))
         });
         results.truncate(top_k);
-        let mut scored = results
+        let scored: Vec<ScoredPoint> = results
             .into_iter()
             .map(|cand| ScoredPoint {
                 id: self.point_id(cand.idx),
                 raw_score: cand.raw_score,
                 sort_key: cand.sort_key,
             })
-            .collect::<Vec<_>>();
-        scored.sort_by(|a, b| {
-            a.sort_key
-                .partial_cmp(&b.sort_key)
-                .unwrap()
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        scored.truncate(top_k);
+            .collect();
 
         let best = scored.first().map(|r| r.sort_key).unwrap_or(0.0);
         let worst = scored.last().map(|r| r.sort_key).unwrap_or(0.0);
@@ -876,14 +931,18 @@ impl HNSWIndex {
         }
 
         let final_query = &prepared_query;
-        let ef_search = opts.ef_search.map(|v| v.max(top_k)).unwrap_or(self.ef.max(top_k));
+        let ef_search = opts
+            .ef_search
+            .map(|v| v.max(top_k))
+            .unwrap_or(self.ef.max(top_k));
+
+        let l0_entries = self.collect_l0_seeds(final_query, current, opts, normalize_score_flag)?;
 
         let log_enabled = log_unfiltered_enabled();
         let mut layer_stats = SearchLayerStats::default();
-        let (mut results, _counters) = self.search_layer_unfiltered(
+        let mut results = self.run_l0_search(
             final_query,
-            current,
-            0,
+            &l0_entries,
             ef_search,
             opts,
             normalize_score_flag,
@@ -894,6 +953,29 @@ impl HNSWIndex {
             },
             trace_ctx.as_mut(),
         )?;
+
+        // Adaptive EF: re-run L0 with higher budget for hard queries.
+        let adapt_high = opts.adaptive_ef_high.or_else(adaptive_ef_high_default);
+        let adapt_threshold = opts
+            .adaptive_ef_score_threshold
+            .or_else(adaptive_ef_score_threshold_default);
+        if let (Some(high_ef), Some(threshold)) = (adapt_high, adapt_threshold) {
+            let best_so_far = results.first().map(|c| c.sort_key).unwrap_or(f32::MAX);
+            if best_so_far > threshold && high_ef > ef_search {
+                let retry = self.run_l0_search(
+                    final_query,
+                    &l0_entries,
+                    high_ef,
+                    opts,
+                    normalize_score_flag,
+                    None,
+                    None,
+                )?;
+                if retry.first().map(|c| c.sort_key).unwrap_or(f32::MAX) < best_so_far {
+                    results = retry;
+                }
+            }
+        }
         results.sort_by(|a, b| {
             a.sort_key
                 .partial_cmp(&b.sort_key)
@@ -901,21 +983,14 @@ impl HNSWIndex {
                 .then_with(|| self.point_id(a.idx).cmp(&self.point_id(b.idx)))
         });
         results.truncate(top_k);
-        let mut scored = results
+        let scored: Vec<ScoredPoint> = results
             .into_iter()
             .map(|cand| ScoredPoint {
                 id: self.point_id(cand.idx),
                 raw_score: cand.raw_score,
                 sort_key: cand.sort_key,
             })
-            .collect::<Vec<_>>();
-        scored.sort_by(|a, b| {
-            a.sort_key
-                .partial_cmp(&b.sort_key)
-                .unwrap()
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        scored.truncate(top_k);
+            .collect();
 
         if log_enabled {
             let best = scored.first().map(|r| r.sort_key).unwrap_or(0.0);
@@ -932,5 +1007,56 @@ impl HNSWIndex {
         }
 
         Ok(scored)
+    }
+
+    /// Collect L0 entry seeds after upper-layer greedy descent.
+    /// When `num_entry_seeds > 1` and the index has upper layers, runs a small BFS at L1 to
+    /// collect multiple candidate starting points for the L0 search.
+    fn collect_l0_seeds(
+        &self,
+        query: &[f32],
+        current: usize,
+        opts: &SearchRuntimeOptions,
+        normalize: bool,
+    ) -> Result<Vec<usize>, DBError> {
+        let num_seeds = opts
+            .num_entry_seeds
+            .or_else(num_entry_seeds_default)
+            .unwrap_or(1)
+            .max(1);
+        if num_seeds <= 1 || self.current_max_level == 0 {
+            return Ok(vec![current]);
+        }
+        let seed_opts = SearchRuntimeOptions {
+            expansion_mult: Some(1),
+            ..SearchRuntimeOptions::default()
+        };
+        let (l1_results, _) = self.search_layer_unfiltered(
+            query,
+            &[current],
+            1,
+            num_seeds,
+            &seed_opts,
+            normalize,
+            None,
+            None,
+        )?;
+        Ok(l1_results.into_iter().map(|c| c.idx).collect())
+    }
+
+    /// Wrapper around `search_layer_unfiltered` at L0, returning just the result candidates.
+    fn run_l0_search(
+        &self,
+        query: &[f32],
+        entries: &[usize],
+        ef: usize,
+        opts: &SearchRuntimeOptions,
+        normalize: bool,
+        stats: Option<&mut SearchLayerStats>,
+        trace: Option<&mut SearchTraceCtx>,
+    ) -> Result<Vec<NodeCandidate>, DBError> {
+        let (results, _counters) =
+            self.search_layer_unfiltered(query, entries, 0, ef, opts, normalize, stats, trace)?;
+        Ok(results)
     }
 }

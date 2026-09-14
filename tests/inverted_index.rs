@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
+use annex::payload_storage::stores::PayloadIndex;
+use annex::utils::payload::{Payload, PayloadValue};
 use ordered_float::OrderedFloat;
-use vectordb::payload_storage::stores::PayloadIndex;
-use vectordb::utils::payload::{Payload, PayloadValue};
 
 #[test]
 fn test_index_insert_and_query() {

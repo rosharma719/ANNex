@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use vectordb::segment::Segment;
-use vectordb::utils::types::{DistanceMetric, Vector};
-use vectordb::vector::hnsw::HNSWIndex;
+use annex::segment::Segment;
+use annex::utils::types::{DistanceMetric, Vector};
+use annex::vector::hnsw::HNSWIndex;
 
 fn vecf(v: &[f32]) -> Vector {
     v.to_vec()

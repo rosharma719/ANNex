@@ -1,8 +1,8 @@
+use annex::utils::errors::DBError;
+use annex::utils::types::{DistanceMetric, Vector};
+use annex::vector::hnsw::HNSWIndex;
+use annex::vector::metric::score;
 use rand::Rng;
-use vectordb::utils::errors::DBError;
-use vectordb::utils::types::{DistanceMetric, Vector};
-use vectordb::vector::hnsw::HNSWIndex;
-use vectordb::vector::metric::score;
 
 fn vecf(v: &[f32]) -> Vector {
     println!("Creating vector: {:?}", v);
@@ -331,7 +331,7 @@ fn test_search_k_greater_than_total_points() {
 #[test]
 fn test_single_insertion_exact_retrieval() {
     let mut hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 50, 16, 2);
-    let vec = vecf(&[3.14, 2.71]);
+    let vec = vecf(&[3.15, 2.71]);
     hnsw.insert(42, vec.clone()).unwrap();
 
     let results = hnsw.search(&vec, 1).unwrap();

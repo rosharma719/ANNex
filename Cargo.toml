@@ -1,7 +1,25 @@
 [package]
-name = "vectordb"
+name = "annex"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "ANNex: in-memory ANN (HNSW) vector search engine with payload filtering, snapshot persistence, and WAL replay."
+repository = "https://github.com/rosharma719/annex"
+documentation = "https://docs.rs/annex"
+readme = "README.md"
+keywords = ["hnsw", "vector-search", "ann", "similarity", "embeddings"]
+categories = ["database-implementations", "algorithms", "data-structures"]
+exclude = [
+    "data/*",
+    "logs/*",
+    "docs/nyt_snapshot_builds.json",
+    "scripts/*",
+    "tests/*",
+    "examples/*",
+    ".env.example",
+    ".claude/*",
+]
 
 [dependencies]
 thiserror = "1.0"

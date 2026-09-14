@@ -4,9 +4,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use annex::analysis::{AnalyzerConfig, analyze_snapshot};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, to_writer};
-use vectordb::analysis::{AnalyzerConfig, analyze_snapshot};
 
 const DEFAULT_OUTPUT: &str = "nyt_analysis_runner.jsonl";
 const DEFAULT_BASE: &str = "data/nytimes-256-angular/base.npy";

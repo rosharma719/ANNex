@@ -19,6 +19,11 @@ pub(crate) struct SearchScratch {
     pub(crate) temp_epoch: Vec<u32>,
     pub(crate) temp_epoch_val: u32,
     pub(crate) temp_list: Vec<usize>,
+    pub(crate) extend_seen_epoch: Vec<u32>,
+    pub(crate) extend_seen_val: u32,
+    pub(crate) extend_base: Vec<usize>,
+    pub(crate) extend_neighbors: Vec<usize>,
+    pub(crate) extend_extra: Vec<NodeCandidate>,
     pub(crate) filter_mask_cache: HashMap<u64, Arc<Vec<bool>>>,
     pub(crate) filter_mask_lru: VecDeque<u64>,
     pub(crate) filter_mask_cap: usize,
@@ -39,6 +44,11 @@ impl Default for SearchScratch {
             temp_epoch: Vec::new(),
             temp_epoch_val: 0,
             temp_list: Vec::new(),
+            extend_seen_epoch: Vec::new(),
+            extend_seen_val: 0,
+            extend_base: Vec::new(),
+            extend_neighbors: Vec::new(),
+            extend_extra: Vec::new(),
             filter_mask_cache: HashMap::new(),
             filter_mask_lru: VecDeque::new(),
             filter_mask_cap: FILTER_MASK_CACHE_CAP,
@@ -114,6 +124,31 @@ impl SearchScratch {
         if self.temp_epoch[idx] != self.temp_epoch_val {
             self.temp_epoch[idx] = self.temp_epoch_val;
             self.temp_list.push(idx);
+        }
+    }
+
+    pub(crate) fn reset_extend_seen(&mut self, len: usize) {
+        if self.extend_seen_epoch.len() < len {
+            self.extend_seen_epoch.resize(len, 0);
+        }
+        if self.extend_seen_val == u32::MAX {
+            self.extend_seen_epoch.fill(0);
+            self.extend_seen_val = 1;
+        } else {
+            self.extend_seen_val = self.extend_seen_val.wrapping_add(1);
+            if self.extend_seen_val == 0 {
+                self.extend_seen_val = 1;
+            }
+        }
+    }
+
+    /// Returns true if `idx` was newly marked (i.e., not already seen this epoch).
+    pub(crate) fn mark_extend_seen(&mut self, idx: usize) -> bool {
+        if self.extend_seen_epoch[idx] == self.extend_seen_val {
+            false
+        } else {
+            self.extend_seen_epoch[idx] = self.extend_seen_val;
+            true
         }
     }
 

@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
-use vectordb::segment::Segment;
+use annex::segment::Segment;
 
 fn main() {
     let path = match env::args().nth(1) {

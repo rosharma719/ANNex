@@ -18,6 +18,22 @@ pub struct SearchRuntimeOptions {
     pub neighbor_scan_patience: Option<usize>,
     /// Overrides `VECTORDB_EARLY_EXIT_PATIENCE` for this call.
     pub early_exit_patience: Option<usize>,
+    /// Overrides `VECTORDB_SEARCH_EXPANSION_MULT` for this call.
+    /// Insert uses this with `Some(1)` so candidate-pool expansion only happens at query time.
+    pub expansion_mult: Option<usize>,
+    /// Number of seeds to collect from L1 before entering L0 search. When >1 and the index
+    /// has upper layers, a small BFS at L1 collects this many candidates and all are used as
+    /// L0 entry points, reducing sensitivity to routing quality in upper layers.
+    /// Overrides `VECTORDB_NUM_ENTRY_SEEDS`. Default is 1 (standard single-entry behavior).
+    pub num_entry_seeds: Option<usize>,
+    /// When set together with `adaptive_ef_score_threshold`, re-runs L0 with this EF for
+    /// queries whose best result score exceeds the threshold (hard queries).
+    /// Overrides `VECTORDB_ADAPTIVE_EF_HIGH`.
+    pub adaptive_ef_high: Option<usize>,
+    /// Score threshold that triggers an adaptive EF retry. Queries whose top-1 sort_key
+    /// (lower = better) exceeds this value are re-run with `adaptive_ef_high`.
+    /// Overrides `VECTORDB_ADAPTIVE_EF_SCORE_THRESHOLD`.
+    pub adaptive_ef_score_threshold: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]

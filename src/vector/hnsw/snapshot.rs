@@ -37,6 +37,7 @@ struct HnswSnapshotV1 {
 
 impl From<HnswSnapshotV1> for HnswSnapshot {
     fn from(snapshot: HnswSnapshotV1) -> Self {
+        let m0 = snapshot.m * 2;
         Self {
             layers: snapshot.layers,
             vectors: snapshot.vectors,
@@ -44,7 +45,8 @@ impl From<HnswSnapshotV1> for HnswSnapshot {
             entry_point: snapshot.entry_point,
             metric: snapshot.metric,
             m: snapshot.m,
-            m0: snapshot.m * 2,
+            m0,
+            stored_cap_l0: m0,
             ef: snapshot.ef,
             ef_construct: snapshot.ef_construct,
             max_level_cap: snapshot.max_level_cap,
@@ -100,6 +102,7 @@ impl HNSWIndex {
             metric: self.metric,
             m: self.m,
             m0: self.m0,
+            stored_cap_l0: self.stored_cap_l0,
             ef: self.ef,
             ef_construct: self.ef_construct,
             max_level_cap: self.max_level_cap,
@@ -117,6 +120,11 @@ impl HNSWIndex {
             snapshot.m * 2
         } else {
             snapshot.m0
+        };
+        let stored_cap_l0 = if snapshot.stored_cap_l0 == 0 {
+            m0
+        } else {
+            snapshot.stored_cap_l0
         };
         let mut ids: Vec<PointId> = snapshot.vectors.keys().copied().collect();
         ids.sort_unstable();
@@ -148,7 +156,11 @@ impl HNSWIndex {
             + 1;
         let mut layers = Vec::with_capacity(num_levels);
         for level in 0..num_levels {
-            let cap = if level == 0 { m0 + 1 } else { snapshot.m + 1 };
+            let cap = if level == 0 {
+                stored_cap_l0 + 1
+            } else {
+                snapshot.m + 1
+            };
             let mut layer = Vec::with_capacity(ids.len());
             for _ in 0..ids.len() {
                 layer.push(parking_lot::RwLock::new(Vec::with_capacity(cap)));
@@ -181,6 +193,7 @@ impl HNSWIndex {
             metric: snapshot.metric,
             m: snapshot.m,
             m0,
+            stored_cap_l0,
             ef: snapshot.ef,
             ef_construct: snapshot.ef_construct,
             max_level_cap: snapshot.max_level_cap,

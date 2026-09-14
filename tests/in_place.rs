@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use vectordb::payload_storage::filters::Filter;
-use vectordb::payload_storage::filters::evaluate_filter;
-use vectordb::segment::segment::Segment;
-use vectordb::utils::payload::{Payload, PayloadValue, ScalarComparisonOp};
-use vectordb::utils::types::{DistanceMetric, Vector};
-use vectordb::vector::hnsw::{HNSWIndex, ScoredPoint};
-use vectordb::vector::metric::score;
+use annex::payload_storage::filters::Filter;
+use annex::payload_storage::filters::evaluate_filter;
+use annex::segment::segment::Segment;
+use annex::utils::payload::{Payload, PayloadValue, ScalarComparisonOp};
+use annex::utils::types::{DistanceMetric, Vector};
+use annex::vector::hnsw::{HNSWIndex, ScoredPoint};
+use annex::vector::metric::score;
 
 fn make_payload(group: &str, score: i64) -> Payload {
     let mut payload = Payload::default();

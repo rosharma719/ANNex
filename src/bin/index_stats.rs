@@ -6,10 +6,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use rand::Rng;
 use serde::Serialize;
 
-use vectordb::segment::Segment;
-use vectordb::utils::types::DistanceMetric;
-use vectordb::vector::hnsw::HNSWIndex;
-use vectordb::vector::metric::score;
+use annex::segment::Segment;
+use annex::utils::types::DistanceMetric;
+use annex::vector::hnsw::HNSWIndex;
+use annex::vector::metric::score;
 
 #[derive(Default)]
 struct Cli {

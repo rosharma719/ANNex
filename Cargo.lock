@@ -24,6 +24,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
 
 [[package]]
+name = "annex"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "criterion",
+ "itertools 0.14.0",
+ "libc",
+ "log",
+ "ndarray",
+ "ndarray-npy",
+ "ordered-float",
+ "parking_lot",
+ "rand 0.9.0",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "anstyle"
 version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -872,26 +892,6 @@ name = "unicode-ident"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a5f39404a5da50712a4c1eecf25e90dd62b613502b7e925fd4e4d19b5c96512"
-
-[[package]]
-name = "vectordb"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "criterion",
- "itertools 0.14.0",
- "libc",
- "log",
- "ndarray",
- "ndarray-npy",
- "ordered-float",
- "parking_lot",
- "rand 0.9.0",
- "serde",
- "serde_json",
- "thiserror",
-]
 
 [[package]]
 name = "version_check"

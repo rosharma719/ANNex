@@ -391,6 +391,34 @@ fn test_high_dimensional_accuracy() {
 }
 
 #[test]
+fn reorder_rcm_preserves_search_results() {
+    use annex::utils::types::DistanceMetric;
+    use annex::vector::hnsw::HNSWIndex;
+    let mut index = HNSWIndex::new(DistanceMetric::Cosine, 8, 50, 4, 16);
+    let mut rng_state = 12345u64;
+    let mut lcg = || -> f32 {
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (rng_state >> 33) as f32 / u32::MAX as f32
+    };
+    for i in 0..100u64 {
+        let v: Vec<f32> = (0..16).map(|_| lcg()).collect();
+        index.insert(i, v).unwrap();
+    }
+    let query: Vec<f32> = (0..16).map(|j| if j == 0 { 1.0 } else { 0.0 }).collect();
+    let before = index.search(&query, 10).unwrap();
+    index.reorder_rcm();
+    let after = index.search(&query, 10).unwrap();
+    let before_ids: Vec<u64> = before.iter().map(|r| r.id).collect();
+    let after_ids: Vec<u64> = after.iter().map(|r| r.id).collect();
+    assert_eq!(
+        before_ids, after_ids,
+        "reorder must not change search results"
+    );
+}
+
+#[test]
 fn ti_skip_matches_baseline_recall() {
     use annex::vector::hnsw::SearchRuntimeOptions;
     let mut index = HNSWIndex::new(DistanceMetric::Cosine, 16, 200, 4, 8);

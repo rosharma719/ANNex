@@ -849,6 +849,120 @@ impl HNSWIndex {
 }
 
 impl HNSWIndex {
+    /// Permute node indices using Reverse Cuthill-McKee so that graph-adjacent
+    /// nodes at L0 become memory-adjacent. Reduces cache miss rate during BFS.
+    /// All node-indexed arrays (vectors, layers, idx_to_point, deleted,
+    /// point_to_idx, edge_dists_l0) are permuted consistently.
+    pub fn reorder_rcm(&mut self) {
+        let n = self.len();
+        if n == 0 {
+            return;
+        }
+
+        // Build undirected adjacency list from L0.
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        if let Some(l0) = self.layers.first() {
+            for (u, nb_lock) in l0.iter().enumerate() {
+                for &v in nb_lock.read().iter() {
+                    if v != u {
+                        if !adj[u].contains(&v) {
+                            adj[u].push(v);
+                        }
+                        if !adj[v].contains(&u) {
+                            adj[v].push(u);
+                        }
+                    }
+                }
+            }
+        }
+
+        // RCM: BFS starting from the node with minimum degree.
+        let start = (0..n).min_by_key(|&i| adj[i].len()).unwrap_or(0);
+        let mut perm = Vec::with_capacity(n);
+        let mut visited = vec![false; n];
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(start);
+        visited[start] = true;
+        while let Some(u) = queue.pop_front() {
+            perm.push(u);
+            let mut nbrs: Vec<usize> = adj[u].iter().copied().filter(|&v| !visited[v]).collect();
+            nbrs.sort_by_key(|&v| adj[v].len()); // ascending degree
+            for v in nbrs {
+                if !visited[v] {
+                    visited[v] = true;
+                    queue.push_back(v);
+                }
+            }
+        }
+        // Handle disconnected nodes.
+        for i in 0..n {
+            if !visited[i] {
+                perm.push(i);
+            }
+        }
+        perm.reverse(); // Reverse Cuthill-McKee
+
+        // Build inverse permutation: inv_perm[old_idx] = new_idx
+        let mut inv_perm = vec![0usize; n];
+        for (new_idx, &old_idx) in perm.iter().enumerate() {
+            inv_perm[old_idx] = new_idx;
+        }
+
+        // Permute vectors (flat slice: each node occupies `dim` consecutive f32s).
+        let dim = self.dim;
+        let mut new_vectors = vec![0.0f32; n * dim];
+        for (new_idx, &old_idx) in perm.iter().enumerate() {
+            let src = &self.vectors[old_idx * dim..(old_idx + 1) * dim];
+            new_vectors[new_idx * dim..(new_idx + 1) * dim].copy_from_slice(src);
+        }
+        self.vectors = new_vectors;
+
+        // Permute idx_to_point, deleted, and levels.
+        let old_itp = std::mem::take(&mut self.idx_to_point);
+        let old_del = std::mem::take(&mut self.deleted);
+        let old_lvl = std::mem::take(&mut self.levels);
+        self.idx_to_point = perm.iter().map(|&o| old_itp[o]).collect();
+        self.deleted = perm.iter().map(|&o| old_del[o]).collect();
+        self.levels = perm.iter().map(|&o| old_lvl[o]).collect();
+
+        // Rebuild point_to_idx from new idx_to_point.
+        self.point_to_idx.clear();
+        for (new_idx, &id) in self.idx_to_point.iter().enumerate() {
+            self.point_to_idx.insert(id, new_idx);
+        }
+
+        // Update entry point.
+        if let Some(ep) = self.entry_point {
+            self.entry_point = Some(inv_perm[ep]);
+        }
+
+        // Permute all layers: remap neighbor indices through inv_perm.
+        for layer in self.layers.iter_mut() {
+            let new_layer: Vec<parking_lot::RwLock<Vec<usize>>> = (0..n)
+                .map(|_| parking_lot::RwLock::new(Vec::new()))
+                .collect();
+            for (old_idx, nb_lock) in layer.iter().enumerate() {
+                let new_nbs: Vec<usize> = nb_lock.read().iter().map(|&nb| inv_perm[nb]).collect();
+                *new_layer[inv_perm[old_idx]].write() = new_nbs;
+            }
+            *layer = new_layer;
+        }
+
+        // Permute edge_dists_l0 if present.
+        if !self.edge_dists_l0.is_empty() {
+            let new_ed: Vec<parking_lot::RwLock<Vec<f32>>> = (0..n)
+                .map(|_| parking_lot::RwLock::new(Vec::new()))
+                .collect();
+            for (old_idx, ed_lock) in self.edge_dists_l0.iter().enumerate() {
+                let dists = ed_lock.read().clone();
+                *new_ed[inv_perm[old_idx]].write() = dists;
+            }
+            self.edge_dists_l0 = new_ed;
+        }
+    }
+}
+
+impl HNSWIndex {
     pub(crate) fn validate_dim(&self, vec: &[f32]) -> Result<(), DBError> {
         if vec.len() != self.dim {
             return Err(DBError::VectorLengthMismatch {

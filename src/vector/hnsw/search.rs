@@ -1398,7 +1398,11 @@ impl HNSWIndex {
                     }
                 })
                 .collect();
-            reranked.sort_by(|a, b| a.sort_key.partial_cmp(&b.sort_key).unwrap());
+            reranked.sort_by(|a, b| {
+                a.sort_key
+                    .partial_cmp(&b.sort_key)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             reranked.truncate(ef);
             return Ok(reranked);
         }

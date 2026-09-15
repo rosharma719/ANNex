@@ -863,7 +863,15 @@ impl HNSWIndex {
     /// nodes at L0 become memory-adjacent. Reduces cache miss rate during BFS.
     /// All node-indexed arrays (vectors, layers, idx_to_point, deleted,
     /// point_to_idx, edge_dists_l0) are permuted consistently.
+    /// Note: clears any SQ8 quantized state (`quantized`/`quant_min`/`quant_scale`).
+    /// Call `quantize_all()` again after reordering if SQ8 search is needed.
     pub fn reorder_rcm(&mut self) {
+        // Quantized codes are indexed by node idx; they are invalidated by reordering.
+        // Clear them so callers know to re-run quantize_all() after reorder.
+        self.quantized.clear();
+        self.quant_min.clear();
+        self.quant_scale.clear();
+
         let n = self.len();
         if n == 0 {
             return;

@@ -238,6 +238,82 @@ impl HNSWIndex {
         Ok(())
     }
 
+    /// Sort a batch of `(id, vector)` pairs by descending estimated Local Intrinsic
+    /// Dimensionality (LID). High-LID (hub/outlier) vectors are inserted first so they
+    /// propagate to upper layers, improving long-range routing and recall without changing
+    /// query-time behavior.
+    ///
+    /// LID estimation: for each vector, sample `min(32, n-1)` other vectors from the batch,
+    /// compute cosine distances, sort, and apply the Hill estimator:
+    ///   LID ≈ −k / Σ_{i=1..k} log(d_i / d_k)
+    /// where `d_1 ≤ d_2 ≤ … ≤ d_k` are the k-nearest distances from the sample.
+    pub fn sort_by_lid(entries: &mut Vec<(u64, Vec<f32>)>) {
+        let n = entries.len();
+        if n < 4 {
+            return;
+        }
+        let sample_k = 16usize.min(n - 1);
+        let sample_n = 32usize.min(n - 1);
+
+        // Pre-normalize for cosine similarity (works for all metrics as an approximation).
+        let normed: Vec<Vec<f32>> = entries
+            .iter()
+            .map(|(_, v)| {
+                let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    v.iter().map(|x| x / norm).collect()
+                } else {
+                    v.clone()
+                }
+            })
+            .collect();
+
+        let lids: Vec<f32> = (0..n)
+            .map(|i| {
+                let stride = n / sample_n + 1;
+                let mut dists: Vec<f32> = (0..sample_n)
+                    .map(|s| {
+                        let j = (i + 1 + s * stride) % n;
+                        let dot: f32 = normed[i]
+                            .iter()
+                            .zip(normed[j].iter())
+                            .map(|(a, b)| a * b)
+                            .sum();
+                        (1.0 - dot).max(0.0)
+                    })
+                    .collect();
+                dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                dists.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+                let k = dists.len().min(sample_k);
+                if k < 2 {
+                    return 0.0;
+                }
+                let d_k = dists[k - 1];
+                if d_k < 1e-9 {
+                    return 0.0;
+                }
+                let sum_log: f32 = dists[..k].iter().map(|&d| (d / d_k).max(1e-9).ln()).sum();
+                if sum_log.abs() < 1e-9 {
+                    0.0
+                } else {
+                    -(k as f32) / sum_log
+                }
+            })
+            .collect();
+
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            lids[b]
+                .partial_cmp(&lids[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut sorted = Vec::with_capacity(n);
+        for i in order {
+            sorted.push(entries[i].clone());
+        }
+        *entries = sorted;
+    }
+
     /// Insert a batch of points using concurrent search+link.
     ///
     /// Phase 1 (sequential): allocate every node — extend vecs, register IDs, push self-link.
@@ -248,8 +324,26 @@ impl HNSWIndex {
     /// New nodes allocated in the same batch do not see each other as candidates during Phase 2
     /// (they have no graph edges yet), which is the standard trade-off for batch HNSW builds.
     pub fn par_insert_batch(&mut self, entries: &[(PointId, Vector)]) -> Result<usize, DBError> {
+        use super::config::lid_sort_enabled;
+        // LID sort: build a permuted view of entries without changing the signature.
+        // When enabled, high-LID vectors are allocated first so they reach upper layers.
+        let sort_order: Vec<usize> = if lid_sort_enabled() && entries.len() > 3 {
+            let mut owned: Vec<(u64, Vec<f32>)> =
+                entries.iter().map(|(id, v)| (*id, v.clone())).collect();
+            Self::sort_by_lid(&mut owned);
+            let id_to_orig: std::collections::HashMap<u64, usize> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, (id, _))| (*id, i))
+                .collect();
+            owned.iter().map(|(id, _)| id_to_orig[id]).collect()
+        } else {
+            (0..entries.len()).collect()
+        };
+
         let mut node_infos: Vec<(usize, usize)> = Vec::new(); // (idx, level)
-        for (point_id, vector) in entries {
+        for i in 0..entries.len() {
+            let (point_id, vector) = &entries[sort_order[i]];
             if self.point_to_idx.contains_key(point_id) {
                 continue;
             }

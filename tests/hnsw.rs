@@ -494,3 +494,70 @@ fn sq8_rerank_top1_matches_f32() {
     let overlap = sq8_res.iter().filter(|r| f32_ids.contains(&r.id)).count();
     assert!(overlap >= 3, "SQ8 recall vs f32: {}/5", overlap);
 }
+
+#[test]
+fn lid_sort_does_not_regress_recall() {
+    use annex::utils::types::DistanceMetric;
+    use annex::vector::hnsw::{HNSWIndex, SearchRuntimeOptions};
+
+    fn build_index(apply_lid: bool) -> HNSWIndex {
+        let mut index = HNSWIndex::new(DistanceMetric::Cosine, 8, 100, 4, 32);
+        let mut rng = 42u64;
+        let mut lcg = || -> f32 {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as f32 / u32::MAX as f32
+        };
+        let mut entries: Vec<(u64, Vec<f32>)> = (0..500u64)
+            .map(|i| (i, (0..32).map(|_| lcg()).collect()))
+            .collect();
+        if apply_lid {
+            HNSWIndex::sort_by_lid(&mut entries);
+        }
+        for (id, v) in entries {
+            index.insert(id, v).unwrap();
+        }
+        index
+    }
+
+    let mut rng = 999u64;
+    let mut lcg = || -> f32 {
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (rng >> 33) as f32 / u32::MAX as f32
+    };
+    let queries: Vec<Vec<f32>> = (0..50).map(|_| (0..32).map(|_| lcg()).collect()).collect();
+
+    let baseline = build_index(false);
+    let lid = build_index(true);
+
+    let eval = |index: &HNSWIndex| -> f64 {
+        let truth_opts = SearchRuntimeOptions {
+            ef_search: Some(450),
+            ..Default::default()
+        };
+        let eval_opts = SearchRuntimeOptions {
+            ef_search: Some(20),
+            ..Default::default()
+        };
+        let mut hits = 0usize;
+        for q in &queries {
+            let truth = index.search_with_options(q, 10, &truth_opts).unwrap();
+            let res = index.search_with_options(q, 10, &eval_opts).unwrap();
+            let truth_ids: std::collections::HashSet<_> = truth.iter().map(|r| r.id).collect();
+            hits += res.iter().filter(|r| truth_ids.contains(&r.id)).count();
+        }
+        hits as f64 / (queries.len() * 10) as f64
+    };
+
+    let r_base = eval(&baseline);
+    let r_lid = eval(&lid);
+    assert!(
+        r_lid >= r_base - 0.02,
+        "LID recall {:.3} < baseline {:.3} - 0.02",
+        r_lid,
+        r_base
+    );
+}

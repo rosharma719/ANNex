@@ -327,6 +327,66 @@ fn nytimes_rcm_benchmark() {
     }
 }
 
+#[test]
+#[ignore]
+fn nytimes_sq8_benchmark() {
+    use annex::vector::hnsw::{HNSWIndex, SearchRuntimeOptions};
+    use std::time::Instant;
+    let path = std::env::var("VECTORDB_NYT_PERSIST_PATH").unwrap_or_else(|_| {
+        "data/nytimes-256-angular/index_m16_m0_32_stored_128_efc300.bin".into()
+    });
+    let segment = annex::segment::Segment::load_from_path(&path).unwrap();
+    let mut index = HNSWIndex::from_snapshot(segment.hnsw().to_snapshot());
+    drop(segment);
+    // Build SQ8 quantization tables.
+    let quant_start = Instant::now();
+    index.quantize_all();
+    eprintln!("quantize_all took {:?}", quant_start.elapsed());
+    let queries: ndarray::Array2<f32> =
+        ndarray_npy::read_npy("data/nytimes-256-angular/queries.npy").unwrap();
+    let truth: Vec<Vec<u64>> = serde_json::from_slice(
+        &std::fs::read("data/nytimes-256-angular/ground_truth.json").unwrap(),
+    )
+    .unwrap();
+    let count = 1000usize;
+    let qs: Vec<annex::utils::types::Vector> = queries
+        .rows()
+        .into_iter()
+        .take(count)
+        .map(|r| r.to_vec())
+        .collect();
+
+    for rerank_factor in [0usize, 3] {
+        for ef in [64usize, 128, 256] {
+            let opts = SearchRuntimeOptions {
+                ef_search: Some(ef),
+                sq8_rerank_factor: Some(rerank_factor),
+                ..Default::default()
+            };
+            let mut hits = 0;
+            for (i, q) in qs.iter().enumerate() {
+                let r = index.search_with_options(q, 20, &opts).unwrap();
+                hits += r.iter().filter(|x| truth[i][..20].contains(&x.id)).count();
+            }
+            let start = Instant::now();
+            for q in &qs {
+                std::hint::black_box(index.search_with_options(q, 20, &opts).unwrap());
+            }
+            let qps = count as f64 / start.elapsed().as_secs_f64();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "experiment": "sq8_benchmark",
+                    "ef": ef,
+                    "sq8_rerank_factor": rerank_factor,
+                    "recall": hits as f64 / (count * 20) as f64,
+                    "qps": qps
+                })
+            );
+        }
+    }
+}
+
 // Snapshot cosine vectors are normalized. Four independent sums keep the
 // offline experiment affordable without depending on private SIMD kernels.
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {

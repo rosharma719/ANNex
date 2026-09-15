@@ -458,3 +458,39 @@ fn ti_skip_matches_baseline_recall() {
         .count();
     assert!(overlap >= 8, "TI skip recall vs baseline: {}/10", overlap);
 }
+
+#[test]
+fn sq8_rerank_top1_matches_f32() {
+    use annex::utils::types::DistanceMetric;
+    use annex::vector::hnsw::{HNSWIndex, SearchRuntimeOptions};
+    let mut index = HNSWIndex::new(DistanceMetric::Cosine, 8, 50, 4, 16);
+    let mut rng = 99u64;
+    let lcg = |r: &mut u64| -> f32 {
+        *r = r
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*r >> 33) as f32 / u32::MAX as f32
+    };
+    for i in 0..150u64 {
+        let v: Vec<f32> = (0..16).map(|_| lcg(&mut rng)).collect();
+        index.insert(i, v).unwrap();
+    }
+    index.quantize_all();
+    let query: Vec<f32> = (0..16).map(|j| if j < 4 { 0.7 } else { 0.0 }).collect();
+    let f32_opts = SearchRuntimeOptions {
+        ef_search: Some(50),
+        sq8_rerank_factor: Some(0),
+        ..Default::default()
+    };
+    let sq8_opts = SearchRuntimeOptions {
+        ef_search: Some(50),
+        sq8_rerank_factor: Some(4),
+        ..Default::default()
+    };
+    let f32_res = index.search_with_options(&query, 5, &f32_opts).unwrap();
+    let sq8_res = index.search_with_options(&query, 5, &sq8_opts).unwrap();
+    assert_eq!(f32_res[0].id, sq8_res[0].id, "top-1 must match");
+    let f32_ids: std::collections::HashSet<_> = f32_res.iter().map(|r| r.id).collect();
+    let overlap = sq8_res.iter().filter(|r| f32_ids.contains(&r.id)).count();
+    assert!(overlap >= 3, "SQ8 recall vs f32: {}/5", overlap);
+}

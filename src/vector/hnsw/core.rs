@@ -65,6 +65,13 @@ pub struct HNSWIndex {
     /// Protected by the same logical lock as layers[0][idx]: always write under
     /// layers[0][idx].write() and read under layers[0][idx].read().
     pub(crate) edge_dists_l0: Vec<parking_lot::RwLock<Vec<f32>>>,
+    /// SQ8 quantized vectors: quantized[idx * dim + d] = u8 encoding of dimension d.
+    /// Empty until `quantize_all()` is called.
+    pub(crate) quantized: Vec<u8>,
+    /// Per-dimension minimum value used for SQ8 quantization.
+    pub(crate) quant_min: Vec<f32>,
+    /// Per-dimension scale: (max - min) / 255.0. Set to 1.0 for constant dimensions.
+    pub(crate) quant_scale: Vec<f32>,
     pub(crate) point_to_idx: HashMap<PointId, usize>,
     pub(crate) idx_to_point: Vec<PointId>,
     pub(crate) exact_fallback_enabled: bool,
@@ -135,6 +142,9 @@ impl HNSWIndex {
             deleted: Vec::new(),
             deleted_count: 0,
             edge_dists_l0: Vec::new(),
+            quantized: Vec::new(),
+            quant_min: Vec::new(),
+            quant_scale: Vec::new(),
             point_to_idx: HashMap::new(),
             idx_to_point: Vec::new(),
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),
@@ -971,6 +981,72 @@ impl HNSWIndex {
             });
         }
         Ok(())
+    }
+}
+
+impl HNSWIndex {
+    /// Build per-dimension min/max from all stored (non-deleted) vectors,
+    /// then encode each vector as SQ8. Call after bulk insert or snapshot load.
+    /// Not persisted in snapshots; call again after loading from disk.
+    pub fn quantize_all(&mut self) {
+        let n = self.len();
+        let dim = self.dim;
+        if n == 0 || dim == 0 {
+            return;
+        }
+        let mut min_d = vec![f32::MAX; dim];
+        let mut max_d = vec![f32::MIN; dim];
+        for idx in 0..n {
+            if self.deleted.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let v = self.vector_slice(idx);
+            for d in 0..dim {
+                min_d[d] = min_d[d].min(v[d]);
+                max_d[d] = max_d[d].max(v[d]);
+            }
+        }
+        let mut scale = vec![0.0f32; dim];
+        for d in 0..dim {
+            let range = max_d[d] - min_d[d];
+            scale[d] = if range > 0.0 { range / 255.0 } else { 1.0 };
+        }
+        let mut quantized = vec![0u8; n * dim];
+        for idx in 0..n {
+            let v = self.vector_slice(idx);
+            for d in 0..dim {
+                let q = ((v[d] - min_d[d]) / scale[d]).clamp(0.0, 255.0).round() as u8;
+                quantized[idx * dim + d] = q;
+            }
+        }
+        self.quant_min = min_d;
+        self.quant_scale = scale;
+        self.quantized = quantized;
+    }
+
+    /// Quantize a query vector into signed i16 for dot-product scoring against SQ8 codes.
+    pub(crate) fn quantize_query(&self, query: &[f32]) -> Vec<i16> {
+        query
+            .iter()
+            .enumerate()
+            .map(|(d, &v)| {
+                ((v - self.quant_min[d]) / self.quant_scale[d])
+                    .clamp(0.0, 255.0)
+                    .round() as i16
+            })
+            .collect()
+    }
+
+    /// Approximate SQ8 dot product: sum of u8 stored codes × i16 query codes.
+    /// Result is an i32 monotonically related to the true inner product (higher = closer).
+    /// Suitable for candidate ranking; the f32 rerank pass overwrites raw scores.
+    #[inline]
+    pub(crate) fn sq8_approx_dot(&self, query_q: &[i16], idx: usize) -> i32 {
+        let v = &self.quantized[idx * self.dim..(idx + 1) * self.dim];
+        v.iter()
+            .zip(query_q.iter())
+            .map(|(&b, &q)| (b as i32) * (q as i32))
+            .sum()
     }
 }
 

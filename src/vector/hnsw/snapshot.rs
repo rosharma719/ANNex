@@ -248,6 +248,10 @@ impl HNSWIndex {
             deleted_count: deleted.iter().filter(|&&flag| flag).count(),
             deleted,
             edge_dists_l0,
+            // SQ8 quantization is not persisted; rebuilt lazily via quantize_all().
+            quantized: Vec::new(),
+            quant_min: Vec::new(),
+            quant_scale: Vec::new(),
             point_to_idx,
             idx_to_point: ids,
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),

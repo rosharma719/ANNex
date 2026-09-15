@@ -39,6 +39,11 @@ pub struct SearchRuntimeOptions {
     /// skipped before computing `fast_score`. Not valid for Dot metric (no bounded metric).
     /// Overrides `VECTORDB_TI_SKIP`.
     pub use_ti_skip: Option<bool>,
+    /// When > 0, use SQ8 quantized scoring during L0 traversal and collect
+    /// `ef_search * sq8_rerank_factor` candidates, then rerank with full f32.
+    /// Set to 0 to disable SQ8 traversal. Overrides `VECTORDB_SQ8_RERANK_FACTOR`.
+    /// Has no effect if `quantize_all()` has not been called on the index.
+    pub sq8_rerank_factor: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]

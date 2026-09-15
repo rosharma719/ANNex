@@ -45,6 +45,7 @@ static DIVERSITY_ALPHA_LOW: OnceLock<Option<f32>> = OnceLock::new();
 static DIVERSITY_ALPHA_HIGH: OnceLock<Option<f32>> = OnceLock::new();
 static DIVERSITY_PRUNE_FLOOR: OnceLock<Option<usize>> = OnceLock::new();
 static TI_SKIP: OnceLock<bool> = OnceLock::new();
+static SQ8_RERANK_FACTOR: OnceLock<Option<usize>> = OnceLock::new();
 
 fn hnsw_telemetry() -> &'static HnswTelemetryConfig {
     HNSW_TELEMETRY.get_or_init(HnswTelemetryConfig::from_env)
@@ -269,4 +270,8 @@ pub(crate) fn diversity_prune_floor() -> usize {
     DIVERSITY_PRUNE_FLOOR
         .get_or_init(|| env_usize("VECTORDB_DIVERSITY_PRUNE_FLOOR"))
         .unwrap_or(0)
+}
+
+pub fn sq8_rerank_factor_default() -> Option<usize> {
+    *SQ8_RERANK_FACTOR.get_or_init(|| env_usize_nonzero("VECTORDB_SQ8_RERANK_FACTOR"))
 }

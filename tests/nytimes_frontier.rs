@@ -387,6 +387,69 @@ fn nytimes_sq8_benchmark() {
     }
 }
 
+#[test]
+#[ignore]
+fn nytimes_lid_build_recall() {
+    use annex::utils::types::DistanceMetric;
+    // Use first 50k base vectors for a quick build comparison.
+    let n_build = setting("VECTORDB_LID_BUILD_N", 50_000);
+    let base: Array2<f32> = read_npy("data/nytimes-256-angular/base.npy").unwrap();
+    let queries: Array2<f32> = read_npy("data/nytimes-256-angular/queries.npy").unwrap();
+    let truth: Vec<Vec<u64>> =
+        serde_json::from_slice(&fs::read("data/nytimes-256-angular/ground_truth.json").unwrap())
+            .unwrap();
+    let q_count = 1000usize;
+    let qs: Vec<Vector> = queries
+        .rows()
+        .into_iter()
+        .take(q_count)
+        .map(|r| r.to_vec())
+        .collect();
+
+    for apply_lid in [false, true] {
+        let mut entries: Vec<(u64, Vector)> = base
+            .rows()
+            .into_iter()
+            .take(n_build)
+            .enumerate()
+            .map(|(i, r)| (i as u64, r.to_vec()))
+            .collect();
+        if apply_lid {
+            let t = Instant::now();
+            HNSWIndex::sort_by_lid(&mut entries);
+            eprintln!("sort_by_lid({n_build}) took {:?}", t.elapsed());
+        }
+        let t = Instant::now();
+        let mut index = HNSWIndex::new(DistanceMetric::Cosine, 16, 200, 4, 256);
+        for (id, v) in entries {
+            index.insert(id, v).unwrap();
+        }
+        eprintln!("build({n_build}, lid={apply_lid}) took {:?}", t.elapsed());
+
+        for ef in [64usize, 128, 256] {
+            let opts = SearchRuntimeOptions {
+                ef_search: Some(ef),
+                ..Default::default()
+            };
+            let mut hits = 0;
+            for (i, q) in qs.iter().enumerate() {
+                let r = index.search_with_options(q, 20, &opts).unwrap();
+                hits += r.iter().filter(|x| truth[i][..20].contains(&x.id)).count();
+            }
+            let start = Instant::now();
+            for q in &qs {
+                black_box(index.search_with_options(black_box(q), 20, &opts).unwrap());
+            }
+            let qps = q_count as f64 / start.elapsed().as_secs_f64();
+            println!(
+                "{}",
+                json!({"experiment": "lid_build", "n_build": n_build, "lid": apply_lid,
+                       "ef": ef, "recall": hits as f64 / (q_count * 20) as f64, "qps": qps})
+            );
+        }
+    }
+}
+
 // Snapshot cosine vectors are normalized. Four independent sums keep the
 // offline experiment affordable without depending on private SIMD kernels.
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {

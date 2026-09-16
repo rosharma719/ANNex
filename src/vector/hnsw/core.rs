@@ -993,8 +993,16 @@ impl HNSWIndex {
 }
 
 impl HNSWIndex {
-    /// Build per-dimension min/max from all stored (non-deleted) vectors,
-    /// then encode each vector as SQ8. Call after bulk insert or snapshot load.
+    /// Build SQ8 quantization tables and encode all stored vectors.
+    ///
+    /// For Cosine: uses zero-centered encoding so the SQ8 dot product is an unbiased
+    /// approximation of the true dot product. Stored code = round(v[d]*127.5 + 128),
+    /// mapping [-1,1] → [0.5,255.5]. `quant_min` and `quant_scale` are unused for
+    /// cosine and are left empty.
+    ///
+    /// For Euclidean/Dot: uses per-dimension min-max encoding. `quant_min[d]` and
+    /// `quant_scale[d]` = (max-min)/255 are stored for query quantization.
+    ///
     /// Not persisted in snapshots; call again after loading from disk.
     pub fn quantize_all(&mut self) {
         let n = self.len();
@@ -1002,59 +1010,94 @@ impl HNSWIndex {
         if n == 0 || dim == 0 {
             return;
         }
-        let mut min_d = vec![f32::MAX; dim];
-        let mut max_d = vec![f32::MIN; dim];
-        for idx in 0..n {
-            if self.deleted.get(idx).copied().unwrap_or(false) {
-                continue;
-            }
-            let v = self.vector_slice(idx);
-            for d in 0..dim {
-                min_d[d] = min_d[d].min(v[d]);
-                max_d[d] = max_d[d].max(v[d]);
-            }
-        }
-        let mut scale = vec![0.0f32; dim];
-        for d in 0..dim {
-            let range = max_d[d] - min_d[d];
-            scale[d] = if range > 0.0 { range / 255.0 } else { 1.0 };
-        }
         let mut quantized = vec![0u8; n * dim];
-        for idx in 0..n {
-            let v = self.vector_slice(idx);
-            for d in 0..dim {
-                let q = ((v[d] - min_d[d]) / scale[d]).clamp(0.0, 255.0).round() as u8;
-                quantized[idx * dim + d] = q;
+        if self.metric == DistanceMetric::Cosine {
+            // Zero-centered: v[d] ∈ [-1,1] → code ∈ [0,255]. Eliminates the per-vector
+            // mean bias that destroys ranking quality for per-dim min-max on unit vectors.
+            for idx in 0..n {
+                let v = self.vector_slice(idx);
+                for d in 0..dim {
+                    quantized[idx * dim + d] =
+                        (v[d] * 127.5 + 128.0).clamp(0.0, 255.0).round() as u8;
+                }
             }
+            self.quant_min = Vec::new();
+            self.quant_scale = Vec::new();
+        } else {
+            let mut min_d = vec![f32::MAX; dim];
+            let mut max_d = vec![f32::MIN; dim];
+            for idx in 0..n {
+                if self.deleted.get(idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                let v = self.vector_slice(idx);
+                for d in 0..dim {
+                    min_d[d] = min_d[d].min(v[d]);
+                    max_d[d] = max_d[d].max(v[d]);
+                }
+            }
+            let mut scale = vec![0.0f32; dim];
+            for d in 0..dim {
+                let range = max_d[d] - min_d[d];
+                scale[d] = if range > 0.0 { range / 255.0 } else { 1.0 };
+            }
+            for idx in 0..n {
+                let v = self.vector_slice(idx);
+                for d in 0..dim {
+                    quantized[idx * dim + d] =
+                        ((v[d] - min_d[d]) / scale[d]).clamp(0.0, 255.0).round() as u8;
+                }
+            }
+            self.quant_min = min_d;
+            self.quant_scale = scale;
         }
-        self.quant_min = min_d;
-        self.quant_scale = scale;
         self.quantized = quantized;
     }
 
-    /// Quantize a query vector into signed i16 for dot-product scoring against SQ8 codes.
+    /// Quantize a query vector into signed i16 codes for `sq8_approx_dot`.
+    ///
+    /// Cosine: `query_q[d] = round(q[d] * 127.5)` — centered, so dot with stored codes
+    /// (which are offset by +128) gives an unbiased similarity estimate.
+    /// Non-cosine: per-dimension min-max, consistent with `quantize_all`.
     pub(crate) fn quantize_query(&self, query: &[f32]) -> Vec<i16> {
-        query
-            .iter()
-            .enumerate()
-            .map(|(d, &v)| {
-                ((v - self.quant_min[d]) / self.quant_scale[d])
-                    .clamp(0.0, 255.0)
-                    .round() as i16
-            })
-            .collect()
+        if self.metric == DistanceMetric::Cosine {
+            query
+                .iter()
+                .map(|&v| (v * 127.5).clamp(-128.0, 127.0).round() as i16)
+                .collect()
+        } else {
+            query
+                .iter()
+                .enumerate()
+                .map(|(d, &v)| {
+                    let min = self.quant_min.get(d).copied().unwrap_or(0.0);
+                    let scale = self.quant_scale.get(d).copied().unwrap_or(1.0);
+                    ((v - min) / scale).clamp(0.0, 255.0).round() as i16
+                })
+                .collect()
+        }
     }
 
-    /// Approximate SQ8 dot product: sum of u8 stored codes × i16 query codes.
-    /// Result is an i32 monotonically related to the true inner product (higher = closer).
-    /// Suitable for candidate ranking; the f32 rerank pass overwrites raw scores.
+    /// Approximate SQ8 dot product. Result is monotonically related to true similarity
+    /// (higher = closer). The f32 rerank pass overwrites raw scores before returning.
+    ///
+    /// Cosine: `sum_d (code[d] - 128) * query_q[d]` — the -128 removes the storage
+    /// offset, leaving an unbiased approximation of 127.5^2 * true_dot(v, q).
+    /// Non-cosine: `sum_d code[d] * query_q[d]` (no offset needed).
     #[inline]
     pub(crate) fn sq8_approx_dot(&self, query_q: &[i16], idx: usize) -> i32 {
         let v = &self.quantized[idx * self.dim..(idx + 1) * self.dim];
-        v.iter()
-            .zip(query_q.iter())
-            .map(|(&b, &q)| (b as i32) * (q as i32))
-            .sum()
+        if self.metric == DistanceMetric::Cosine {
+            v.iter()
+                .zip(query_q.iter())
+                .map(|(&b, &q)| (b as i32 - 128) * (q as i32))
+                .sum()
+        } else {
+            v.iter()
+                .zip(query_q.iter())
+                .map(|(&b, &q)| (b as i32) * (q as i32))
+                .sum()
+        }
     }
 }
 

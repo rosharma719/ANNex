@@ -316,23 +316,18 @@ impl HNSWIndex {
                             && cap == usize::MAX
                             && neighbor_patience == 0
                             && !rotate_neighbor_scans
+                            && !stride_enabled
+                            && !use_ti; // TI skip uses its own branch below
+                        let use_ti_scan = use_ti
+                            && !collect_counters
+                            && cap == usize::MAX
+                            && neighbor_patience == 0
+                            && !rotate_neighbor_scans
                             && !stride_enabled;
                         if use_simple_scan {
-                            let ed_guard = if use_ti {
-                                self.edge_dists_l0.get(current.idx).map(|l| l.read())
-                            } else {
-                                None
-                            };
+                            // Hot path: no TI skip, no caps, no stats — zero overhead vs
+                            // pre-Task-2 code. Any change here must preserve that property.
                             for (position, &neighbor) in neighbors.iter().enumerate() {
-                                if use_ti && scratch.result_set.len() >= ef {
-                                    if let Some(ref ed) = ed_guard {
-                                        if let Some(&edge_d) = ed.get(position) {
-                                            if current.sort_key - edge_d > worst_score {
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
                                 if let Some(&next) = neighbors.get(position + 2)
                                     && let Some(entry) = scratch.visited_epoch.get(next)
                                 {
@@ -418,6 +413,100 @@ impl HNSWIndex {
                                     }
                                 }
                             }
+                        } else if use_ti_scan {
+                            // TI-skip fast path: same structure as simple_scan but applies
+                            // triangle-inequality lower-bound check before each distance call.
+                            let ed_guard = self.edge_dists_l0.get(current.idx).map(|l| l.read());
+                            for (position, &neighbor) in neighbors.iter().enumerate() {
+                                // TI lower-bound: d(q,n) >= d(q,c) - d(c,n).
+                                // If lower bound already exceeds worst result, skip.
+                                if scratch.result_set.len() >= ef {
+                                    if let Some(ref ed) = ed_guard {
+                                        if let Some(&edge_d) = ed.get(position) {
+                                            if current.sort_key - edge_d > worst_score {
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(&next) = neighbors.get(position + 2)
+                                    && let Some(entry) = scratch.visited_epoch.get(next)
+                                {
+                                    prefetch_read(entry);
+                                }
+                                if self.deleted.get(neighbor).copied().unwrap_or(false)
+                                    || !scratch.mark_visited(neighbor)
+                                {
+                                    continue;
+                                }
+                                visited_count += 1;
+                                self.prefetch_vector(neighbor);
+                                batch[batch_len] = neighbor;
+                                batch_len += 1;
+                                if batch_len == BATCH {
+                                    for &idx in batch.iter().take(batch_len) {
+                                        let raw = self.fast_score(query, self.vector_slice(idx));
+                                        let score_val = if normalize {
+                                            self.normalize_score(raw)
+                                        } else {
+                                            raw
+                                        };
+                                        let improves_result_set = scratch.result_set.len() < ef
+                                            || score_val < worst_score;
+                                        let push_candidate = self.metric == DistanceMetric::Dot
+                                            || improves_result_set;
+                                        if push_candidate {
+                                            let sp = NodeCandidate {
+                                                idx,
+                                                raw_score: raw,
+                                                sort_key: score_val,
+                                            };
+                                            scratch.candidate_queue.push(sp);
+                                            if improves_result_set {
+                                                scratch.result_set.push(NodeResult(sp));
+                                                if scratch.result_set.len() > ef {
+                                                    scratch.result_set.pop();
+                                                }
+                                                if let Some(rp) = scratch.result_set.peek() {
+                                                    worst_score = rp.0.sort_key;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    batch_len = 0;
+                                }
+                            }
+                            if batch_len > 0 {
+                                for &idx in batch.iter().take(batch_len) {
+                                    let raw = self.fast_score(query, self.vector_slice(idx));
+                                    let score_val = if normalize {
+                                        self.normalize_score(raw)
+                                    } else {
+                                        raw
+                                    };
+                                    let improves_result_set =
+                                        scratch.result_set.len() < ef || score_val < worst_score;
+                                    let push_candidate =
+                                        self.metric == DistanceMetric::Dot || improves_result_set;
+                                    if push_candidate {
+                                        let sp = NodeCandidate {
+                                            idx,
+                                            raw_score: raw,
+                                            sort_key: score_val,
+                                        };
+                                        scratch.candidate_queue.push(sp.clone());
+                                        if improves_result_set {
+                                            scratch.result_set.push(NodeResult(sp));
+                                            if scratch.result_set.len() > ef {
+                                                scratch.result_set.pop();
+                                            }
+                                            if let Some(rp) = scratch.result_set.peek() {
+                                                worst_score = rp.0.sort_key;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             let window = degree.min(cap);
                             if window > 0 {
@@ -446,11 +535,10 @@ impl HNSWIndex {
                                 let mut neighbors_examined = 0usize;
                                 let mut offset = start;
                                 let cap_hit = window >= cap;
-                                let ed_guard_complex = if use_ti {
-                                    self.edge_dists_l0.get(current.idx).map(|l| l.read())
-                                } else {
-                                    None
-                                };
+                                // The TI-skip + no-cap path is handled by use_ti_scan above.
+                                // This complex path only runs when there IS a cap, rotation,
+                                // stride, patience, or stats collection — TI skip is skipped
+                                // here to keep this path uncluttered.
                                 'neighbor_scan: while neighbors_examined < window {
                                     if neighbors_examined + 2 < window {
                                         let next = neighbors[(offset + 2 * stride) % degree];
@@ -458,19 +546,9 @@ impl HNSWIndex {
                                             prefetch_read(entry);
                                         }
                                     }
-                                    let current_offset = offset;
                                     let neighbor = neighbors[offset];
                                     neighbors_examined += 1;
                                     offset = (offset + stride) % degree;
-                                    if use_ti && scratch.result_set.len() >= ef {
-                                        if let Some(ref ed) = ed_guard_complex {
-                                            if let Some(&edge_d) = ed.get(current_offset) {
-                                                if current.sort_key - edge_d > worst_score {
-                                                    continue 'neighbor_scan;
-                                                }
-                                            }
-                                        }
-                                    }
                                     if collect_counters {
                                         adjacency_reads += 1;
                                     }

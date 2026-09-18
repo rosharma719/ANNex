@@ -22,8 +22,8 @@ use super::config::{
     early_exit_patience, log_neighbor_scan_state, log_unfiltered_enabled, neighbor_scan_cap,
     neighbor_scan_patience, neighbor_scan_rotate_enabled, neighbor_scan_stride_enabled,
     next_search_trace_seq, num_entry_seeds_default, search_expansion_cap_override,
-    search_expansion_multiplier, search_trace_logger, sq8_rerank_factor_default, ti_skip_enabled,
-    trace_every,
+    search_expansion_multiplier, search_trace_logger, sq8_rerank_factor_default,
+    sq8_screen_enabled, ti_skip_enabled, trace_every,
 };
 use super::scratch::SEARCH_SCRATCH;
 use super::stats::{SearchLayerStats, SearchStats, UNFILTERED_SEARCH_AGG, UnfilteredSample};
@@ -273,6 +273,17 @@ impl HNSWIndex {
                 && self.metric == DistanceMetric::Cosine // TI bound valid for cosine on pre-normalized vecs
                 && opts.use_ti_skip.unwrap_or_else(ti_skip_enabled)
                 && !self.edge_dists_l0.is_empty();
+            let use_sq8_screen_path = level == 0
+                && self.metric == DistanceMetric::Cosine
+                && !self.quantized.is_empty()
+                && opts.sq8_screen.unwrap_or_else(sq8_screen_enabled)
+                && !use_ti; // TI and screen are mutually exclusive fast-paths
+            // Precompute i8 query codes once per BFS call for the screen path.
+            let query_i8: Vec<i8> = if use_sq8_screen_path {
+                self.quantize_query_i8(query)
+            } else {
+                Vec::new()
+            };
             let allow_early_exit = self.metric != DistanceMetric::Dot && !disable_early_exit();
             let patience_limit = if allow_early_exit {
                 opts.early_exit_patience.unwrap_or_else(early_exit_patience)
@@ -317,8 +328,15 @@ impl HNSWIndex {
                             && neighbor_patience == 0
                             && !rotate_neighbor_scans
                             && !stride_enabled
-                            && !use_ti; // TI skip uses its own branch below
+                            && !use_ti // TI skip uses its own branch below
+                            && !use_sq8_screen_path; // SQ8 screen uses its own branch below
                         let use_ti_scan = use_ti
+                            && !collect_counters
+                            && cap == usize::MAX
+                            && neighbor_patience == 0
+                            && !rotate_neighbor_scans
+                            && !stride_enabled;
+                        let use_sq8_scan = use_sq8_screen_path
                             && !collect_counters
                             && cap == usize::MAX
                             && neighbor_patience == 0
@@ -502,6 +520,111 @@ impl HNSWIndex {
                                             }
                                             if let Some(rp) = scratch.result_set.peek() {
                                                 worst_score = rp.0.sort_key;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if use_sq8_scan {
+                            // SQ8 screening path: check visited first (cheap), then screen
+                            // with integer dot product BEFORE the expensive f32 prefetch+score.
+                            // Neighbors clearly below the result-set threshold skip the cache-
+                            // miss-heavy f32 vector load entirely.
+                            //
+                            // SQ8 threshold: 127.5² × (1 − worst_score) × safety_margin (0.85).
+                            let mut sq8_thresh =
+                                ((1.0 - worst_score) * 127.5 * 127.5 * 0.85) as i32;
+                            for (position, &neighbor) in neighbors.iter().enumerate() {
+                                if let Some(&next) = neighbors.get(position + 2)
+                                    && let Some(entry) = scratch.visited_epoch.get(next)
+                                {
+                                    prefetch_read(entry);
+                                }
+                                if self.deleted.get(neighbor).copied().unwrap_or(false)
+                                    || !scratch.mark_visited(neighbor)
+                                {
+                                    continue;
+                                }
+                                visited_count += 1;
+                                // SQ8 screen: only for new unvisited neighbors when result set
+                                // is full — saves the f32 prefetch on clearly bad candidates.
+                                if scratch.result_set.len() >= ef {
+                                    let stored = self.quantized_slice(neighbor);
+                                    let sq8 = HNSWIndex::screen_dot(&query_i8, stored);
+                                    if sq8 < sq8_thresh {
+                                        continue;
+                                    }
+                                }
+                                self.prefetch_vector(neighbor);
+                                batch[batch_len] = neighbor;
+                                batch_len += 1;
+                                if batch_len == BATCH {
+                                    for &idx in batch.iter().take(batch_len) {
+                                        let raw = self.fast_score(query, self.vector_slice(idx));
+                                        let score_val = if normalize {
+                                            self.normalize_score(raw)
+                                        } else {
+                                            raw
+                                        };
+                                        let improves_result_set = scratch.result_set.len() < ef
+                                            || score_val < worst_score;
+                                        let push_candidate = self.metric == DistanceMetric::Dot
+                                            || improves_result_set;
+                                        if push_candidate {
+                                            let sp = NodeCandidate {
+                                                idx,
+                                                raw_score: raw,
+                                                sort_key: score_val,
+                                            };
+                                            scratch.candidate_queue.push(sp);
+                                            if improves_result_set {
+                                                scratch.result_set.push(NodeResult(sp));
+                                                if scratch.result_set.len() > ef {
+                                                    scratch.result_set.pop();
+                                                }
+                                                if let Some(rp) = scratch.result_set.peek() {
+                                                    worst_score = rp.0.sort_key;
+                                                    sq8_thresh = ((1.0 - worst_score)
+                                                        * 127.5
+                                                        * 127.5
+                                                        * 0.85)
+                                                        as i32;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    batch_len = 0;
+                                }
+                            }
+                            if batch_len > 0 {
+                                for &idx in batch.iter().take(batch_len) {
+                                    let raw = self.fast_score(query, self.vector_slice(idx));
+                                    let score_val = if normalize {
+                                        self.normalize_score(raw)
+                                    } else {
+                                        raw
+                                    };
+                                    let improves_result_set =
+                                        scratch.result_set.len() < ef || score_val < worst_score;
+                                    let push_candidate =
+                                        self.metric == DistanceMetric::Dot || improves_result_set;
+                                    if push_candidate {
+                                        let sp = NodeCandidate {
+                                            idx,
+                                            raw_score: raw,
+                                            sort_key: score_val,
+                                        };
+                                        scratch.candidate_queue.push(sp.clone());
+                                        if improves_result_set {
+                                            scratch.result_set.push(NodeResult(sp));
+                                            if scratch.result_set.len() > ef {
+                                                scratch.result_set.pop();
+                                            }
+                                            if let Some(rp) = scratch.result_set.peek() {
+                                                worst_score = rp.0.sort_key;
+                                                sq8_thresh =
+                                                    ((1.0 - worst_score) * 127.5 * 127.5 * 0.85)
+                                                        as i32;
                                             }
                                         }
                                     }

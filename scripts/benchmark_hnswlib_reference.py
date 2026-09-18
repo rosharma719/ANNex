@@ -21,7 +21,12 @@ def main():
     parser.add_argument("--data", type=Path, default=Path("data/nytimes-256-angular"))
     parser.add_argument("--index", type=Path, default=Path("data/nytimes-256-angular/hnswlib-m16-efc300.bin"))
     parser.add_argument("--build-only", action="store_true")
+    parser.add_argument("--efs", default="32,64,128,256,512")
+    parser.add_argument("--offsets", default="0,1000")
+    parser.add_argument("--queries", type=int, default=1000)
+    parser.add_argument("--rounds", type=int, default=3)
     args = parser.parse_args()
+    assert args.queries > 0 and args.rounds > 0
     index = hnswlib.Index(space="cosine", dim=256)
     if args.index.exists():
         index.load_index(str(args.index))
@@ -37,14 +42,15 @@ def main():
         return
     queries = np.load(args.data / "queries.npy")
     truth = np.array(json.loads((args.data / "ground_truth.json").read_text()))
-    for offset in [0, 1000]:
-        selected = queries[offset:offset + 1000]
-        for ef in [32, 64, 128, 256, 512]:
+    for offset in map(int, args.offsets.split(",")):
+        assert offset >= 0 and offset + args.queries <= len(queries)
+        selected = queries[offset:offset + args.queries]
+        for ef in map(int, args.efs.split(",")):
             index.set_ef(ef)
             # Untimed warm-up and recall, one query per call, one search thread.
             answers = [index.knn_query(q, k=20, num_threads=1)[0][0] for q in selected]
-            recall = sum(len(set(a) & set(t[:20])) for a, t in zip(answers, truth[offset:offset + 1000])) / 20000
-            for round_id in range(3):
+            recall = sum(len(set(a) & set(t[:20])) for a, t in zip(answers, truth[offset:offset + args.queries])) / (args.queries * 20)
+            for round_id in range(args.rounds):
                 times = []
                 start = perf_counter()
                 for query in selected:
@@ -55,6 +61,7 @@ def main():
                 print(json.dumps({"query_offset": offset, "ef": ef, "round": round_id,
                                   "recall": recall, "qps": len(selected) / elapsed,
                                   "mean_ms": elapsed * 1000 / len(selected),
+                                  "queries": len(selected), "p50_ms": float(np.percentile(times, 50)),
                                   "p99_ms": float(np.percentile(times, 99))}), flush=True)
 
 

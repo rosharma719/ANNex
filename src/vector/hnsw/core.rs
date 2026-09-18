@@ -1138,6 +1138,46 @@ impl HNSWIndex {
                 .sum()
         }
     }
+
+    /// Slice accessor for quantized codes. Panics if `quantized` is empty.
+    #[inline]
+    pub(crate) fn quantized_slice(&self, idx: usize) -> &[u8] {
+        &self.quantized[idx * self.dim..(idx + 1) * self.dim]
+    }
+
+    /// Quantize a cosine query into i8 for screen_dot. Caller must ensure metric==Cosine.
+    /// Same centering as quantize_all: q[d]*127.5 rounded to [-128, 127].
+    pub(crate) fn quantize_query_i8(&self, query: &[f32]) -> Vec<i8> {
+        query
+            .iter()
+            .map(|&v| (v * 127.5).clamp(-128.0, 127.0).round() as i8)
+            .collect()
+    }
+
+    /// Fast dot product for SQ8 screening: stored u8 codes (centered at 128) × i8 query.
+    /// Equivalent to sq8_approx_dot but uses i8 query codes and a loop structure that
+    /// the compiler auto-vectorises into NEON vmlal or AVX2 madd.
+    /// Monotone with true cosine similarity — higher = closer.
+    #[inline]
+    pub(crate) fn screen_dot(query_i8: &[i8], stored: &[u8]) -> i32 {
+        // Four independent accumulators break the dependency chain for auto-vectorisation.
+        let n = query_i8.len().min(stored.len());
+        let mut a = [0i32; 4];
+        let mut i = 0;
+        while i + 4 <= n {
+            a[0] += (query_i8[i] as i32) * (stored[i] as i32 - 128);
+            a[1] += (query_i8[i + 1] as i32) * (stored[i + 1] as i32 - 128);
+            a[2] += (query_i8[i + 2] as i32) * (stored[i + 2] as i32 - 128);
+            a[3] += (query_i8[i + 3] as i32) * (stored[i + 3] as i32 - 128);
+            i += 4;
+        }
+        let mut acc = a[0] + a[1] + a[2] + a[3];
+        while i < n {
+            acc += (query_i8[i] as i32) * (stored[i] as i32 - 128);
+            i += 1;
+        }
+        acc
+    }
 }
 
 #[cfg(test)]

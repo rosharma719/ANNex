@@ -184,6 +184,9 @@ fn nytimes_new_frontier() {
             index.reorder_rcm();
             eprintln!("reorder_rcm took {:?}", t.elapsed());
         }
+        if ti_skip {
+            index.build_edge_distances();
+        }
         // Warm up caches with one cold pass before timing.
         let warmup_opts = SearchRuntimeOptions {
             ef_search: Some(64),
@@ -565,6 +568,9 @@ fn nytimes_feature_isolation() {
         let mut index = load_index(&path);
         if apply_rcm {
             index.reorder_rcm();
+        }
+        if ti_skip {
+            index.build_edge_distances();
         }
         // Warm caches.
         let warm = SearchRuntimeOptions {

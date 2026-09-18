@@ -246,6 +246,12 @@ pub fn ti_skip_enabled() -> bool {
     *TI_SKIP.get_or_init(|| env_bool("VECTORDB_TI_SKIP").unwrap_or(false))
 }
 
+static SQ8_SCREEN: OnceLock<bool> = OnceLock::new();
+
+pub fn sq8_screen_enabled() -> bool {
+    *SQ8_SCREEN.get_or_init(|| env_bool("VECTORDB_SQ8_SCREEN").unwrap_or(false))
+}
+
 pub(crate) fn diversity_alpha_for_level(level: usize) -> f32 {
     if let Some(alpha) = DIVERSITY_ALPHA.get_or_init(|| {
         env_f32("VECTORDB_DIVERSITY_ALPHA").filter(|value| value.is_finite() && *value > 0.0)

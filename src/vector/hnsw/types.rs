@@ -44,6 +44,12 @@ pub struct SearchRuntimeOptions {
     /// Set to 0 to disable SQ8 traversal. Overrides `VECTORDB_SQ8_RERANK_FACTOR`.
     /// Has no effect if `quantize_all()` has not been called on the index.
     pub sq8_rerank_factor: Option<usize>,
+    /// Screen each L0 neighbor with a fast integer dot product before prefetching its
+    /// f32 vector. Neighbors whose SQ8 score is clearly below the current worst result
+    /// are skipped, saving the f32 prefetch + distance computation. Effective at high ef
+    /// where most candidates are rejected. Requires quantize_all() to be called first.
+    /// Overrides `VECTORDB_SQ8_SCREEN`.
+    pub sq8_screen: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -556,21 +556,26 @@ fn nytimes_feature_isolation() {
         .map(|r| r.to_vec())
         .collect();
 
-    // (label, apply_rcm, ti_skip, patience)
-    let configs: &[(&str, bool, bool, usize)] = &[
-        ("baseline", false, false, 2),
-        ("patience3", false, false, 3),
-        ("rcm", true, false, 3),
-        ("rcm+ti", true, true, 3),
+    // (label, apply_rcm, ti_skip, sq8_screen, patience)
+    let configs: &[(&str, bool, bool, bool, usize)] = &[
+        ("baseline", false, false, false, 2),
+        ("patience3", false, false, false, 3),
+        ("rcm", true, false, false, 3),
+        ("rcm+ti", true, true, false, 3),
+        ("sq8_screen", false, false, true, 3),
+        ("rcm+sq8_screen", true, false, true, 3),
     ];
 
-    for &(label, apply_rcm, ti_skip, patience) in configs {
+    for &(label, apply_rcm, ti_skip, sq8_screen, patience) in configs {
         let mut index = load_index(&path);
         if apply_rcm {
             index.reorder_rcm();
         }
         if ti_skip {
             index.build_edge_distances();
+        }
+        if sq8_screen {
+            index.quantize_all();
         }
         // Warm caches.
         let warm = SearchRuntimeOptions {
@@ -585,6 +590,7 @@ fn nytimes_feature_isolation() {
             let opts = SearchRuntimeOptions {
                 ef_search: Some(ef),
                 use_ti_skip: Some(ti_skip),
+                sq8_screen: Some(sq8_screen),
                 early_exit_patience: Some(patience),
                 ..Default::default()
             };

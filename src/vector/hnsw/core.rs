@@ -1155,30 +1155,144 @@ impl HNSWIndex {
     }
 
     /// Fast dot product for SQ8 screening: stored u8 codes (centered at 128) × i8 query.
-    /// Equivalent to sq8_approx_dot but uses i8 query codes and a loop structure that
-    /// the compiler auto-vectorises into NEON vmlal or AVX2 madd.
-    /// Monotone with true cosine similarity — higher = closer.
+    /// Dispatches to NEON sdot on aarch64 (4 cache lines vs 16 for f32), scalar fallback
+    /// elsewhere. Monotone with true cosine similarity — higher = closer.
     #[inline]
     pub(crate) fn screen_dot(query_i8: &[i8], stored: &[u8]) -> i32 {
-        // Four independent accumulators break the dependency chain for auto-vectorisation.
-        let n = query_i8.len().min(stored.len());
-        let mut a = [0i32; 4];
-        let mut i = 0;
-        while i + 4 <= n {
-            a[0] += (query_i8[i] as i32) * (stored[i] as i32 - 128);
-            a[1] += (query_i8[i + 1] as i32) * (stored[i + 1] as i32 - 128);
-            a[2] += (query_i8[i + 2] as i32) * (stored[i + 2] as i32 - 128);
-            a[3] += (query_i8[i + 3] as i32) * (stored[i + 3] as i32 - 128);
-            i += 4;
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return unsafe { screen_dot_neon_sdot(query_i8, stored) };
         }
-        let mut acc = a[0] + a[1] + a[2] + a[3];
-        while i < n {
-            acc += (query_i8[i] as i32) * (stored[i] as i32 - 128);
-            i += 1;
+        #[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { screen_dot_avx2(query_i8, stored) };
         }
-        acc
+        screen_dot_scalar(query_i8, stored)
     }
 }
+
+fn screen_dot_scalar(query_i8: &[i8], stored: &[u8]) -> i32 {
+    let n = query_i8.len().min(stored.len());
+    let mut a = [0i32; 4];
+    let mut i = 0;
+    while i + 4 <= n {
+        a[0] += (query_i8[i] as i32) * (stored[i] as i32 - 128);
+        a[1] += (query_i8[i + 1] as i32) * (stored[i + 1] as i32 - 128);
+        a[2] += (query_i8[i + 2] as i32) * (stored[i + 2] as i32 - 128);
+        a[3] += (query_i8[i + 3] as i32) * (stored[i + 3] as i32 - 128);
+        i += 4;
+    }
+    let mut acc = a[0] + a[1] + a[2] + a[3];
+    while i < n {
+        acc += (query_i8[i] as i32) * (stored[i] as i32 - 128);
+        i += 1;
+    }
+    acc
+}
+
+/// NEON sdot: vdotq_s32 processes 4 groups of 4 i8 products per instruction.
+/// For 256-dim: 256/16 = 16 sdot calls with 4 accumulators = 4 iterations of 64 values.
+/// Memory: 256 B/vector (4 cache lines) vs 1024 B for f32 (16 cache lines).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn screen_dot_neon_sdot(query_i8: &[i8], stored: &[u8]) -> i32 {
+    use std::arch::aarch64::*;
+    let n = query_i8.len().min(stored.len());
+    let sub128 = vdupq_n_u8(128);
+    let mut acc0 = vdupq_n_s32(0);
+    let mut acc1 = vdupq_n_s32(0);
+    let mut acc2 = vdupq_n_s32(0);
+    let mut acc3 = vdupq_n_s32(0);
+    let mut i = 0;
+    while i + 64 <= n {
+        let q0 = vld1q_s8(query_i8.as_ptr().add(i));
+        let q1 = vld1q_s8(query_i8.as_ptr().add(i + 16));
+        let q2 = vld1q_s8(query_i8.as_ptr().add(i + 32));
+        let q3 = vld1q_s8(query_i8.as_ptr().add(i + 48));
+        // Subtract 128 from u8: u8-128 wraps to the correct signed i8 bit pattern.
+        let s0 = vreinterpretq_s8_u8(vsubq_u8(vld1q_u8(stored.as_ptr().add(i)), sub128));
+        let s1 = vreinterpretq_s8_u8(vsubq_u8(vld1q_u8(stored.as_ptr().add(i + 16)), sub128));
+        let s2 = vreinterpretq_s8_u8(vsubq_u8(vld1q_u8(stored.as_ptr().add(i + 32)), sub128));
+        let s3 = vreinterpretq_s8_u8(vsubq_u8(vld1q_u8(stored.as_ptr().add(i + 48)), sub128));
+        acc0 = vdotq_s32(acc0, q0, s0);
+        acc1 = vdotq_s32(acc1, q1, s1);
+        acc2 = vdotq_s32(acc2, q2, s2);
+        acc3 = vdotq_s32(acc3, q3, s3);
+        i += 64;
+    }
+    while i + 16 <= n {
+        let q = vld1q_s8(query_i8.as_ptr().add(i));
+        let s = vreinterpretq_s8_u8(vsubq_u8(vld1q_u8(stored.as_ptr().add(i)), sub128));
+        acc0 = vdotq_s32(acc0, q, s);
+        i += 16;
+    }
+    acc0 = vaddq_s32(acc0, acc1);
+    acc2 = vaddq_s32(acc2, acc3);
+    acc0 = vaddq_s32(acc0, acc2);
+    let mut sum = vaddvq_s32(acc0);
+    while i < n {
+        sum += (*query_i8.get_unchecked(i) as i32) * (*stored.get_unchecked(i) as i32 - 128);
+        i += 1;
+    }
+    sum
+}
+
+/// AVX2 path using maddubs + madd pattern.
+#[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn screen_dot_avx2(query_i8: &[i8], stored: &[u8]) -> i32 {
+    use std::arch::x86_64::*;
+    // maddubs(u8, i8): multiplies pairs of unsigned×signed bytes, adds adjacent pairs → i16.
+    // We pass stored (u8) as first arg and query (i8 cast to u8 by adding 128) as second,
+    // then correct the bias with a separate accumulator.
+    let n = query_i8.len().min(stored.len());
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = _mm256_setzero_si256();
+    let mut i = 0;
+    while i + 32 <= n {
+        let s = _mm256_loadu_si256(stored.as_ptr().add(i) as *const __m256i);
+        // treat query i8 as u8 offset by 128: q_u8[d] = q_i8[d] + 128
+        let q_raw = _mm256_loadu_si256(query_i8.as_ptr().add(i) as *const __m256i);
+        let offset128 = _mm256_set1_epi8(-128i8); // = 128 as u8
+        let q_u8 = _mm256_add_epi8(q_raw, offset128);
+        // maddubs(s[u8], q_u8[u8]): s×q_u8, adjacent pairs summed → i16
+        // But q_u8 is interpreted as i8 by maddubs... actually:
+        // _mm256_maddubs_epi16(a: u8, b: i8) computes a*b not b*a. Treat s as u8, q_u8 as i8.
+        // Since q_u8 = q_i8 + 128, the range is [0,255] interpreted as i8 wraps, but
+        // this gives wrong products. Use widening multiply instead.
+        // Widen s (u8) and q_raw (i8) to i16, multiply, reduce.
+        let s_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(s));
+        let s_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(s, 1));
+        let q_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(q_raw));
+        let q_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(q_raw, 1));
+        // Subtract 128 from s as i16 to center it
+        let bias = _mm256_set1_epi16(128);
+        let s_lo_c = _mm256_sub_epi16(s_lo, bias);
+        let s_hi_c = _mm256_sub_epi16(s_hi, bias);
+        // Multiply i16 × i16 → keep low 16 bits, then use madd to accumulate into i32
+        let prod_lo = _mm256_madd_epi16(_mm256_mullo_epi16(s_lo_c, q_lo), ones);
+        let prod_hi = _mm256_madd_epi16(_mm256_mullo_epi16(s_hi_c, q_hi), ones);
+        acc = _mm256_add_epi32(acc, _mm256_add_epi32(prod_lo, prod_hi));
+        i += 32;
+    }
+    // Reduce acc (8 × i32) to scalar
+    let sum128 = _mm_add_epi32(
+        _mm256_castsi256_si128(acc),
+        _mm256_extracti128_si256(acc, 1),
+    );
+    let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0b_01_00_11_10));
+    let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 1));
+    let mut result = _mm_cvtsi128_si32(sum32);
+    while i < n {
+        result += (*query_i8.get_unchecked(i) as i32) * (*stored.get_unchecked(i) as i32 - 128);
+        i += 1;
+    }
+    result
+}
+
+impl HNSWIndex {}
 
 #[cfg(test)]
 mod tests {
@@ -1279,6 +1393,68 @@ mod tests {
         println!(
             "kernel metric={:?} dim={} vecs={} iters={} total={} scores/s={:.2} ns/score={:.2} acc={:.4}",
             metric, dim, vecs, iters, total, scores_per_sec, ns_per, acc
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_screen_dot_kernel() {
+        let dim = env::var("VECTORDB_KERNEL_DIM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
+        let vecs = env::var("VECTORDB_KERNEL_VECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000);
+        let iters = env::var("VECTORDB_KERNEL_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500);
+
+        let query_f32: Vector = gen_vec(42, dim)
+            .into_iter()
+            .map(|v| v * 0.5 + 0.5)
+            .collect();
+        let query_norm = {
+            let n: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+            query_f32.iter().map(|x| x / n).collect::<Vec<_>>()
+        };
+        let query_i8: Vec<i8> = query_norm
+            .iter()
+            .map(|&v| (v * 127.5).clamp(-128.0, 127.0).round() as i8)
+            .collect();
+
+        let stored_vecs: Vec<Vec<u8>> = (0..vecs as u32)
+            .map(|seed| {
+                let v = gen_vec(seed, dim);
+                let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                v.iter()
+                    .map(|&x| (x / n * 127.5 + 128.0).clamp(0.0, 255.0).round() as u8)
+                    .collect()
+            })
+            .collect();
+
+        // Correctness check: screen_dot vs scalar
+        for s in &stored_vecs {
+            let fast = HNSWIndex::screen_dot(&query_i8, s);
+            let scalar = screen_dot_scalar(&query_i8, s);
+            assert_eq!(fast, scalar, "screen_dot mismatch");
+        }
+
+        let mut acc: i64 = 0;
+        let start = Instant::now();
+        for _ in 0..iters {
+            for s in &stored_vecs {
+                acc += HNSWIndex::screen_dot(&query_i8, s) as i64;
+            }
+        }
+        let elapsed = start.elapsed();
+        let total = (iters as u64) * (vecs as u64);
+        let ns_per = elapsed.as_secs_f64() * 1e9 / total as f64;
+        println!(
+            "screen_dot dim={} vecs={} iters={} total={} ns/call={:.2} acc={}",
+            dim, vecs, iters, total, ns_per, acc
         );
     }
 }

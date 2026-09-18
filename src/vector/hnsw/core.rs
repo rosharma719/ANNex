@@ -859,6 +859,45 @@ impl HNSWIndex {
 }
 
 impl HNSWIndex {
+    /// Compute and store L0 edge distances, enabling triangle-inequality neighbor
+    /// skipping during search (`VECTORDB_TI_SKIP=true` / `use_ti_skip: Some(true)`).
+    ///
+    /// This is NOT called automatically on snapshot load — doing so caused a ~50%
+    /// throughput regression from heap fragmentation (290k scattered Vec allocations
+    /// competing with the flat vector array for cache). Call this explicitly after
+    /// loading or building an index when TI skip is actually needed.
+    pub fn build_edge_distances(&mut self) {
+        let n = self.len();
+        let dim = self.dim;
+        // Allocate the outer Vec once; inner Vecs are populated below.
+        if self.edge_dists_l0.is_empty() {
+            self.edge_dists_l0 = (0..n)
+                .map(|_| parking_lot::RwLock::new(Vec::new()))
+                .collect();
+        }
+        if let Some(l0) = self.layers.first() {
+            for (idx, nb_lock) in l0.iter().enumerate() {
+                let nb: Vec<usize> = nb_lock.read().clone();
+                if nb.is_empty() {
+                    continue;
+                }
+                let src: Vec<f32> = self.vectors[idx * dim..(idx + 1) * dim].to_vec();
+                let dists: Vec<f32> = nb
+                    .iter()
+                    .map(|&n| {
+                        if n == idx {
+                            return 0.0;
+                        }
+                        self.fast_score(&src, self.vector_slice(n))
+                    })
+                    .collect();
+                *self.edge_dists_l0[idx].write() = dists;
+            }
+        }
+    }
+}
+
+impl HNSWIndex {
     /// Permute node indices using Reverse Cuthill-McKee so that graph-adjacent
     /// nodes at L0 become memory-adjacent. Reduces cache miss rate during BFS.
     /// All node-indexed arrays (vectors, layers, idx_to_point, deleted,

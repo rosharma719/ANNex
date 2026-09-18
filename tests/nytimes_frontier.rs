@@ -151,6 +151,92 @@ fn load_index(path: &str) -> HNSWIndex {
 
 #[test]
 #[ignore]
+fn nytimes_new_frontier() {
+    // Clean isolated benchmark comparing the original baseline against the
+    // fully-stacked optimized configuration:
+    //   original:    ef_search, no TI skip, patience=2 (old default)
+    //   optimized:   RCM reorder + TI skip (ef≤32) + patience=3 (new default)
+    let path = env::var("VECTORDB_NYT_PERSIST_PATH").unwrap_or_else(|_| {
+        "data/nytimes-256-angular/index_m16_m0_32_stored_128_efc300.bin".into()
+    });
+    let queries: Array2<f32> = read_npy("data/nytimes-256-angular/queries.npy").unwrap();
+    let truth: Vec<Vec<u64>> =
+        serde_json::from_slice(&fs::read("data/nytimes-256-angular/ground_truth.json").unwrap())
+            .unwrap();
+    let count = setting("VECTORDB_QUERIES", 1000);
+    let qs: Vec<Vector> = queries
+        .rows()
+        .into_iter()
+        .take(count)
+        .map(|r| r.to_vec())
+        .collect();
+
+    let configs: &[(&str, bool, bool, usize)] = &[
+        // (label, apply_rcm, ti_skip, early_patience)
+        ("original", false, false, 2),
+        ("rcm+ti+patience3", true, true, 3),
+    ];
+
+    for &(label, apply_rcm, ti_skip, patience) in configs {
+        let mut index = load_index(&path);
+        if apply_rcm {
+            let t = Instant::now();
+            index.reorder_rcm();
+            eprintln!("reorder_rcm took {:?}", t.elapsed());
+        }
+        // Warm up caches with one cold pass before timing.
+        let warmup_opts = SearchRuntimeOptions {
+            ef_search: Some(64),
+            use_ti_skip: Some(ti_skip),
+            early_exit_patience: Some(patience),
+            ..Default::default()
+        };
+        for q in &qs {
+            let _ = index.search_with_options(q, 20, &warmup_opts);
+        }
+
+        for &ef in &[32usize, 64, 128, 256, 512] {
+            let opts = SearchRuntimeOptions {
+                ef_search: Some(ef),
+                use_ti_skip: Some(ti_skip),
+                early_exit_patience: Some(patience),
+                ..Default::default()
+            };
+            // Recall pass (untimed).
+            let mut hits = 0;
+            for (i, q) in qs.iter().enumerate() {
+                let r = index.search_with_options(q, 20, &opts).unwrap();
+                hits += r.iter().filter(|x| truth[i][..20].contains(&x.id)).count();
+            }
+            let recall = hits as f64 / (count * 20) as f64;
+            // Timed pass.
+            let mut times = Vec::with_capacity(count);
+            let start = Instant::now();
+            for q in &qs {
+                let t0 = Instant::now();
+                black_box(index.search_with_options(black_box(q), 20, &opts).unwrap());
+                times.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+            times.sort_by(f64::total_cmp);
+            println!(
+                "{}",
+                json!({
+                    "experiment": "new_frontier",
+                    "label": label,
+                    "ef": ef,
+                    "recall": recall,
+                    "qps": count as f64 / elapsed,
+                    "p50_ms": times[count / 2],
+                    "p99_ms": times[(count * 99 / 100).min(count - 1)],
+                })
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore]
 fn nytimes_calibrate_patience() {
     let path = std::env::var("VECTORDB_NYT_PERSIST_PATH").unwrap_or_else(|_| {
         "data/nytimes-256-angular/index_m16_m0_32_stored_128_efc300.bin".into()
@@ -442,6 +528,85 @@ fn nytimes_lid_build_recall() {
                 "{}",
                 json!({"experiment": "lid_build", "n_build": n_build, "lid": apply_lid,
                        "ef": ef, "recall": hits as f64 / (q_count * 20) as f64, "qps": qps})
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn nytimes_feature_isolation() {
+    // Benchmarks each optimization in isolation and in combination to find
+    // the true additive value of each feature. Runs single-process, cache-warmed.
+    let path = env::var("VECTORDB_NYT_PERSIST_PATH").unwrap_or_else(|_| {
+        "data/nytimes-256-angular/index_m16_m0_32_stored_128_efc300.bin".into()
+    });
+    let queries: Array2<f32> = read_npy("data/nytimes-256-angular/queries.npy").unwrap();
+    let truth: Vec<Vec<u64>> =
+        serde_json::from_slice(&fs::read("data/nytimes-256-angular/ground_truth.json").unwrap())
+            .unwrap();
+    let count = setting("VECTORDB_QUERIES", 1000);
+    let qs: Vec<Vector> = queries
+        .rows()
+        .into_iter()
+        .take(count)
+        .map(|r| r.to_vec())
+        .collect();
+
+    // (label, apply_rcm, ti_skip, patience)
+    let configs: &[(&str, bool, bool, usize)] = &[
+        ("baseline", false, false, 2),
+        ("patience3", false, false, 3),
+        ("rcm", true, false, 3),
+        ("rcm+ti", true, true, 3),
+    ];
+
+    for &(label, apply_rcm, ti_skip, patience) in configs {
+        let mut index = load_index(&path);
+        if apply_rcm {
+            index.reorder_rcm();
+        }
+        // Warm caches.
+        let warm = SearchRuntimeOptions {
+            ef_search: Some(64),
+            ..Default::default()
+        };
+        for q in &qs {
+            let _ = index.search_with_options(q, 20, &warm);
+        }
+
+        for &ef in &[32usize, 64, 128, 256, 512] {
+            let opts = SearchRuntimeOptions {
+                ef_search: Some(ef),
+                use_ti_skip: Some(ti_skip),
+                early_exit_patience: Some(patience),
+                ..Default::default()
+            };
+            let mut hits = 0;
+            for (i, q) in qs.iter().enumerate() {
+                let r = index.search_with_options(q, 20, &opts).unwrap();
+                hits += r.iter().filter(|x| truth[i][..20].contains(&x.id)).count();
+            }
+            let recall = hits as f64 / (count * 20) as f64;
+            let mut times = Vec::with_capacity(count);
+            let wall = Instant::now();
+            for q in &qs {
+                let t0 = Instant::now();
+                black_box(index.search_with_options(black_box(q), 20, &opts).unwrap());
+                times.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(f64::total_cmp);
+            println!(
+                "{}",
+                json!({
+                    "experiment": "feature_isolation",
+                    "label": label,
+                    "ef": ef,
+                    "recall": recall,
+                    "qps": count as f64 / wall.elapsed().as_secs_f64(),
+                    "p50_ms": times[count / 2],
+                    "p99_ms": times[(count * 99 / 100).min(count - 1)],
+                })
             );
         }
     }

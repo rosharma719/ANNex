@@ -391,8 +391,7 @@ fn nytimes_sq8_benchmark() {
 #[ignore]
 fn nytimes_lid_build_recall() {
     use annex::utils::types::DistanceMetric;
-    // Use first 50k base vectors for a quick build comparison.
-    let n_build = setting("VECTORDB_LID_BUILD_N", 50_000);
+    let n_build = setting("VECTORDB_LID_BUILD_N", 290_000);
     let base: Array2<f32> = read_npy("data/nytimes-256-angular/base.npy").unwrap();
     let queries: Array2<f32> = read_npy("data/nytimes-256-angular/queries.npy").unwrap();
     let truth: Vec<Vec<u64>> =
@@ -421,9 +420,7 @@ fn nytimes_lid_build_recall() {
         }
         let t = Instant::now();
         let mut index = HNSWIndex::new(DistanceMetric::Cosine, 16, 200, 4, 256);
-        for (id, v) in entries {
-            index.insert(id, v).unwrap();
-        }
+        index.par_insert_batch(&entries).unwrap();
         eprintln!("build({n_build}, lid={apply_lid}) took {:?}", t.elapsed());
 
         for ef in [64usize, 128, 256] {

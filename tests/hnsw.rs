@@ -561,3 +561,83 @@ fn lid_sort_does_not_regress_recall() {
         r_base
     );
 }
+
+// ── VectorArena tests ────────────────────────────────────────────────────────
+
+#[test]
+fn vector_arena_push_and_get() {
+    use annex::vector::hnsw::arena::{VectorArena, VectorArenaView};
+    let arena = VectorArena::new(4, 8);
+    let v0 = vec![1.0f32, 2.0, 3.0, 4.0];
+    let v1 = vec![5.0f32, 6.0, 7.0, 8.0];
+    let idx0 = arena.push(&v0);
+    let idx1 = arena.push(&v1);
+    assert_eq!(idx0, 0);
+    assert_eq!(idx1, 1);
+    let view = arena.view();
+    assert_eq!(view.get(0), v0.as_slice());
+    assert_eq!(view.get(1), v1.as_slice());
+    assert_eq!(arena.len(), 2);
+    // Suppress unused-import warning
+    let _: VectorArenaView = view;
+}
+
+#[test]
+fn vector_arena_crosses_chunk_boundary() {
+    use annex::vector::hnsw::arena::VectorArena;
+    let arena = VectorArena::new(2, 4); // 4 vectors per chunk, dim=2
+    for i in 0..10u64 {
+        let v = vec![i as f32, i as f32 * 2.0];
+        arena.push(&v);
+    }
+    assert_eq!(arena.len(), 10);
+    let view = arena.view();
+    for i in 0..10u64 {
+        let got = view.get(i as usize);
+        assert_eq!(got[0], i as f32);
+        assert_eq!(got[1], i as f32 * 2.0);
+    }
+}
+
+#[test]
+fn vector_arena_view_survives_concurrent_push() {
+    use annex::vector::hnsw::arena::VectorArena;
+    use std::sync::Arc;
+    let arena = Arc::new(VectorArena::new(2, 4));
+    arena.push(&[1.0f32, 2.0]);
+    arena.push(&[3.0f32, 4.0]);
+    let view = arena.view();
+    let arena2 = arena.clone();
+    let handle = std::thread::spawn(move || {
+        for i in 0..20i32 {
+            arena2.push(&[i as f32, i as f32]);
+        }
+    });
+    // Original view still valid and correct while concurrent pushes happen
+    assert_eq!(view.get(0), &[1.0f32, 2.0]);
+    assert_eq!(view.get(1), &[3.0f32, 4.0]);
+    handle.join().unwrap();
+    assert_eq!(arena.len(), 22);
+}
+
+#[test]
+fn vector_arena_addresses_stable_across_chunk_growth() {
+    // Capture a raw pointer into the arena before growth, verify it's unchanged after.
+    use annex::vector::hnsw::arena::VectorArena;
+    let arena = VectorArena::new(4, 4); // 4 per chunk
+    arena.push(&[1.0f32, 2.0, 3.0, 4.0]);
+    let view_before = arena.view();
+    let ptr_before: *const f32 = view_before.get(0).as_ptr();
+    // Push enough to force multiple new chunks
+    for i in 0..20i32 {
+        arena.push(&[i as f32, 0.0, 0.0, 0.0]);
+    }
+    let view_after = arena.view();
+    let ptr_after: *const f32 = view_after.get(0).as_ptr();
+    // Address must be identical — chunk data never moves
+    assert_eq!(
+        ptr_before, ptr_after,
+        "vector address changed after growth — not stable!"
+    );
+    assert_eq!(view_after.get(0), &[1.0f32, 2.0, 3.0, 4.0]);
+}

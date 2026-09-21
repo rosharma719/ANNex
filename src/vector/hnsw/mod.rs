@@ -1,3 +1,4 @@
+pub mod arena;
 pub mod config;
 mod core;
 mod filter;

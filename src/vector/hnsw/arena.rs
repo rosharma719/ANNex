@@ -26,6 +26,7 @@
 //! let vec: &[f32] = view.get(idx);
 //! ```
 
+use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -34,44 +35,62 @@ use parking_lot::{Mutex, RwLock};
 
 /// One fixed-size chunk of f32 vector data.
 ///
-/// `data` is preallocated to `chunk_capacity * dim` f32 values and **never resized**.
-/// Addresses inside it are permanently stable for the lifetime of this `Arc<VectorChunk>`.
+/// Each f32 element is wrapped in its own `UnsafeCell` so Miri can verify that
+/// writes to slot N do not alias reads from slot M (different `UnsafeCell` instances).
+/// This is the correct granularity for Stacked Borrows / Tree Borrows aliasing models.
+///
+/// `data` is preallocated to `chunk_capacity * dim` cells and **never resized**.
+/// Addresses of individual cells are permanently stable.
 pub(crate) struct VectorChunk {
-    data: Box<[f32]>,
+    data: Box<[UnsafeCell<f32>]>,
 }
+
+// SAFETY: VectorChunk is shared across threads. Each cell is written exactly once
+// (by the thread holding VectorArena::writer mutex) and read-only afterwards.
+// UnsafeCell disables Rust's read-only aliasing guarantees; callers are responsible
+// for ensuring write-before-read ordering via the NodeState Release/Acquire protocol.
+unsafe impl Sync for VectorChunk {}
+unsafe impl Send for VectorChunk {}
 
 impl VectorChunk {
     fn new(chunk_capacity: usize, dim: usize) -> Arc<Self> {
+        let data: Vec<UnsafeCell<f32>> = (0..chunk_capacity * dim)
+            .map(|_| UnsafeCell::new(0.0f32))
+            .collect();
         Arc::new(Self {
-            data: vec![0.0f32; chunk_capacity * dim].into_boxed_slice(),
+            data: data.into_boxed_slice(),
         })
     }
 
     /// Write `vec` into slot `local_idx`.
     ///
     /// # Safety
-    /// Caller must hold the `VectorArena::writer` mutex, ensuring no other thread
-    /// writes this slot concurrently. Readers cannot observe this slot until after
-    /// the node's `NodeState` is set to `LIVE` (see `arena` module docs).
+    /// Caller must hold the `VectorArena::writer` mutex (no concurrent writes).
+    /// Readers cannot observe this slot until `NodeState` is published as LIVE.
     fn write(&self, local_idx: usize, dim: usize, vec: &[f32]) {
         let start = local_idx * dim;
-        // SAFETY: we have exclusive write access via the writer mutex.
-        // The Box allocation is stable — this pointer is valid for the chunk's lifetime.
-        // We cast the Box's data pointer to *mut f32 to write the target slice.
-        let base = self.data.as_ptr() as *mut f32;
-        unsafe {
-            let dest = std::slice::from_raw_parts_mut(base.add(start), dim);
-            dest.copy_from_slice(vec);
+        for i in 0..dim {
+            // SAFETY: writer mutex ensures exclusive write access to this slot.
+            // Each UnsafeCell<f32> is an independent aliasing unit.
+            unsafe { *self.data[start + i].get() = vec[i] };
         }
     }
 
-    /// Return the slice for slot `local_idx`.
+    /// Return a shared slice for slot `local_idx`.
     ///
     /// # Safety
-    /// Caller must ensure `local_idx < chunk_capacity` and the slot has been written.
+    /// Caller must ensure the slot has been written and published (NodeState = LIVE
+    /// with Release/Acquire fence). Each UnsafeCell<f32> may only be read after
+    /// its corresponding write has been published.
     #[inline]
     unsafe fn slice(&self, local_idx: usize, dim: usize) -> &[f32] {
-        &self.data[local_idx * dim..(local_idx + 1) * dim]
+        let start = local_idx * dim;
+        // SAFETY: UnsafeCell<f32> has the same layout as f32. We reinterpret a
+        // slice of UnsafeCell<f32> as &[f32]. The slice is valid until the chunk
+        // is dropped (kept alive by Arc). No writes to these cells happen after
+        // publication (write-once protocol).
+        let ptr = self.data[start].get() as *const f32;
+        std::slice::from_raw_parts(ptr, dim)
     }
 }
 
@@ -268,14 +287,14 @@ struct ArrayWriter<T> {
 /// Instead:
 /// - For multi-access hot paths: acquire a `ChunkedArrayView` once with `view()`.
 /// - For single-access mutation: use `with(idx, |slot| ...)`.
-pub(crate) struct ChunkedArray<T: Default + Send + Sync + 'static> {
+pub struct ChunkedArray<T: Default + Send + Sync + 'static> {
     chunks: RwLock<Arc<[Arc<ArrayChunk<T>>]>>,
     chunk_capacity: usize,
     writer: Mutex<ArrayWriter<T>>,
 }
 
 impl<T: Default + Send + Sync + 'static> ChunkedArray<T> {
-    pub(crate) fn new(chunk_capacity: usize) -> Self {
+    pub fn new(chunk_capacity: usize) -> Self {
         assert!(chunk_capacity > 0);
         Self {
             chunks: RwLock::new(Arc::from(Vec::<Arc<ArrayChunk<T>>>::new())),
@@ -288,7 +307,7 @@ impl<T: Default + Send + Sync + 'static> ChunkedArray<T> {
     }
 
     /// Allocate one slot initialised to `T::default()`; return its stable index.
-    pub(crate) fn push_default(&self) -> usize {
+    pub fn push_default(&self) -> usize {
         let mut w = self.writer.lock();
         let idx = w.total;
         let local_idx = idx % self.chunk_capacity;
@@ -304,7 +323,7 @@ impl<T: Default + Send + Sync + 'static> ChunkedArray<T> {
     }
 
     /// Acquire a snapshot view. One `Arc` clone; no lock held afterwards.
-    pub(crate) fn view(&self) -> ChunkedArrayView<T> {
+    pub fn view(&self) -> ChunkedArrayView<T> {
         ChunkedArrayView {
             chunks: self.chunks.read().clone(),
             chunk_capacity: self.chunk_capacity,
@@ -316,7 +335,7 @@ impl<T: Default + Send + Sync + 'static> ChunkedArray<T> {
     /// Acquires a snapshot view briefly, calls `f`, drops the view.
     /// Use this for write-path mutations (e.g. `store` on an `AtomicBool`).
     #[inline]
-    pub(crate) fn with<F, R>(&self, idx: usize, f: F) -> R
+    pub fn with<F, R>(&self, idx: usize, f: F) -> R
     where
         F: FnOnce(&T) -> R,
     {
@@ -324,11 +343,11 @@ impl<T: Default + Send + Sync + 'static> ChunkedArray<T> {
         f(view.get(idx))
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.writer.lock().total
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
@@ -337,7 +356,7 @@ impl<T: Default + Send + Sync + 'static> ChunkedArray<T> {
 ///
 /// Holds one `Arc<[Arc<ArrayChunk<T>>]>` — no lock is held after construction.
 /// `get(idx)` returns a `&T` with lifetime tied to this view.
-pub(crate) struct ChunkedArrayView<T: Send + Sync + 'static> {
+pub struct ChunkedArrayView<T: Send + Sync + 'static> {
     chunks: Arc<[Arc<ArrayChunk<T>>]>,
     chunk_capacity: usize,
 }
@@ -348,7 +367,7 @@ impl<T: Default + Send + Sync + 'static> ChunkedArrayView<T> {
     /// # Panics
     /// Panics if `idx` was pushed after this view was taken.
     #[inline]
-    pub(crate) fn get(&self, idx: usize) -> &T {
+    pub fn get(&self, idx: usize) -> &T {
         // SAFETY: (a) slot was initialised by push_default() → ArrayChunk::new()
         //             which fills every element with T::default();
         //         (b) this view holds an Arc to the chunk, keeping its Box alive;

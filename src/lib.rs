@@ -76,4 +76,7 @@ pub use crate::segment::{
 pub use crate::utils::errors::DBError;
 pub use crate::utils::payload::{Payload, PayloadValue, ScalarComparisonOp};
 pub use crate::utils::types::{DistanceMetric, PointId, Score, Vector};
+pub use crate::vector::hnsw::arena::{
+    ChunkedArray, ChunkedArrayView, VectorArena, VectorArenaView,
+};
 pub use crate::vector::hnsw::{ScoredPoint, SearchRuntimeOptions};

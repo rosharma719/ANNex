@@ -641,3 +641,104 @@ fn vector_arena_addresses_stable_across_chunk_growth() {
     );
     assert_eq!(view_after.get(0), &[1.0f32, 2.0, 3.0, 4.0]);
 }
+
+// ── ChunkedArray tests ───────────────────────────────────────────────────────
+
+#[test]
+fn chunked_array_push_and_access() {
+    use annex::vector::hnsw::arena::ChunkedArray;
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+    let arr: ChunkedArray<AtomicBool> = ChunkedArray::new(4);
+    let i0 = arr.push_default();
+    let i1 = arr.push_default();
+    assert_eq!(i0, 0);
+    assert_eq!(i1, 1);
+    assert_eq!(arr.len(), 2);
+
+    // Default is false
+    arr.with(0, |b| assert_eq!(b.load(Ordering::Relaxed), false));
+    // Store true, verify
+    arr.with(0, |b| b.store(true, Ordering::Relaxed));
+    arr.with(0, |b| assert_eq!(b.load(Ordering::Relaxed), true));
+    arr.with(1, |b| assert_eq!(b.load(Ordering::Relaxed), false));
+
+    // AtomicU8
+    let arr8: ChunkedArray<AtomicU8> = ChunkedArray::new(4);
+    let idx = arr8.push_default();
+    arr8.with(idx, |v| v.store(42, Ordering::Relaxed));
+    arr8.with(idx, |v| assert_eq!(v.load(Ordering::Relaxed), 42));
+}
+
+#[test]
+fn chunked_array_crosses_chunk_boundary() {
+    use annex::vector::hnsw::arena::ChunkedArray;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    let arr: ChunkedArray<AtomicU8> = ChunkedArray::new(4); // 4 per chunk
+    for i in 0..10u8 {
+        let idx = arr.push_default();
+        arr.with(idx, |v| v.store(i, Ordering::Relaxed));
+    }
+    assert_eq!(arr.len(), 10);
+    for i in 0..10u8 {
+        arr.with(i as usize, |v| assert_eq!(v.load(Ordering::Relaxed), i));
+    }
+}
+
+#[test]
+fn chunked_array_slot_addresses_stable_across_growth() {
+    use annex::vector::hnsw::arena::ChunkedArray;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    let arr: ChunkedArray<AtomicU8> = ChunkedArray::new(4);
+    arr.push_default();
+    // Capture the raw address of slot 0
+    let ptr0 = arr.view().get(0) as *const AtomicU8;
+    // Push enough to force multiple new chunks
+    for _ in 0..20 {
+        arr.push_default();
+    }
+    let ptr0_after = arr.view().get(0) as *const AtomicU8;
+    assert_eq!(
+        ptr0, ptr0_after,
+        "slot 0 address changed after growth — not stable!"
+    );
+}
+
+#[test]
+fn chunked_array_view_stable_during_concurrent_push() {
+    use annex::vector::hnsw::arena::ChunkedArray;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    let arr: Arc<ChunkedArray<AtomicU8>> = Arc::new(ChunkedArray::new(4));
+    arr.push_default();
+    arr.push_default();
+    arr.with(0, |v| v.store(7, Ordering::Relaxed));
+    arr.with(1, |v| v.store(13, Ordering::Relaxed));
+
+    let view = arr.view();
+    let arr2 = arr.clone();
+    let handle = std::thread::spawn(move || {
+        for _ in 0..100 {
+            arr2.push_default();
+        }
+    });
+    // View is stable while concurrent pushes happen
+    assert_eq!(view.get(0).load(Ordering::Relaxed), 7);
+    assert_eq!(view.get(1).load(Ordering::Relaxed), 13);
+    handle.join().unwrap();
+}
+
+#[test]
+fn chunked_array_with_parking_lot_rwlock() {
+    // Verifies ChunkedArray works with parking_lot::RwLock<Vec<usize>>,
+    // which is the type used for graph neighbor lists.
+    use annex::vector::hnsw::arena::ChunkedArray;
+    use parking_lot::RwLock;
+    let arr: ChunkedArray<RwLock<Vec<usize>>> = ChunkedArray::new(4);
+    let i0 = arr.push_default(); // RwLock::default() = unlocked, Vec::default() = empty
+    let i1 = arr.push_default();
+    arr.with(i0, |lock| lock.write().extend_from_slice(&[1, 2, 3]));
+    arr.with(i1, |lock| lock.write().push(42));
+    arr.with(i0, |lock| assert_eq!(*lock.read(), vec![1, 2, 3]));
+    arr.with(i1, |lock| assert_eq!(*lock.read(), vec![42]));
+}

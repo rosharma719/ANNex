@@ -636,3 +636,86 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len() % 4, 0);
     1.0 - sums.into_iter().sum::<f32>()
 }
+
+/// Pareto sweep: reads config from env vars set by run_annexdb.sh.
+/// Emits one JSON line per (config, ef) with full latency percentiles.
+#[test]
+#[ignore]
+fn nytimes_pareto_sweep() {
+    let path = env::var("VECTORDB_NYT_PERSIST_PATH").unwrap_or_else(|_| {
+        "data/nytimes-256-angular/index_m16_m0_32_stored_128_efc300.bin".into()
+    });
+    let label = env::var("ANNEX_BENCH_LABEL").unwrap_or_else(|_| "annexdb".into());
+    let apply_rcm = env::var("ANNEX_BENCH_RCM").unwrap_or_default() == "true";
+    let apply_sq8 = env::var("ANNEX_BENCH_SQ8").unwrap_or_default() == "true";
+    let efs: Vec<usize> = env::var("VECTORDB_EF_SEARCH_LIST")
+        .unwrap_or_else(|_| "32,64,128,256,512".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+
+    let queries: Array2<f32> = read_npy("data/nytimes-256-angular/queries.npy").unwrap();
+    let truth: Vec<Vec<u64>> =
+        serde_json::from_slice(&fs::read("data/nytimes-256-angular/ground_truth.json").unwrap())
+            .unwrap();
+    let count = 1000usize;
+    let qs: Vec<Vector> = queries
+        .rows()
+        .into_iter()
+        .take(count)
+        .map(|r| r.to_vec())
+        .collect();
+
+    let mut index = load_index(&path);
+    if apply_rcm {
+        index.reorder_rcm();
+    }
+    if apply_sq8 {
+        index.quantize_all();
+    }
+
+    // Cache warm
+    let warm = SearchRuntimeOptions {
+        ef_search: Some(64),
+        ..Default::default()
+    };
+    for q in &qs {
+        let _ = index.search_with_options(q, 20, &warm);
+    }
+
+    for ef in efs {
+        let opts = SearchRuntimeOptions {
+            ef_search: Some(ef),
+            sq8_screen: Some(apply_sq8),
+            ..Default::default()
+        };
+        let mut hits = 0;
+        for (i, q) in qs.iter().enumerate() {
+            let r = index.search_with_options(q, 20, &opts).unwrap();
+            hits += r.iter().filter(|x| truth[i][..20].contains(&x.id)).count();
+        }
+        let recall = hits as f64 / (count * 20) as f64;
+        let mut times = Vec::with_capacity(count);
+        let wall = Instant::now();
+        for q in &qs {
+            let t0 = Instant::now();
+            black_box(index.search_with_options(black_box(q), 20, &opts).unwrap());
+            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let qps = count as f64 / wall.elapsed().as_secs_f64();
+        times.sort_by(f64::total_cmp);
+        println!(
+            "{}",
+            json!({
+                "lib": "annexdb",
+                "config": label,
+                "ef": ef,
+                "recall": recall,
+                "qps": qps,
+                "p50_ms": times[count / 2],
+                "p95_ms": times[(count * 95 / 100).min(count - 1)],
+                "p99_ms": times[(count * 99 / 100).min(count - 1)],
+            })
+        );
+    }
+}

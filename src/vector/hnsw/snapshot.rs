@@ -183,6 +183,12 @@ impl HNSWIndex {
             }
         }
 
+        // Edge distances are NOT backfilled on load. They are computed lazily by
+        // build_edge_distances() only when TI skip is actually needed. Pre-computing
+        // them on every snapshot load caused a ~50% throughput regression on the
+        // 290k NYT index due to heap fragmentation from 290k scattered Vec allocations.
+        let edge_dists_l0: Vec<parking_lot::RwLock<Vec<f32>>> = Vec::new();
+
         Self {
             layers,
             vectors,
@@ -200,7 +206,13 @@ impl HNSWIndex {
             level_scale: snapshot.level_scale,
             current_max_level: snapshot.current_max_level,
             dim: snapshot.dim,
+            deleted_count: deleted.iter().filter(|&&flag| flag).count(),
             deleted,
+            edge_dists_l0,
+            // SQ8 quantization is not persisted; rebuilt lazily via quantize_all().
+            quantized: Vec::new(),
+            quant_min: Vec::new(),
+            quant_scale: Vec::new(),
             point_to_idx,
             idx_to_point: ids,
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),

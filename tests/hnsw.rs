@@ -389,3 +389,175 @@ fn test_high_dimensional_accuracy() {
 
     assert_eq!(results[0].id, 1, "Expected ID 1 to be closest to query");
 }
+
+#[test]
+fn reorder_rcm_preserves_search_results() {
+    use annex::utils::types::DistanceMetric;
+    use annex::vector::hnsw::HNSWIndex;
+    let mut index = HNSWIndex::new(DistanceMetric::Cosine, 8, 50, 4, 16);
+    let mut rng_state = 12345u64;
+    let mut lcg = || -> f32 {
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (rng_state >> 33) as f32 / u32::MAX as f32
+    };
+    for i in 0..100u64 {
+        let v: Vec<f32> = (0..16).map(|_| lcg()).collect();
+        index.insert(i, v).unwrap();
+    }
+    let query: Vec<f32> = (0..16).map(|j| if j == 0 { 1.0 } else { 0.0 }).collect();
+    let before = index.search(&query, 10).unwrap();
+    index.reorder_rcm();
+    let after = index.search(&query, 10).unwrap();
+    let before_ids: Vec<u64> = before.iter().map(|r| r.id).collect();
+    let after_ids: Vec<u64> = after.iter().map(|r| r.id).collect();
+    assert_eq!(
+        before_ids, after_ids,
+        "reorder must not change search results"
+    );
+}
+
+#[test]
+fn ti_skip_matches_baseline_recall() {
+    use annex::vector::hnsw::SearchRuntimeOptions;
+    let mut index = HNSWIndex::new(DistanceMetric::Cosine, 16, 200, 4, 8);
+    let vecs: Vec<Vec<f32>> = (0..200u64)
+        .map(|i| {
+            let mut v = vec![0.0f32; 8];
+            v[i as usize % 8] = 1.0;
+            v[(i as usize + 1) % 8] = 0.5;
+            v
+        })
+        .collect();
+    for (i, v) in vecs.iter().enumerate() {
+        index.insert(i as u64, v.clone()).unwrap();
+    }
+    let query = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let baseline_opts = SearchRuntimeOptions {
+        ef_search: Some(50),
+        use_ti_skip: Some(false),
+        ..Default::default()
+    };
+    let ti_opts = SearchRuntimeOptions {
+        ef_search: Some(50),
+        use_ti_skip: Some(true),
+        ..Default::default()
+    };
+    let baseline = index
+        .search_with_options(&query, 10, &baseline_opts)
+        .unwrap();
+    let ti_result = index.search_with_options(&query, 10, &ti_opts).unwrap();
+    // TI skip is an approximation; top-1 must match exactly.
+    assert_eq!(baseline[0].id, ti_result[0].id, "top-1 must match");
+    // At least 80% recall for the top-10 set.
+    let baseline_ids: std::collections::HashSet<_> = baseline.iter().map(|r| r.id).collect();
+    let overlap = ti_result
+        .iter()
+        .filter(|r| baseline_ids.contains(&r.id))
+        .count();
+    assert!(overlap >= 8, "TI skip recall vs baseline: {}/10", overlap);
+}
+
+#[test]
+fn sq8_rerank_top1_matches_f32() {
+    use annex::utils::types::DistanceMetric;
+    use annex::vector::hnsw::{HNSWIndex, SearchRuntimeOptions};
+    let mut index = HNSWIndex::new(DistanceMetric::Cosine, 8, 50, 4, 16);
+    let mut rng = 99u64;
+    let lcg = |r: &mut u64| -> f32 {
+        *r = r
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*r >> 33) as f32 / u32::MAX as f32
+    };
+    for i in 0..150u64 {
+        let v: Vec<f32> = (0..16).map(|_| lcg(&mut rng)).collect();
+        index.insert(i, v).unwrap();
+    }
+    index.quantize_all();
+    let query: Vec<f32> = (0..16).map(|j| if j < 4 { 0.7 } else { 0.0 }).collect();
+    let f32_opts = SearchRuntimeOptions {
+        ef_search: Some(50),
+        sq8_rerank_factor: Some(0),
+        ..Default::default()
+    };
+    let sq8_opts = SearchRuntimeOptions {
+        ef_search: Some(50),
+        sq8_rerank_factor: Some(4),
+        ..Default::default()
+    };
+    let f32_res = index.search_with_options(&query, 5, &f32_opts).unwrap();
+    let sq8_res = index.search_with_options(&query, 5, &sq8_opts).unwrap();
+    assert_eq!(f32_res[0].id, sq8_res[0].id, "top-1 must match");
+    let f32_ids: std::collections::HashSet<_> = f32_res.iter().map(|r| r.id).collect();
+    let overlap = sq8_res.iter().filter(|r| f32_ids.contains(&r.id)).count();
+    assert!(overlap >= 3, "SQ8 recall vs f32: {}/5", overlap);
+}
+
+#[test]
+fn lid_sort_does_not_regress_recall() {
+    use annex::utils::types::DistanceMetric;
+    use annex::vector::hnsw::{HNSWIndex, SearchRuntimeOptions};
+
+    fn build_index(apply_lid: bool) -> HNSWIndex {
+        let mut index = HNSWIndex::new(DistanceMetric::Cosine, 8, 100, 4, 32);
+        let mut rng = 42u64;
+        let mut lcg = || -> f32 {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as f32 / u32::MAX as f32
+        };
+        let mut entries: Vec<(u64, Vec<f32>)> = (0..500u64)
+            .map(|i| (i, (0..32).map(|_| lcg()).collect()))
+            .collect();
+        if apply_lid {
+            HNSWIndex::sort_by_lid(&mut entries);
+        }
+        for (id, v) in entries {
+            index.insert(id, v).unwrap();
+        }
+        index
+    }
+
+    let mut rng = 999u64;
+    let mut lcg = || -> f32 {
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (rng >> 33) as f32 / u32::MAX as f32
+    };
+    let queries: Vec<Vec<f32>> = (0..50).map(|_| (0..32).map(|_| lcg()).collect()).collect();
+
+    let baseline = build_index(false);
+    let lid = build_index(true);
+
+    let eval = |index: &HNSWIndex| -> f64 {
+        let truth_opts = SearchRuntimeOptions {
+            ef_search: Some(450),
+            ..Default::default()
+        };
+        let eval_opts = SearchRuntimeOptions {
+            ef_search: Some(20),
+            ..Default::default()
+        };
+        let mut hits = 0usize;
+        for q in &queries {
+            let truth = index.search_with_options(q, 10, &truth_opts).unwrap();
+            let res = index.search_with_options(q, 10, &eval_opts).unwrap();
+            let truth_ids: std::collections::HashSet<_> = truth.iter().map(|r| r.id).collect();
+            hits += res.iter().filter(|r| truth_ids.contains(&r.id)).count();
+        }
+        hits as f64 / (queries.len() * 10) as f64
+    };
+
+    let r_base = eval(&baseline);
+    let r_lid = eval(&lid);
+    assert!(
+        r_lid >= r_base - 0.02,
+        "LID recall {:.3} < baseline {:.3} - 0.02",
+        r_lid,
+        r_base
+    );
+}

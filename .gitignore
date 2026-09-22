@@ -8,3 +8,7 @@ __pycache__/
 *.log
 *.pyc
 *.pyo
+# Scratch investigation artifacts — never commit
+experiments/
+# SDD workspace (git-ignored scratch for subagent-driven dev)
+.superpowers/

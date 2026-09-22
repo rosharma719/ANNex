@@ -58,6 +58,20 @@ pub struct HNSWIndex {
     pub(crate) current_max_level: usize,
     pub(crate) dim: usize,
     pub(crate) deleted: Vec<bool>,
+    // Maintained on deletion and recomputed on snapshot load; keeps query setup O(1).
+    pub(crate) deleted_count: usize,
+    /// Parallel to layers[0]: edge_dists_l0[idx] holds the distance from node idx to
+    /// each of its L0 neighbors, co-indexed with layers[0][idx].
+    /// Protected by the same logical lock as layers[0][idx]: always write under
+    /// layers[0][idx].write() and read under layers[0][idx].read().
+    pub(crate) edge_dists_l0: Vec<parking_lot::RwLock<Vec<f32>>>,
+    /// SQ8 quantized vectors: quantized[idx * dim + d] = u8 encoding of dimension d.
+    /// Empty until `quantize_all()` is called.
+    pub(crate) quantized: Vec<u8>,
+    /// Per-dimension minimum value used for SQ8 quantization.
+    pub(crate) quant_min: Vec<f32>,
+    /// Per-dimension scale: (max - min) / 255.0. Set to 1.0 for constant dimensions.
+    pub(crate) quant_scale: Vec<f32>,
     pub(crate) point_to_idx: HashMap<PointId, usize>,
     pub(crate) idx_to_point: Vec<PointId>,
     pub(crate) exact_fallback_enabled: bool,
@@ -126,6 +140,11 @@ impl HNSWIndex {
             current_max_level: 0,
             dim,
             deleted: Vec::new(),
+            deleted_count: 0,
+            edge_dists_l0: Vec::new(),
+            quantized: Vec::new(),
+            quant_min: Vec::new(),
+            quant_scale: Vec::new(),
             point_to_idx: HashMap::new(),
             idx_to_point: Vec::new(),
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),
@@ -191,8 +210,11 @@ impl HNSWIndex {
         let Some(idx) = self.idx_of(point_id) else {
             return;
         };
-        if let Some(flag) = self.deleted.get_mut(idx) {
+        if let Some(flag) = self.deleted.get_mut(idx)
+            && !*flag
+        {
             *flag = true;
+            self.deleted_count += 1;
         }
         if Some(idx) == self.entry_point {
             self.entry_point = self.find_highest_level_entry_point();
@@ -260,6 +282,10 @@ impl HNSWIndex {
                 self.layers[level].push(RwLock::new(Vec::with_capacity(cap)));
             }
         }
+        while self.edge_dists_l0.len() < nodes_len {
+            self.edge_dists_l0
+                .push(parking_lot::RwLock::new(Vec::new()));
+        }
     }
 
     pub fn contains(&self, point_id: &PointId) -> bool {
@@ -314,7 +340,7 @@ impl HNSWIndex {
     }
 
     pub fn deleted_count(&self) -> usize {
-        self.deleted.iter().filter(|d| **d).count()
+        self.deleted_count
     }
 
     pub fn deleted_fraction(&self) -> f64 {
@@ -817,6 +843,8 @@ impl HNSWIndex {
         self.vectors.extend_from_slice(&vector);
         self.levels.push(level);
         self.deleted.push(false);
+        self.edge_dists_l0
+            .push(parking_lot::RwLock::new(Vec::new()));
         self.idx_to_point.push(point_id);
         self.point_to_idx.insert(point_id, idx);
         idx
@@ -831,6 +859,188 @@ impl HNSWIndex {
 }
 
 impl HNSWIndex {
+    /// Compute and store L0 edge distances, enabling triangle-inequality neighbor
+    /// skipping during search (`VECTORDB_TI_SKIP=true` / `use_ti_skip: Some(true)`).
+    ///
+    /// This is NOT called automatically on snapshot load — doing so caused a ~50%
+    /// throughput regression from heap fragmentation (290k scattered Vec allocations
+    /// competing with the flat vector array for cache). Call this explicitly after
+    /// loading or building an index when TI skip is actually needed.
+    pub fn build_edge_distances(&mut self) {
+        let n = self.len();
+        let dim = self.dim;
+        // Allocate the outer Vec once; inner Vecs are populated below.
+        if self.edge_dists_l0.is_empty() {
+            self.edge_dists_l0 = (0..n)
+                .map(|_| parking_lot::RwLock::new(Vec::new()))
+                .collect();
+        }
+        if let Some(l0) = self.layers.first() {
+            for (idx, nb_lock) in l0.iter().enumerate() {
+                let nb: Vec<usize> = nb_lock.read().clone();
+                if nb.is_empty() {
+                    continue;
+                }
+                let src: Vec<f32> = self.vectors[idx * dim..(idx + 1) * dim].to_vec();
+                let dists: Vec<f32> = nb
+                    .iter()
+                    .map(|&n| {
+                        if n == idx {
+                            return 0.0;
+                        }
+                        self.fast_score(&src, self.vector_slice(n))
+                    })
+                    .collect();
+                *self.edge_dists_l0[idx].write() = dists;
+            }
+        }
+    }
+}
+
+impl HNSWIndex {
+    /// Convenience optimizer: applies the winning search-layout stack in one call.
+    ///
+    /// Performs in order:
+    ///   1. `reorder_rcm()` — permute nodes for cache locality (−5–9% latency)
+    ///   2. `quantize_all()` — build SQ8 codes for neighbor screening
+    ///
+    /// After this call, set `sq8_screen: Some(true)` in `SearchRuntimeOptions` to
+    /// activate neighbor screening (−43–50% latency at equivalent recall).
+    ///
+    /// Benchmark results on NYT-256-Angular, Apple M2, recall@20:
+    ///   ef=128: 1.104ms (pre-optimization) → 0.545ms (post), +1.3pp recall
+    ///   ef=256: 1.960ms → 1.008ms, +0.8pp recall
+    ///
+    /// Note: clears any previously built SQ8 state before reordering, then rebuilds.
+    pub fn enable_sq8_screening(&mut self) {
+        self.reorder_rcm(); // clears quantized state as a side effect
+        self.quantize_all(); // rebuild after reorder
+    }
+}
+
+impl HNSWIndex {
+    /// Permute node indices using Reverse Cuthill-McKee so that graph-adjacent
+    /// nodes at L0 become memory-adjacent. Reduces cache miss rate during BFS.
+    /// All node-indexed arrays (vectors, layers, idx_to_point, deleted,
+    /// point_to_idx, edge_dists_l0) are permuted consistently.
+    /// Note: clears any SQ8 quantized state (`quantized`/`quant_min`/`quant_scale`).
+    /// Call `quantize_all()` again after reordering if SQ8 search is needed.
+    pub fn reorder_rcm(&mut self) {
+        // Quantized codes are indexed by node idx; they are invalidated by reordering.
+        // Clear them so callers know to re-run quantize_all() after reorder.
+        self.quantized.clear();
+        self.quant_min.clear();
+        self.quant_scale.clear();
+
+        let n = self.len();
+        if n == 0 {
+            return;
+        }
+
+        // Build undirected adjacency list from L0.
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        if let Some(l0) = self.layers.first() {
+            for (u, nb_lock) in l0.iter().enumerate() {
+                for &v in nb_lock.read().iter() {
+                    if v != u {
+                        if !adj[u].contains(&v) {
+                            adj[u].push(v);
+                        }
+                        if !adj[v].contains(&u) {
+                            adj[v].push(u);
+                        }
+                    }
+                }
+            }
+        }
+
+        // RCM: BFS starting from the node with minimum degree.
+        let start = (0..n).min_by_key(|&i| adj[i].len()).unwrap_or(0);
+        let mut perm = Vec::with_capacity(n);
+        let mut visited = vec![false; n];
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(start);
+        visited[start] = true;
+        while let Some(u) = queue.pop_front() {
+            perm.push(u);
+            let mut nbrs: Vec<usize> = adj[u].iter().copied().filter(|&v| !visited[v]).collect();
+            nbrs.sort_by_key(|&v| adj[v].len()); // ascending degree
+            for v in nbrs {
+                if !visited[v] {
+                    visited[v] = true;
+                    queue.push_back(v);
+                }
+            }
+        }
+        // Handle disconnected nodes.
+        for i in 0..n {
+            if !visited[i] {
+                perm.push(i);
+            }
+        }
+        perm.reverse(); // Reverse Cuthill-McKee
+
+        // Build inverse permutation: inv_perm[old_idx] = new_idx
+        let mut inv_perm = vec![0usize; n];
+        for (new_idx, &old_idx) in perm.iter().enumerate() {
+            inv_perm[old_idx] = new_idx;
+        }
+
+        // Permute vectors (flat slice: each node occupies `dim` consecutive f32s).
+        let dim = self.dim;
+        let mut new_vectors = vec![0.0f32; n * dim];
+        for (new_idx, &old_idx) in perm.iter().enumerate() {
+            let src = &self.vectors[old_idx * dim..(old_idx + 1) * dim];
+            new_vectors[new_idx * dim..(new_idx + 1) * dim].copy_from_slice(src);
+        }
+        self.vectors = new_vectors;
+
+        // Permute idx_to_point, deleted, and levels.
+        let old_itp = std::mem::take(&mut self.idx_to_point);
+        let old_del = std::mem::take(&mut self.deleted);
+        let old_lvl = std::mem::take(&mut self.levels);
+        self.idx_to_point = perm.iter().map(|&o| old_itp[o]).collect();
+        self.deleted = perm.iter().map(|&o| old_del[o]).collect();
+        self.levels = perm.iter().map(|&o| old_lvl[o]).collect();
+
+        // Rebuild point_to_idx from new idx_to_point.
+        self.point_to_idx.clear();
+        for (new_idx, &id) in self.idx_to_point.iter().enumerate() {
+            self.point_to_idx.insert(id, new_idx);
+        }
+
+        // Update entry point.
+        if let Some(ep) = self.entry_point {
+            self.entry_point = Some(inv_perm[ep]);
+        }
+
+        // Permute all layers: remap neighbor indices through inv_perm.
+        for layer in self.layers.iter_mut() {
+            let new_layer: Vec<parking_lot::RwLock<Vec<usize>>> = (0..n)
+                .map(|_| parking_lot::RwLock::new(Vec::new()))
+                .collect();
+            for (old_idx, nb_lock) in layer.iter().enumerate() {
+                let new_nbs: Vec<usize> = nb_lock.read().iter().map(|&nb| inv_perm[nb]).collect();
+                *new_layer[inv_perm[old_idx]].write() = new_nbs;
+            }
+            *layer = new_layer;
+        }
+
+        // Permute edge_dists_l0 if present.
+        if !self.edge_dists_l0.is_empty() {
+            let new_ed: Vec<parking_lot::RwLock<Vec<f32>>> = (0..n)
+                .map(|_| parking_lot::RwLock::new(Vec::new()))
+                .collect();
+            for (old_idx, ed_lock) in self.edge_dists_l0.iter().enumerate() {
+                let dists = ed_lock.read().clone();
+                *new_ed[inv_perm[old_idx]].write() = dists;
+            }
+            self.edge_dists_l0 = new_ed;
+        }
+    }
+}
+
+impl HNSWIndex {
     pub(crate) fn validate_dim(&self, vec: &[f32]) -> Result<(), DBError> {
         if vec.len() != self.dim {
             return Err(DBError::VectorLengthMismatch {
@@ -841,6 +1051,269 @@ impl HNSWIndex {
         Ok(())
     }
 }
+
+impl HNSWIndex {
+    /// Build SQ8 quantization tables and encode all stored vectors.
+    ///
+    /// For Cosine: uses zero-centered encoding so the SQ8 dot product is an unbiased
+    /// approximation of the true dot product. Stored code = round(v[d]*127.5 + 128),
+    /// mapping [-1,1] → [0.5,255.5]. `quant_min` and `quant_scale` are unused for
+    /// cosine and are left empty.
+    ///
+    /// For Euclidean/Dot: uses per-dimension min-max encoding. `quant_min[d]` and
+    /// `quant_scale[d]` = (max-min)/255 are stored for query quantization.
+    ///
+    /// Not persisted in snapshots; call again after loading from disk.
+    pub fn quantize_all(&mut self) {
+        let n = self.len();
+        let dim = self.dim;
+        if n == 0 || dim == 0 {
+            return;
+        }
+        let mut quantized = vec![0u8; n * dim];
+        if self.metric == DistanceMetric::Cosine {
+            // Zero-centered: v[d] ∈ [-1,1] → code ∈ [0,255]. Eliminates the per-vector
+            // mean bias that destroys ranking quality for per-dim min-max on unit vectors.
+            for idx in 0..n {
+                let v = self.vector_slice(idx);
+                for d in 0..dim {
+                    quantized[idx * dim + d] =
+                        (v[d] * 127.5 + 128.0).clamp(0.0, 255.0).round() as u8;
+                }
+            }
+            self.quant_min = Vec::new();
+            self.quant_scale = Vec::new();
+        } else {
+            let mut min_d = vec![f32::MAX; dim];
+            let mut max_d = vec![f32::MIN; dim];
+            for idx in 0..n {
+                if self.deleted.get(idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                let v = self.vector_slice(idx);
+                for d in 0..dim {
+                    min_d[d] = min_d[d].min(v[d]);
+                    max_d[d] = max_d[d].max(v[d]);
+                }
+            }
+            let mut scale = vec![0.0f32; dim];
+            for d in 0..dim {
+                let range = max_d[d] - min_d[d];
+                scale[d] = if range > 0.0 { range / 255.0 } else { 1.0 };
+            }
+            for idx in 0..n {
+                let v = self.vector_slice(idx);
+                for d in 0..dim {
+                    quantized[idx * dim + d] =
+                        ((v[d] - min_d[d]) / scale[d]).clamp(0.0, 255.0).round() as u8;
+                }
+            }
+            self.quant_min = min_d;
+            self.quant_scale = scale;
+        }
+        self.quantized = quantized;
+    }
+
+    /// Quantize a query vector into signed i16 codes for `sq8_approx_dot`.
+    ///
+    /// Cosine: `query_q[d] = round(q[d] * 127.5)` — centered, so dot with stored codes
+    /// (which are offset by +128) gives an unbiased similarity estimate.
+    /// Non-cosine: per-dimension min-max, consistent with `quantize_all`.
+    pub(crate) fn quantize_query(&self, query: &[f32]) -> Vec<i16> {
+        if self.metric == DistanceMetric::Cosine {
+            query
+                .iter()
+                .map(|&v| (v * 127.5).clamp(-128.0, 127.0).round() as i16)
+                .collect()
+        } else {
+            query
+                .iter()
+                .enumerate()
+                .map(|(d, &v)| {
+                    let min = self.quant_min.get(d).copied().unwrap_or(0.0);
+                    let scale = self.quant_scale.get(d).copied().unwrap_or(1.0);
+                    ((v - min) / scale).clamp(0.0, 255.0).round() as i16
+                })
+                .collect()
+        }
+    }
+
+    /// Approximate SQ8 dot product. Result is monotonically related to true similarity
+    /// (higher = closer). The f32 rerank pass overwrites raw scores before returning.
+    ///
+    /// Cosine: `sum_d (code[d] - 128) * query_q[d]` — the -128 removes the storage
+    /// offset, leaving an unbiased approximation of 127.5^2 * true_dot(v, q).
+    /// Non-cosine: `sum_d code[d] * query_q[d]` (no offset needed).
+    #[inline]
+    pub(crate) fn sq8_approx_dot(&self, query_q: &[i16], idx: usize) -> i32 {
+        let v = &self.quantized[idx * self.dim..(idx + 1) * self.dim];
+        if self.metric == DistanceMetric::Cosine {
+            v.iter()
+                .zip(query_q.iter())
+                .map(|(&b, &q)| (b as i32 - 128) * (q as i32))
+                .sum()
+        } else {
+            v.iter()
+                .zip(query_q.iter())
+                .map(|(&b, &q)| (b as i32) * (q as i32))
+                .sum()
+        }
+    }
+
+    /// Slice accessor for quantized codes. Panics if `quantized` is empty.
+    #[inline]
+    pub(crate) fn quantized_slice(&self, idx: usize) -> &[u8] {
+        &self.quantized[idx * self.dim..(idx + 1) * self.dim]
+    }
+
+    /// Quantize a cosine query into i8 for screen_dot. Caller must ensure metric==Cosine.
+    /// Same centering as quantize_all: q[d]*127.5 rounded to [-128, 127].
+    pub(crate) fn quantize_query_i8(&self, query: &[f32]) -> Vec<i8> {
+        query
+            .iter()
+            .map(|&v| (v * 127.5).clamp(-128.0, 127.0).round() as i8)
+            .collect()
+    }
+
+    /// Fast dot product for SQ8 screening: stored u8 codes (centered at 128) × i8 query.
+    /// Dispatches to NEON sdot on aarch64 (4 cache lines vs 16 for f32), scalar fallback
+    /// elsewhere. Monotone with true cosine similarity — higher = closer.
+    #[inline]
+    pub(crate) fn screen_dot(query_i8: &[i8], stored: &[u8]) -> i32 {
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return unsafe { screen_dot_neon_sdot(query_i8, stored) };
+        }
+        #[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { screen_dot_avx2(query_i8, stored) };
+        }
+        screen_dot_scalar(query_i8, stored)
+    }
+}
+
+fn screen_dot_scalar(query_i8: &[i8], stored: &[u8]) -> i32 {
+    let n = query_i8.len().min(stored.len());
+    let mut a = [0i32; 4];
+    let mut i = 0;
+    while i + 4 <= n {
+        a[0] += (query_i8[i] as i32) * (stored[i] as i32 - 128);
+        a[1] += (query_i8[i + 1] as i32) * (stored[i + 1] as i32 - 128);
+        a[2] += (query_i8[i + 2] as i32) * (stored[i + 2] as i32 - 128);
+        a[3] += (query_i8[i + 3] as i32) * (stored[i + 3] as i32 - 128);
+        i += 4;
+    }
+    let mut acc = a[0] + a[1] + a[2] + a[3];
+    while i < n {
+        acc += (query_i8[i] as i32) * (stored[i] as i32 - 128);
+        i += 1;
+    }
+    acc
+}
+
+/// NEON sdot: vdotq_s32 processes 4 groups of 4 i8 products per instruction.
+/// For 256-dim: 256/16 = 16 sdot calls with 4 accumulators = 4 iterations of 64 values.
+/// Memory: 256 B/vector (4 cache lines) vs 1024 B for f32 (16 cache lines).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn screen_dot_neon_sdot(query_i8: &[i8], stored: &[u8]) -> i32 {
+    use std::arch::aarch64::*;
+    let n = query_i8.len().min(stored.len());
+    let sub128 = vdupq_n_u8(128);
+    let mut acc0 = vdupq_n_s32(0);
+    let mut acc1 = vdupq_n_s32(0);
+    let mut acc2 = vdupq_n_s32(0);
+    let mut acc3 = vdupq_n_s32(0);
+    let mut i = 0;
+    while i + 64 <= n {
+        let q0 = vld1q_s8(query_i8.as_ptr().add(i));
+        let q1 = vld1q_s8(query_i8.as_ptr().add(i + 16));
+        let q2 = vld1q_s8(query_i8.as_ptr().add(i + 32));
+        let q3 = vld1q_s8(query_i8.as_ptr().add(i + 48));
+        // Subtract 128 from u8: u8-128 wraps to the correct signed i8 bit pattern.
+        let s0 = vreinterpretq_s8_u8(vsubq_u8(vld1q_u8(stored.as_ptr().add(i)), sub128));
+        let s1 = vreinterpretq_s8_u8(vsubq_u8(vld1q_u8(stored.as_ptr().add(i + 16)), sub128));
+        let s2 = vreinterpretq_s8_u8(vsubq_u8(vld1q_u8(stored.as_ptr().add(i + 32)), sub128));
+        let s3 = vreinterpretq_s8_u8(vsubq_u8(vld1q_u8(stored.as_ptr().add(i + 48)), sub128));
+        acc0 = vdotq_s32(acc0, q0, s0);
+        acc1 = vdotq_s32(acc1, q1, s1);
+        acc2 = vdotq_s32(acc2, q2, s2);
+        acc3 = vdotq_s32(acc3, q3, s3);
+        i += 64;
+    }
+    while i + 16 <= n {
+        let q = vld1q_s8(query_i8.as_ptr().add(i));
+        let s = vreinterpretq_s8_u8(vsubq_u8(vld1q_u8(stored.as_ptr().add(i)), sub128));
+        acc0 = vdotq_s32(acc0, q, s);
+        i += 16;
+    }
+    acc0 = vaddq_s32(acc0, acc1);
+    acc2 = vaddq_s32(acc2, acc3);
+    acc0 = vaddq_s32(acc0, acc2);
+    let mut sum = vaddvq_s32(acc0);
+    while i < n {
+        sum += (*query_i8.get_unchecked(i) as i32) * (*stored.get_unchecked(i) as i32 - 128);
+        i += 1;
+    }
+    sum
+}
+
+/// AVX2 path using maddubs + madd pattern.
+#[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn screen_dot_avx2(query_i8: &[i8], stored: &[u8]) -> i32 {
+    use std::arch::x86_64::*;
+    // maddubs(u8, i8): multiplies pairs of unsigned×signed bytes, adds adjacent pairs → i16.
+    // We pass stored (u8) as first arg and query (i8 cast to u8 by adding 128) as second,
+    // then correct the bias with a separate accumulator.
+    let n = query_i8.len().min(stored.len());
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = _mm256_setzero_si256();
+    let mut i = 0;
+    while i + 32 <= n {
+        let s = _mm256_loadu_si256(stored.as_ptr().add(i) as *const __m256i);
+        // treat query i8 as u8 offset by 128: q_u8[d] = q_i8[d] + 128
+        let q_raw = _mm256_loadu_si256(query_i8.as_ptr().add(i) as *const __m256i);
+        let offset128 = _mm256_set1_epi8(-128i8); // = 128 as u8
+        let q_u8 = _mm256_add_epi8(q_raw, offset128);
+        // maddubs(s[u8], q_u8[u8]): s×q_u8, adjacent pairs summed → i16
+        // But q_u8 is interpreted as i8 by maddubs... actually:
+        // _mm256_maddubs_epi16(a: u8, b: i8) computes a*b not b*a. Treat s as u8, q_u8 as i8.
+        // Since q_u8 = q_i8 + 128, the range is [0,255] interpreted as i8 wraps, but
+        // this gives wrong products. Use widening multiply instead.
+        // Widen s (u8) and q_raw (i8) to i16, multiply, reduce.
+        let s_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(s));
+        let s_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(s, 1));
+        let q_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(q_raw));
+        let q_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(q_raw, 1));
+        // Subtract 128 from s as i16 to center it
+        let bias = _mm256_set1_epi16(128);
+        let s_lo_c = _mm256_sub_epi16(s_lo, bias);
+        let s_hi_c = _mm256_sub_epi16(s_hi, bias);
+        // Multiply i16 × i16 → keep low 16 bits, then use madd to accumulate into i32
+        let prod_lo = _mm256_madd_epi16(_mm256_mullo_epi16(s_lo_c, q_lo), ones);
+        let prod_hi = _mm256_madd_epi16(_mm256_mullo_epi16(s_hi_c, q_hi), ones);
+        acc = _mm256_add_epi32(acc, _mm256_add_epi32(prod_lo, prod_hi));
+        i += 32;
+    }
+    // Reduce acc (8 × i32) to scalar
+    let sum128 = _mm_add_epi32(
+        _mm256_castsi256_si128(acc),
+        _mm256_extracti128_si256(acc, 1),
+    );
+    let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0b_01_00_11_10));
+    let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 1));
+    let mut result = _mm_cvtsi128_si32(sum32);
+    while i < n {
+        result += (*query_i8.get_unchecked(i) as i32) * (*stored.get_unchecked(i) as i32 - 128);
+        i += 1;
+    }
+    result
+}
+
+impl HNSWIndex {}
 
 #[cfg(test)]
 mod tests {
@@ -941,6 +1414,68 @@ mod tests {
         println!(
             "kernel metric={:?} dim={} vecs={} iters={} total={} scores/s={:.2} ns/score={:.2} acc={:.4}",
             metric, dim, vecs, iters, total, scores_per_sec, ns_per, acc
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_screen_dot_kernel() {
+        let dim = env::var("VECTORDB_KERNEL_DIM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
+        let vecs = env::var("VECTORDB_KERNEL_VECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000);
+        let iters = env::var("VECTORDB_KERNEL_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500);
+
+        let query_f32: Vector = gen_vec(42, dim)
+            .into_iter()
+            .map(|v| v * 0.5 + 0.5)
+            .collect();
+        let query_norm = {
+            let n: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+            query_f32.iter().map(|x| x / n).collect::<Vec<_>>()
+        };
+        let query_i8: Vec<i8> = query_norm
+            .iter()
+            .map(|&v| (v * 127.5).clamp(-128.0, 127.0).round() as i8)
+            .collect();
+
+        let stored_vecs: Vec<Vec<u8>> = (0..vecs as u32)
+            .map(|seed| {
+                let v = gen_vec(seed, dim);
+                let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                v.iter()
+                    .map(|&x| (x / n * 127.5 + 128.0).clamp(0.0, 255.0).round() as u8)
+                    .collect()
+            })
+            .collect();
+
+        // Correctness check: screen_dot vs scalar
+        for s in &stored_vecs {
+            let fast = HNSWIndex::screen_dot(&query_i8, s);
+            let scalar = screen_dot_scalar(&query_i8, s);
+            assert_eq!(fast, scalar, "screen_dot mismatch");
+        }
+
+        let mut acc: i64 = 0;
+        let start = Instant::now();
+        for _ in 0..iters {
+            for s in &stored_vecs {
+                acc += HNSWIndex::screen_dot(&query_i8, s) as i64;
+            }
+        }
+        let elapsed = start.elapsed();
+        let total = (iters as u64) * (vecs as u64);
+        let ns_per = elapsed.as_secs_f64() * 1e9 / total as f64;
+        println!(
+            "screen_dot dim={} vecs={} iters={} total={} ns/call={:.2} acc={}",
+            dim, vecs, iters, total, ns_per, acc
         );
     }
 }

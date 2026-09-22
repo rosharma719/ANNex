@@ -44,6 +44,9 @@ static DIVERSITY_ALPHA: OnceLock<Option<f32>> = OnceLock::new();
 static DIVERSITY_ALPHA_LOW: OnceLock<Option<f32>> = OnceLock::new();
 static DIVERSITY_ALPHA_HIGH: OnceLock<Option<f32>> = OnceLock::new();
 static DIVERSITY_PRUNE_FLOOR: OnceLock<Option<usize>> = OnceLock::new();
+static TI_SKIP: OnceLock<bool> = OnceLock::new();
+static SQ8_RERANK_FACTOR: OnceLock<Option<usize>> = OnceLock::new();
+static LID_SORT: OnceLock<bool> = OnceLock::new();
 
 fn hnsw_telemetry() -> &'static HnswTelemetryConfig {
     HNSW_TELEMETRY.get_or_init(HnswTelemetryConfig::from_env)
@@ -89,7 +92,10 @@ pub fn search_expansion_cap_override() -> Option<usize> {
 }
 
 pub fn early_exit_patience() -> usize {
-    *EARLY_EXIT_PATIENCE.get_or_init(|| env_usize("VECTORDB_EARLY_EXIT_PATIENCE").unwrap_or(2))
+    // Default raised from 2 → 3 after calibration on NYT-256-angular (2026-09-14):
+    // ep=3 at ef=128 yields +16% QPS and +0.09pp recall vs ep=2.
+    // Override via VECTORDB_EARLY_EXIT_PATIENCE.
+    *EARLY_EXIT_PATIENCE.get_or_init(|| env_usize("VECTORDB_EARLY_EXIT_PATIENCE").unwrap_or(3))
 }
 
 pub(crate) fn filter_expansion_cap() -> Option<usize> {
@@ -236,6 +242,16 @@ pub fn adaptive_ef_score_threshold_default() -> Option<f32> {
     })
 }
 
+pub fn ti_skip_enabled() -> bool {
+    *TI_SKIP.get_or_init(|| env_bool("VECTORDB_TI_SKIP").unwrap_or(false))
+}
+
+static SQ8_SCREEN: OnceLock<bool> = OnceLock::new();
+
+pub fn sq8_screen_enabled() -> bool {
+    *SQ8_SCREEN.get_or_init(|| env_bool("VECTORDB_SQ8_SCREEN").unwrap_or(false))
+}
+
 pub(crate) fn diversity_alpha_for_level(level: usize) -> f32 {
     if let Some(alpha) = DIVERSITY_ALPHA.get_or_init(|| {
         env_f32("VECTORDB_DIVERSITY_ALPHA").filter(|value| value.is_finite() && *value > 0.0)
@@ -261,4 +277,12 @@ pub(crate) fn diversity_prune_floor() -> usize {
     DIVERSITY_PRUNE_FLOOR
         .get_or_init(|| env_usize("VECTORDB_DIVERSITY_PRUNE_FLOOR"))
         .unwrap_or(0)
+}
+
+pub fn sq8_rerank_factor_default() -> Option<usize> {
+    *SQ8_RERANK_FACTOR.get_or_init(|| env_usize_nonzero("VECTORDB_SQ8_RERANK_FACTOR"))
+}
+
+pub fn lid_sort_enabled() -> bool {
+    *LID_SORT.get_or_init(|| env_bool("VECTORDB_LID_SORT").unwrap_or(false))
 }

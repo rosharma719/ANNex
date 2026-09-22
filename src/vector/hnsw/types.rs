@@ -34,6 +34,22 @@ pub struct SearchRuntimeOptions {
     /// (lower = better) exceeds this value are re-run with `adaptive_ef_high`.
     /// Overrides `VECTORDB_ADAPTIVE_EF_SCORE_THRESHOLD`.
     pub adaptive_ef_score_threshold: Option<f32>,
+    /// Enable triangle-inequality neighbor skip at L0. When true and the index has
+    /// edge distances stored, neighbors whose TI lower bound exceeds `worst_score` are
+    /// skipped before computing `fast_score`. Not valid for Dot metric (no bounded metric).
+    /// Overrides `VECTORDB_TI_SKIP`.
+    pub use_ti_skip: Option<bool>,
+    /// When > 0, use SQ8 quantized scoring during L0 traversal and collect
+    /// `ef_search * sq8_rerank_factor` candidates, then rerank with full f32.
+    /// Set to 0 to disable SQ8 traversal. Overrides `VECTORDB_SQ8_RERANK_FACTOR`.
+    /// Has no effect if `quantize_all()` has not been called on the index.
+    pub sq8_rerank_factor: Option<usize>,
+    /// Screen each L0 neighbor with a fast integer dot product before prefetching its
+    /// f32 vector. Neighbors whose SQ8 score is clearly below the current worst result
+    /// are skipped, saving the f32 prefetch + distance computation. Effective at high ef
+    /// where most candidates are rejected. Requires quantize_all() to be called first.
+    /// Overrides `VECTORDB_SQ8_SCREEN`.
+    pub sq8_screen: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug)]

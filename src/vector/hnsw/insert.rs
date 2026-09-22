@@ -79,7 +79,7 @@ impl HNSWIndex {
             self.layers[l][idx].write().push(idx);
         }
 
-        if self.entry_point.is_none() {
+        if self.entry_point().is_none() {
             if VERBOSE {
                 log::debug!(
                     target: "vector::hnsw",
@@ -92,8 +92,12 @@ impl HNSWIndex {
             return Ok(());
         }
 
-        let mut current_entry = if let Some(ep) = self.entry_point {
-            if self.deleted.get(ep).copied().unwrap_or(false) {
+        let (entry_point, current_max_level) = self.entry_level();
+        let mut current_entry = if let Some(ep) = entry_point {
+            if self
+                .deleted
+                .with(ep, |b| b.load(::std::sync::atomic::Ordering::Acquire))
+            {
                 self.find_highest_level_entry_point().unwrap_or(idx)
             } else {
                 ep
@@ -102,7 +106,7 @@ impl HNSWIndex {
             self.find_highest_level_entry_point().unwrap_or(idx)
         };
 
-        for l in ((level + 1)..=self.current_max_level).rev() {
+        for l in ((level + 1)..=current_max_level).rev() {
             current_entry =
                 self.greedy_search_layer_unfiltered(self.vector_slice(idx), current_entry, l);
         }
@@ -203,13 +207,14 @@ impl HNSWIndex {
             }
 
             if trace_enabled {
+                let (trace_entry, trace_max_level) = self.entry_level();
                 let entry = InsertTraceEntry {
                     insert_id: trace_id,
                     point_id,
                     level,
-                    current_max_level: self.current_max_level,
+                    current_max_level: trace_max_level,
                     layer: l,
-                    entry_point: self.entry_point.map(|ep| self.point_id(ep)),
+                    entry_point: trace_entry.map(|ep| self.point_id(ep)),
                     current_entry: self.point_id(current_entry),
                     candidates: candidates.len(),
                     neighbors: neighbors.len(),
@@ -222,7 +227,7 @@ impl HNSWIndex {
             }
         }
 
-        if level > self.current_max_level {
+        if level > current_max_level {
             if VERBOSE {
                 log::debug!(
                     target: "vector::hnsw",
@@ -231,8 +236,7 @@ impl HNSWIndex {
                     level
                 );
             }
-            self.entry_point = Some(idx);
-            self.current_max_level = level;
+            self.store_entry_level(idx, level);
         }
 
         Ok(())
@@ -370,12 +374,11 @@ impl HNSWIndex {
         // neighbors to connect to (only its self-link), so search_and_link is skipped for it.
         // Every other node in the batch CAN search from that entry and connect to it, so the
         // batch builds up real connectivity rather than every node being an isolated self-link.
-        let (first_batch_node, skip_first) = match self.entry_point {
+        let (first_batch_node, skip_first) = match self.entry_point() {
             Some(ep) => (ep, false),
             None => {
                 let (first_idx, first_level) = node_infos[0];
-                self.entry_point = Some(first_idx);
-                self.current_max_level = first_level;
+                self.store_entry_level(first_idx, first_level);
                 (first_idx, true) // skip linking first node — nothing to connect to yet
             }
         };
@@ -421,9 +424,8 @@ impl HNSWIndex {
 
         // Phase 3: promote entry point.
         for &(idx, level) in &node_infos {
-            if level > self.current_max_level {
-                self.entry_point = Some(idx);
-                self.current_max_level = level;
+            if level > self.current_max_level() {
+                self.store_entry_level(idx, level);
             }
         }
 
@@ -438,7 +440,9 @@ impl HNSWIndex {
         level: usize,
         initial_entry: usize,
     ) -> Result<(), DBError> {
-        if self.deleted.get(initial_entry).copied().unwrap_or(true) {
+        if !self.deleted.with(initial_entry, |b| {
+            !b.load(::std::sync::atomic::Ordering::Acquire)
+        }) {
             return Ok(());
         }
         let mut current_entry = initial_entry;
@@ -450,7 +454,7 @@ impl HNSWIndex {
         };
 
         // Greedy descent above the insertion level.
-        for l in ((level + 1)..=self.current_max_level).rev() {
+        for l in ((level + 1)..=self.current_max_level()).rev() {
             current_entry =
                 self.greedy_search_layer_unfiltered(self.vector_slice(idx), current_entry, l);
         }
@@ -816,7 +820,10 @@ impl HNSWIndex {
             if let Some(neighbors_lock) = self.layers.get(level).and_then(|l| l.get(current)) {
                 let neighbors = neighbors_lock.read();
                 for &neighbor in neighbors.iter() {
-                    if self.deleted.get(neighbor).copied().unwrap_or(false) {
+                    if self
+                        .deleted
+                        .with(neighbor, |b| b.load(::std::sync::atomic::Ordering::Acquire))
+                    {
                         continue;
                     }
 
@@ -881,7 +888,10 @@ impl HNSWIndex {
                 let nb_count = scratch.extend_neighbors.len();
                 for j in 0..nb_count {
                     let nb = scratch.extend_neighbors[j];
-                    if self.deleted.get(nb).copied().unwrap_or(false) {
+                    if self
+                        .deleted
+                        .with(nb, |b| b.load(::std::sync::atomic::Ordering::Acquire))
+                    {
                         continue;
                     }
                     if !scratch.mark_extend_seen(nb) {
@@ -1087,7 +1097,10 @@ impl HNSWIndex {
 
             if let Some(neighbors) = self.layer_neighbors(level, current) {
                 for &neighbor in neighbors.iter() {
-                    if self.deleted.get(neighbor).copied().unwrap_or(false) {
+                    if self
+                        .deleted
+                        .with(neighbor, |b| b.load(::std::sync::atomic::Ordering::Acquire))
+                    {
                         continue;
                     }
 

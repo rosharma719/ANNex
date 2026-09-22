@@ -688,7 +688,7 @@ fn chunked_array_crosses_chunk_boundary() {
 #[test]
 fn chunked_array_slot_addresses_stable_across_growth() {
     use annex::vector::hnsw::arena::ChunkedArray;
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::AtomicU8;
     let arr: ChunkedArray<AtomicU8> = ChunkedArray::new(4);
     arr.push_default();
     // Capture the raw address of slot 0
@@ -741,4 +741,39 @@ fn chunked_array_with_parking_lot_rwlock() {
     arr.with(i1, |lock| lock.write().push(42));
     arr.with(i0, |lock| assert_eq!(*lock.read(), vec![1, 2, 3]));
     arr.with(i1, |lock| assert_eq!(*lock.read(), vec![42]));
+}
+
+#[test]
+fn atomic_metadata_and_vector_arena_survive_snapshot_round_trip() {
+    let mut index = HNSWIndex::new(DistanceMetric::Euclidean, 4, 20, 300, 4);
+    assert_eq!(index.max_level_cap(), u8::MAX as usize);
+
+    for id in 0..10u64 {
+        index.insert(id, vec![id as f32, 0.0, 0.0, 0.0]).unwrap();
+    }
+    index.mark_deleted(3);
+
+    assert_eq!(index.len(), 10);
+    assert_eq!(index.deleted_count(), 1);
+    assert_eq!(index.get_vector(&9), Some(&[9.0, 0.0, 0.0, 0.0][..]));
+
+    let snapshot = index.to_snapshot();
+    assert!(
+        snapshot
+            .levels
+            .values()
+            .all(|&level| level <= u8::MAX as usize)
+    );
+    let restored = HNSWIndex::from_snapshot(snapshot);
+
+    assert_eq!(restored.len(), 10);
+    assert_eq!(restored.deleted_count(), 1);
+    assert_eq!(restored.get_vector(&9), Some(&[9.0, 0.0, 0.0, 0.0][..]));
+    assert!(
+        restored
+            .search(&vec![3.0, 0.0, 0.0, 0.0], 10)
+            .unwrap()
+            .iter()
+            .all(|result| result.id != 3)
+    );
 }

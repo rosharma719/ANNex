@@ -136,13 +136,15 @@ impl HNSWIndex {
     }
 
     fn exact_scan(&self, query: &[f32], normalize_scores: bool, top_k: usize) -> Vec<ScoredPoint> {
-        let dim = self.dim;
         let mut brute: Vec<ScoredPoint> = (0..self.len())
             .filter_map(|idx| {
-                if self.deleted.get(idx).copied().unwrap_or(false) {
+                if self
+                    .deleted
+                    .with(idx, |b| b.load(::std::sync::atomic::Ordering::Acquire))
+                {
                     return None;
                 }
-                let vec = &self.vectors[idx * dim..(idx + 1) * dim];
+                let vec = self.vector_slice(idx);
                 let raw = self.fast_score(query, vec);
                 let sort_key = if normalize_scores {
                     self.normalize_score(raw)
@@ -218,7 +220,10 @@ impl HNSWIndex {
             let mut first_seed_idx = 0usize;
             let mut first_seed_score = 0.0f32;
             for &entry in entries {
-                let start = if self.deleted.get(entry).copied().unwrap_or(false) {
+                let start = if self
+                    .deleted
+                    .with(entry, |b| b.load(::std::sync::atomic::Ordering::Acquire))
+                {
                     continue;
                 } else {
                     entry
@@ -247,7 +252,13 @@ impl HNSWIndex {
             }
             // If all provided entries were deleted, fall back to first live node.
             if scratch.result_set.is_empty() {
-                let fallback = self.deleted.iter().position(|d| !*d).unwrap_or(0);
+                let fallback = (0..self.len())
+                    .find(|&idx| {
+                        !self.deleted.with(idx, |flag| {
+                            flag.load(::std::sync::atomic::Ordering::Acquire)
+                        })
+                    })
+                    .unwrap_or(0);
                 let raw = self.fast_score(query, self.vector_slice(fallback));
                 let score_val = if normalize {
                     self.normalize_score(raw)
@@ -351,8 +362,9 @@ impl HNSWIndex {
                                 {
                                     prefetch_read(entry);
                                 }
-                                if self.deleted.get(neighbor).copied().unwrap_or(false)
-                                    || !scratch.mark_visited(neighbor)
+                                if self.deleted.with(neighbor, |b| {
+                                    b.load(::std::sync::atomic::Ordering::Acquire)
+                                }) || !scratch.mark_visited(neighbor)
                                 {
                                     continue;
                                 }
@@ -452,8 +464,9 @@ impl HNSWIndex {
                                 {
                                     prefetch_read(entry);
                                 }
-                                if self.deleted.get(neighbor).copied().unwrap_or(false)
-                                    || !scratch.mark_visited(neighbor)
+                                if self.deleted.with(neighbor, |b| {
+                                    b.load(::std::sync::atomic::Ordering::Acquire)
+                                }) || !scratch.mark_visited(neighbor)
                                 {
                                     continue;
                                 }
@@ -540,8 +553,9 @@ impl HNSWIndex {
                                 {
                                     prefetch_read(entry);
                                 }
-                                if self.deleted.get(neighbor).copied().unwrap_or(false)
-                                    || !scratch.mark_visited(neighbor)
+                                if self.deleted.with(neighbor, |b| {
+                                    b.load(::std::sync::atomic::Ordering::Acquire)
+                                }) || !scratch.mark_visited(neighbor)
                                 {
                                     continue;
                                 }
@@ -675,8 +689,9 @@ impl HNSWIndex {
                                     if collect_counters {
                                         adjacency_reads += 1;
                                     }
-                                    if self.deleted.get(neighbor).copied().unwrap_or(false)
-                                        || !scratch.mark_visited(neighbor)
+                                    if self.deleted.with(neighbor, |b| {
+                                        b.load(::std::sync::atomic::Ordering::Acquire)
+                                    }) || !scratch.mark_visited(neighbor)
                                     {
                                         continue;
                                     }
@@ -930,7 +945,10 @@ impl HNSWIndex {
             let mut first_seed_idx = 0usize;
             let mut first_seed_score = 0.0f32;
             for &entry in entries {
-                let start = if self.deleted.get(entry).copied().unwrap_or(false) {
+                let start = if self
+                    .deleted
+                    .with(entry, |b| b.load(::std::sync::atomic::Ordering::Acquire))
+                {
                     continue;
                 } else {
                     entry
@@ -954,7 +972,13 @@ impl HNSWIndex {
             }
             // Fallback if all entries were deleted.
             if scratch.result_set.is_empty() {
-                let fallback = self.deleted.iter().position(|d| !*d).unwrap_or(0);
+                let fallback = (0..self.len())
+                    .find(|&idx| {
+                        !self.deleted.with(idx, |flag| {
+                            flag.load(::std::sync::atomic::Ordering::Acquire)
+                        })
+                    })
+                    .unwrap_or(0);
                 let score_val = sq8_sort_key(fallback);
                 let candidate = NodeCandidate {
                     idx: fallback,
@@ -1003,7 +1027,9 @@ impl HNSWIndex {
                         {
                             prefetch_read(entry);
                         }
-                        if self.deleted.get(neighbor).copied().unwrap_or(false)
+                        if self
+                            .deleted
+                            .with(neighbor, |b| b.load(::std::sync::atomic::Ordering::Acquire))
                             || !scratch.mark_visited(neighbor)
                         {
                             continue;
@@ -1136,7 +1162,8 @@ impl HNSWIndex {
         top_k: usize,
         opts: &SearchRuntimeOptions,
     ) -> Result<(Vec<ScoredPoint>, SearchStats), DBError> {
-        if self.entry_point.is_none() {
+        let (entry_point, current_max_level) = self.entry_level();
+        if entry_point.is_none() {
             return Ok((
                 vec![],
                 SearchStats {
@@ -1248,8 +1275,8 @@ impl HNSWIndex {
         }
 
         let query_for_greedy = &prepared_query;
-        let mut current = self.entry_point.unwrap();
-        for l in (1..=self.current_max_level).rev() {
+        let mut current = entry_point.unwrap();
+        for l in (1..=current_max_level).rev() {
             current = self.greedy_search_layer_unfiltered(query_for_greedy, current, l);
         }
 
@@ -1339,7 +1366,8 @@ impl HNSWIndex {
         top_k: usize,
         opts: &SearchRuntimeOptions,
     ) -> Result<Vec<ScoredPoint>, DBError> {
-        if self.entry_point.is_none() {
+        let (entry_point, current_max_level) = self.entry_level();
+        if entry_point.is_none() {
             return Ok(vec![]);
         }
         self.validate_dim(query)?;
@@ -1430,8 +1458,8 @@ impl HNSWIndex {
         }
 
         let query_for_greedy = &prepared_query;
-        let mut current = self.entry_point.unwrap();
-        for l in (1..=self.current_max_level).rev() {
+        let mut current = entry_point.unwrap();
+        for l in (1..=current_max_level).rev() {
             current = self.greedy_search_layer_unfiltered(query_for_greedy, current, l);
         }
 
@@ -1529,7 +1557,7 @@ impl HNSWIndex {
             .or_else(num_entry_seeds_default)
             .unwrap_or(1)
             .max(1);
-        if num_seeds <= 1 || self.current_max_level == 0 {
+        if num_seeds <= 1 || self.current_max_level() == 0 {
             return Ok(vec![current]);
         }
         let seed_opts = SearchRuntimeOptions {

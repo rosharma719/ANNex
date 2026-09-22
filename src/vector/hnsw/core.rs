@@ -3,9 +3,11 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use crate::utils::errors::DBError;
 use crate::utils::types::{DistanceMetric, PointId, Vector};
+use crate::vector::hnsw::arena::{ChunkedArray, VectorArena};
 
 use super::config::{
     DEFAULT_EXACT_FALLBACK_THRESHOLD, VERBOSE, exact_fallback_enabled_override,
@@ -38,15 +40,43 @@ pub struct HnswSnapshot {
     pub exact_fallback_threshold: usize,
 }
 
+/// Packed `(current_max_level, entry_point_idx)` in one `AtomicU64`.
+/// Upper 32 bits = max_level; lower 32 bits = entry_idx.
+/// `NO_EP` in the lower 32 bits means no entry point has been set.
+pub(crate) const NO_EP: u32 = u32::MAX;
+pub(crate) const MAX_STORED_LEVEL: usize = u8::MAX as usize;
+
+#[inline]
+pub(crate) fn pack_ep(entry_idx: usize, max_level: usize) -> u64 {
+    debug_assert!(entry_idx <= u32::MAX as usize);
+    debug_assert!(max_level <= u32::MAX as usize);
+    ((max_level as u64) << 32) | (entry_idx as u32 as u64)
+}
+
+#[inline]
+pub(crate) fn unpack_ep(v: u64) -> (Option<usize>, usize) {
+    let idx = (v & 0xffff_ffff) as u32;
+    let level = (v >> 32) as usize;
+    if idx == NO_EP {
+        (None, level)
+    } else {
+        (Some(idx as usize), level)
+    }
+}
+
 pub struct HNSWIndex {
     /// Per-node neighbor lists at each level.
     /// `layers[level][node]` is protected by a `RwLock` so concurrent
     /// inserts can modify different nodes simultaneously while searches
     /// hold shared read locks.
     pub(crate) layers: Vec<Vec<RwLock<Vec<usize>>>>,
-    pub(crate) vectors: Vec<f32>,
-    pub(crate) levels: Vec<usize>,
-    pub(crate) entry_point: Option<usize>,
+    /// Stable-address vector storage. Never reallocates existing data.
+    pub(crate) vectors: VectorArena,
+    /// Per-node assigned level (fits in u8; max_level_cap ≤ 255).
+    pub(crate) levels: ChunkedArray<AtomicU8>,
+    /// Packed (current_max_level, entry_point_idx) as a single atomic.
+    /// Load/store with Acquire/Release for publication ordering.
+    pub(crate) entry_level_ep: AtomicU64,
     pub(crate) metric: DistanceMetric,
     pub(crate) m: usize,
     pub(crate) m0: usize,
@@ -55,11 +85,11 @@ pub struct HNSWIndex {
     pub(crate) ef_construct: usize,
     pub(crate) max_level_cap: usize,
     pub(crate) level_scale: f64,
-    pub(crate) current_max_level: usize,
     pub(crate) dim: usize,
-    pub(crate) deleted: Vec<bool>,
-    // Maintained on deletion and recomputed on snapshot load; keeps query setup O(1).
-    pub(crate) deleted_count: usize,
+    /// Per-node deletion flag.
+    pub(crate) deleted: ChunkedArray<AtomicBool>,
+    /// Maintained on deletion; cached count for O(1) deleted_count().
+    pub(crate) deleted_count: AtomicUsize,
     /// Parallel to layers[0]: edge_dists_l0[idx] holds the distance from node idx to
     /// each of its L0 neighbors, co-indexed with layers[0][idx].
     /// Protected by the same logical lock as layers[0][idx]: always write under
@@ -72,16 +102,11 @@ pub struct HNSWIndex {
     pub(crate) quant_min: Vec<f32>,
     /// Per-dimension scale: (max - min) / 255.0. Set to 1.0 for constant dimensions.
     pub(crate) quant_scale: Vec<f32>,
+    // TODO(Task 5): move to Mutex<AllocState> for concurrent insert+query
     pub(crate) point_to_idx: HashMap<PointId, usize>,
     pub(crate) idx_to_point: Vec<PointId>,
     pub(crate) exact_fallback_enabled: bool,
     pub(crate) exact_fallback_threshold: usize,
-    /// Global read-write lock for concurrent insert coordination.
-    /// Write: held exclusively during node allocation and entry-point promotion.
-    /// Read: held by concurrent insert threads during their search phase so
-    ///        the vectors/levels/layers vecs cannot reallocate under them.
-    #[allow(dead_code)]
-    pub(crate) alloc_lock: RwLock<()>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -95,7 +120,7 @@ pub struct HnswConfigSummary {
     pub ef_construct: usize,
     pub max_level_cap: usize,
     pub level_scale: f64,
-    pub current_max_level: usize,
+    pub current_max_level: usize, // derived from entry_level_ep at snapshot time
     pub dim: usize,
     pub exact_fallback_enabled: bool,
     pub exact_fallback_threshold: usize,
@@ -113,7 +138,7 @@ impl HNSWIndex {
         let _ = log_unfiltered_enabled();
         let base_level_scale = 1.0 / (m as f64).ln();
         let level_scale = Self::level_scale_from_env(base_level_scale).unwrap_or(base_level_scale);
-        let max_level_cap = Self::max_level_cap_from_env(max_level_cap);
+        let max_level_cap = Self::max_level_cap_from_env(max_level_cap).min(MAX_STORED_LEVEL);
         if VERBOSE {
             log::debug!(
                 target: "vector::hnsw",
@@ -124,11 +149,12 @@ impl HNSWIndex {
                 max_level_cap
             );
         }
+        const CHUNK_CAP: usize = 4096;
         Self {
             layers: Vec::new(),
-            vectors: Vec::with_capacity(dim * 64),
-            levels: Vec::new(),
-            entry_point: None,
+            vectors: VectorArena::new(dim, CHUNK_CAP),
+            levels: ChunkedArray::new(CHUNK_CAP),
+            entry_level_ep: AtomicU64::new(pack_ep(NO_EP as usize, 0)),
             metric,
             m,
             m0: m * 2,
@@ -137,10 +163,9 @@ impl HNSWIndex {
             ef_construct: ef,
             max_level_cap,
             level_scale,
-            current_max_level: 0,
             dim,
-            deleted: Vec::new(),
-            deleted_count: 0,
+            deleted: ChunkedArray::new(CHUNK_CAP),
+            deleted_count: AtomicUsize::new(0),
             edge_dists_l0: Vec::new(),
             quantized: Vec::new(),
             quant_min: Vec::new(),
@@ -150,14 +175,12 @@ impl HNSWIndex {
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),
             exact_fallback_threshold: exact_fallback_threshold_override()
                 .unwrap_or(DEFAULT_EXACT_FALLBACK_THRESHOLD),
-            alloc_lock: RwLock::new(()),
         }
     }
 
     pub fn point_level(&self, point_id: PointId) -> Option<usize> {
-        self.point_to_idx
-            .get(&point_id)
-            .and_then(|&idx| self.levels.get(idx).copied())
+        let idx = *self.point_to_idx.get(&point_id)?;
+        Some(self.levels.with(idx, |l| l.load(Ordering::Relaxed)) as usize)
     }
 
     pub fn point_degree(&self, point_id: PointId, level: usize) -> Option<usize> {
@@ -166,6 +189,44 @@ impl HNSWIndex {
             .get(level)
             .and_then(|layer| layer.get(idx))
             .map(|rw| rw.read().len())
+    }
+
+    // ── Entry-point / level helpers ───────────────────────────────────────────
+
+    /// Returns the current entry point index, if any.
+    #[inline]
+    pub(crate) fn entry_point(&self) -> Option<usize> {
+        unpack_ep(self.entry_level_ep.load(Ordering::Acquire)).0
+    }
+
+    /// Returns the current maximum level.
+    #[inline]
+    pub fn current_max_level(&self) -> usize {
+        unpack_ep(self.entry_level_ep.load(Ordering::Acquire)).1
+    }
+
+    /// Load the entry point and maximum level from one atomic observation.
+    #[inline]
+    pub(crate) fn entry_level(&self) -> (Option<usize>, usize) {
+        unpack_ep(self.entry_level_ep.load(Ordering::Acquire))
+    }
+
+    /// Atomically set both entry point and max level together.
+    #[inline]
+    pub(crate) fn store_entry_level(&mut self, idx: usize, level: usize) {
+        debug_assert!(idx < NO_EP as usize);
+        debug_assert!(level <= MAX_STORED_LEVEL);
+        self.entry_level_ep
+            .store(pack_ep(idx, level), Ordering::Release);
+    }
+
+    // ── vector_slice bridge ───────────────────────────────────────────────────
+
+    /// Return a slice into the flat vector storage.
+    /// For the BFS hot path, prefer `VectorArenaView::get` acquired once per search.
+    #[inline]
+    pub(crate) fn vector_slice(&self, idx: usize) -> &[f32] {
+        self.vectors.get_direct(idx)
     }
 
     pub(crate) fn assign_random_level(&self) -> usize {
@@ -180,11 +241,6 @@ impl HNSWIndex {
             DistanceMetric::Cosine | DistanceMetric::Euclidean => raw,
             DistanceMetric::Dot => -raw,
         }
-    }
-
-    #[inline]
-    pub(crate) fn vector_slice(&self, idx: usize) -> &[f32] {
-        &self.vectors[idx * self.dim..(idx + 1) * self.dim]
     }
 
     #[inline]
@@ -210,24 +266,42 @@ impl HNSWIndex {
         let Some(idx) = self.idx_of(point_id) else {
             return;
         };
-        if let Some(flag) = self.deleted.get_mut(idx)
-            && !*flag
-        {
-            *flag = true;
-            self.deleted_count += 1;
+        // Load with Acquire so the caller's subsequent reads see this deletion.
+        let flag = self.deleted.with(idx, |b| b.load(Ordering::Acquire));
+        if !flag {
+            self.deleted.with(idx, |b| b.store(true, Ordering::Release));
+            self.deleted_count.fetch_add(1, Ordering::Relaxed);
         }
-        if Some(idx) == self.entry_point {
-            self.entry_point = self.find_highest_level_entry_point();
+        if Some(idx) == self.entry_point() {
+            let new_ep = self.find_highest_level_entry_point();
+            match new_ep {
+                Some(ep) => {
+                    let level = self.levels.with(ep, |l| l.load(Ordering::Relaxed)) as usize;
+                    self.store_entry_level(ep, level);
+                }
+                None => {
+                    self.entry_level_ep
+                        .store(pack_ep(NO_EP as usize, 0), Ordering::Release);
+                }
+            }
         }
     }
 
     pub fn find_highest_level_entry_point(&self) -> Option<usize> {
-        self.levels
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| !self.deleted.get(*idx).copied().unwrap_or(false))
-            .max_by_key(|(_, level)| *level)
-            .map(|(idx, _)| idx)
+        let n = self.len();
+        let mut best_idx = None;
+        let mut best_level = 0usize;
+        for idx in 0..n {
+            if self.deleted.with(idx, |b| b.load(Ordering::Acquire)) {
+                continue;
+            }
+            let level = self.levels.with(idx, |l| l.load(Ordering::Relaxed)) as usize;
+            if best_idx.is_none() || level >= best_level {
+                best_idx = Some(idx);
+                best_level = level;
+            }
+        }
+        best_idx
     }
 
     #[inline]
@@ -242,12 +316,10 @@ impl HNSWIndex {
 
     #[inline]
     pub(crate) fn get_vector_by_idx(&self, idx: usize) -> Option<&[f32]> {
-        if self.deleted.get(idx).copied().unwrap_or(false) {
+        if idx >= self.vectors.len() || self.deleted.with(idx, |b| b.load(Ordering::Acquire)) {
             None
-        } else if (idx + 1) * self.dim <= self.vectors.len() {
-            Some(self.vector_slice(idx))
         } else {
-            None
+            Some(self.vector_slice(idx))
         }
     }
 
@@ -306,7 +378,7 @@ impl HNSWIndex {
             ef_construct: self.ef_construct,
             max_level_cap: self.max_level_cap,
             level_scale: self.level_scale,
-            current_max_level: self.current_max_level,
+            current_max_level: self.current_max_level(),
             dim: self.dim,
             exact_fallback_enabled: self.exact_fallback_enabled,
             exact_fallback_threshold: self.exact_fallback_threshold,
@@ -322,25 +394,17 @@ impl HNSWIndex {
     }
 
     pub fn iter_vectors(&self) -> impl Iterator<Item = (&PointId, &[f32])> {
-        let dim = self.dim;
-        (0..self.len()).map(move |idx| {
-            let vec = &self.vectors[idx * dim..(idx + 1) * dim];
-            (&self.idx_to_point[idx], vec)
-        })
+        (0..self.len()).map(move |idx| (&self.idx_to_point[idx], self.vector_slice(idx)))
     }
 
     pub fn iter_active_vectors(&self) -> impl Iterator<Item = (&PointId, &[f32])> {
-        let dim = self.dim;
         (0..self.len())
-            .filter(move |&idx| !self.deleted.get(idx).copied().unwrap_or(false))
-            .map(move |idx| {
-                let vec = &self.vectors[idx * dim..(idx + 1) * dim];
-                (&self.idx_to_point[idx], vec)
-            })
+            .filter(move |&idx| !self.deleted.with(idx, |b| b.load(Ordering::Acquire)))
+            .map(move |idx| (&self.idx_to_point[idx], self.vector_slice(idx)))
     }
 
     pub fn deleted_count(&self) -> usize {
-        self.deleted_count
+        self.deleted_count.load(Ordering::Relaxed)
     }
 
     pub fn deleted_fraction(&self) -> f64 {
@@ -352,15 +416,14 @@ impl HNSWIndex {
     }
 
     pub fn iter_active_levels(&self) -> impl Iterator<Item = usize> + '_ {
-        self.levels
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| !self.deleted.get(*idx).copied().unwrap_or(false))
-            .map(|(_, lvl)| *lvl)
+        let n = self.len();
+        (0..n)
+            .filter(move |&idx| !self.deleted.with(idx, |b| b.load(Ordering::Acquire)))
+            .map(move |idx| self.levels.with(idx, |l| l.load(Ordering::Relaxed)) as usize)
     }
 
     pub fn level_histogram(&self) -> Vec<usize> {
-        let max_level = self.current_max_level;
+        let max_level = self.current_max_level();
         let mut counts = vec![0usize; max_level + 1];
         for lvl in self.iter_active_levels() {
             let idx = lvl.min(max_level);
@@ -427,9 +490,9 @@ impl HNSWIndex {
 
     pub fn get_vector(&self, point_id: &PointId) -> Option<&[f32]> {
         let idx = self.idx_of(*point_id)?;
-        if self.deleted.get(idx).copied().unwrap_or(false) {
+        if self.deleted.with(idx, |b| b.load(Ordering::Acquire)) {
             None
-        } else if (idx + 1) * self.dim <= self.vectors.len() {
+        } else if idx < self.vectors.len() {
             Some(self.vector_slice(idx))
         } else {
             None
@@ -437,21 +500,27 @@ impl HNSWIndex {
     }
 
     pub fn get_entry_point(&self) -> Option<u64> {
-        self.entry_point.map(|idx| self.point_id(idx))
+        self.entry_point().map(|idx| self.point_id(idx))
     }
 
-    pub fn current_max_level(&self) -> usize {
-        self.current_max_level
-    }
+    // entry_point() and current_max_level() are defined as helpers above.
 
     pub fn set_entry_point(&mut self, point_id: PointId) {
         if let Some(idx) = self.idx_of(point_id) {
-            self.entry_point = Some(idx);
+            let (_, current_max_level) = self.entry_level();
+            self.store_entry_level(idx, current_max_level);
         }
     }
 
     pub fn set_current_max_level(&mut self, level: usize) {
-        self.current_max_level = level;
+        let level = level.min(self.max_level_cap).min(MAX_STORED_LEVEL);
+        let ep = self.entry_level_ep.load(Ordering::Acquire);
+        let (ep_idx, _) = unpack_ep(ep);
+        let new_ep = match ep_idx {
+            Some(idx) => pack_ep(idx, level),
+            None => pack_ep(NO_EP as usize, level),
+        };
+        self.entry_level_ep.store(new_ep, Ordering::Release);
     }
 
     pub fn set_exact_fallback_enabled(&mut self, enabled: bool) {
@@ -840,9 +909,15 @@ impl HNSWIndex {
         level: usize,
     ) -> usize {
         let idx = self.idx_to_point.len();
-        self.vectors.extend_from_slice(&vector);
-        self.levels.push(level);
-        self.deleted.push(false);
+        let vector_idx = self.vectors.push(&vector);
+        debug_assert_eq!(vector_idx, idx);
+        let lvl_idx = self.levels.push_default();
+        debug_assert_eq!(lvl_idx, idx);
+        let stored_level = u8::try_from(level).expect("HNSW level exceeds u8 storage");
+        self.levels
+            .with(idx, |l| l.store(stored_level, Ordering::Relaxed));
+        let del_idx = self.deleted.push_default(); // AtomicBool::default() = false
+        debug_assert_eq!(del_idx, idx);
         self.edge_dists_l0
             .push(parking_lot::RwLock::new(Vec::new()));
         self.idx_to_point.push(point_id);
@@ -853,8 +928,7 @@ impl HNSWIndex {
 
 impl HNSWIndex {
     pub(crate) fn allocate_entry_point(&mut self, idx: usize, level: usize) {
-        self.entry_point = Some(idx);
-        self.current_max_level = level;
+        self.store_entry_level(idx, level);
     }
 }
 
@@ -868,7 +942,6 @@ impl HNSWIndex {
     /// loading or building an index when TI skip is actually needed.
     pub fn build_edge_distances(&mut self) {
         let n = self.len();
-        let dim = self.dim;
         // Allocate the outer Vec once; inner Vecs are populated below.
         if self.edge_dists_l0.is_empty() {
             self.edge_dists_l0 = (0..n)
@@ -881,7 +954,7 @@ impl HNSWIndex {
                 if nb.is_empty() {
                     continue;
                 }
-                let src: Vec<f32> = self.vectors[idx * dim..(idx + 1) * dim].to_vec();
+                let src: Vec<f32> = self.vector_slice(idx).to_vec();
                 let dists: Vec<f32> = nb
                     .iter()
                     .map(|&n| {
@@ -986,22 +1059,30 @@ impl HNSWIndex {
             inv_perm[old_idx] = new_idx;
         }
 
-        // Permute vectors (flat slice: each node occupies `dim` consecutive f32s).
+        // Permute vectors into a fresh VectorArena.
+        const CHUNK_CAP: usize = 4096;
         let dim = self.dim;
-        let mut new_vectors = vec![0.0f32; n * dim];
-        for (new_idx, &old_idx) in perm.iter().enumerate() {
-            let src = &self.vectors[old_idx * dim..(old_idx + 1) * dim];
-            new_vectors[new_idx * dim..(new_idx + 1) * dim].copy_from_slice(src);
+        let new_vectors = VectorArena::new(dim, CHUNK_CAP);
+        for &old_idx in &perm {
+            new_vectors.push(self.vectors.get_direct(old_idx));
         }
         self.vectors = new_vectors;
 
         // Permute idx_to_point, deleted, and levels.
-        let old_itp = std::mem::take(&mut self.idx_to_point);
-        let old_del = std::mem::take(&mut self.deleted);
-        let old_lvl = std::mem::take(&mut self.levels);
+        let old_itp: Vec<PointId> = std::mem::take(&mut self.idx_to_point);
+        let new_del: ChunkedArray<AtomicBool> = ChunkedArray::new(CHUNK_CAP);
+        let new_lvl: ChunkedArray<AtomicU8> = ChunkedArray::new(CHUNK_CAP);
+        for &old_idx in &perm {
+            let di = new_del.push_default();
+            let was_deleted = self.deleted.with(old_idx, |b| b.load(Ordering::Relaxed));
+            new_del.with(di, |b| b.store(was_deleted, Ordering::Relaxed));
+            let li = new_lvl.push_default();
+            let lvl = self.levels.with(old_idx, |l| l.load(Ordering::Relaxed));
+            new_lvl.with(li, |l| l.store(lvl, Ordering::Relaxed));
+        }
         self.idx_to_point = perm.iter().map(|&o| old_itp[o]).collect();
-        self.deleted = perm.iter().map(|&o| old_del[o]).collect();
-        self.levels = perm.iter().map(|&o| old_lvl[o]).collect();
+        self.deleted = new_del;
+        self.levels = new_lvl;
 
         // Rebuild point_to_idx from new idx_to_point.
         self.point_to_idx.clear();
@@ -1010,8 +1091,10 @@ impl HNSWIndex {
         }
 
         // Update entry point.
-        if let Some(ep) = self.entry_point {
-            self.entry_point = Some(inv_perm[ep]);
+        if let Some(ep) = self.entry_point() {
+            let new_ep = inv_perm[ep];
+            let level = self.levels.with(new_ep, |l| l.load(Ordering::Relaxed)) as usize;
+            self.store_entry_level(new_ep, level);
         }
 
         // Permute all layers: remap neighbor indices through inv_perm.
@@ -1087,7 +1170,7 @@ impl HNSWIndex {
             let mut min_d = vec![f32::MAX; dim];
             let mut max_d = vec![f32::MIN; dim];
             for idx in 0..n {
-                if self.deleted.get(idx).copied().unwrap_or(false) {
+                if self.deleted.with(idx, |b| b.load(Ordering::Acquire)) {
                     continue;
                 }
                 let v = self.vector_slice(idx);

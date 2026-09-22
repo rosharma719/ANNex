@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::payload_storage::filters::{Filter, evaluate_filter};
 use crate::payload_storage::stores::PayloadIndex;
@@ -22,13 +23,16 @@ use super::types::{
 };
 
 impl HNSWIndex {
-    fn best_entry_in_mask(mask: &[bool], levels: &[usize], deleted: &[bool]) -> Option<usize> {
+    fn best_entry_in_mask(&self, mask: &[bool]) -> Option<usize> {
         let mut best: Option<(usize, usize)> = None;
         for (idx, &allowed) in mask.iter().enumerate() {
-            if !allowed || deleted.get(idx).copied().unwrap_or(false) {
+            if !allowed
+                || idx >= self.len()
+                || self.deleted.with(idx, |flag| flag.load(Ordering::Acquire))
+            {
                 continue;
             }
-            let level = levels.get(idx).copied().unwrap_or(0);
+            let level = self.levels.with(idx, |level| level.load(Ordering::Relaxed)) as usize;
             if best.map_or(true, |(_, best_level)| level > best_level) {
                 best = Some((idx, level));
             }
@@ -36,21 +40,19 @@ impl HNSWIndex {
         best.map(|(idx, _)| idx)
     }
 
-    fn top_entries_in_mask(
-        mask: &[bool],
-        levels: &[usize],
-        deleted: &[bool],
-        cap: usize,
-    ) -> Vec<usize> {
+    fn top_entries_in_mask(&self, mask: &[bool], cap: usize) -> Vec<usize> {
         if cap == 0 {
             return Vec::new();
         }
         let mut best: Vec<(usize, usize)> = Vec::with_capacity(cap);
         for (idx, &allowed) in mask.iter().enumerate() {
-            if !allowed || deleted.get(idx).copied().unwrap_or(false) {
+            if !allowed
+                || idx >= self.len()
+                || self.deleted.with(idx, |flag| flag.load(Ordering::Acquire))
+            {
                 continue;
             }
-            let level = levels.get(idx).copied().unwrap_or(0);
+            let level = self.levels.with(idx, |level| level.load(Ordering::Relaxed)) as usize;
             if best.len() < cap {
                 best.push((idx, level));
                 if best.len() == cap {
@@ -76,20 +78,12 @@ impl HNSWIndex {
         payload_index: &PayloadIndex,
         payloads: &HashMap<PointId, Payload>,
     ) -> Option<usize> {
-        fn max_level_point<'a>(
-            ids: impl Iterator<Item = &'a PointId>,
-            levels: &[usize],
-            deleted: &[bool],
-            map: &HashMap<PointId, usize>,
-        ) -> Option<usize> {
-            ids.filter_map(|id| map.get(id).copied())
-                .filter(|&idx| !deleted.get(idx).copied().unwrap_or(false))
-                .max_by_key(|&idx| levels.get(idx).copied().unwrap_or(0))
-        }
-
         match filter {
             Filter::Match { key, value } => payload_index.query_exact(key, value).and_then(|ids| {
-                max_level_point(ids.iter(), &self.levels, &self.deleted, &self.point_to_idx)
+                ids.iter()
+                    .filter_map(|id| self.point_to_idx.get(id).copied())
+                    .filter(|&idx| !self.deleted.with(idx, |flag| flag.load(Ordering::Acquire)))
+                    .max_by_key(|&idx| self.levels.with(idx, |level| level.load(Ordering::Relaxed)))
             }),
             Filter::And(conds) | Filter::Or(conds) => {
                 let mut best: Option<(usize, usize)> = None;
@@ -98,7 +92,8 @@ impl HNSWIndex {
                     if let Some(id) =
                         self.find_entry_point_matching_filter(cond, payload_index, payloads)
                     {
-                        let level = self.levels.get(id).copied().unwrap_or(0);
+                        let level =
+                            self.levels.with(id, |level| level.load(Ordering::Relaxed)) as usize;
                         if best.map_or(true, |(_, l)| level > l) {
                             best = Some((id, level));
                         }
@@ -190,7 +185,7 @@ impl HNSWIndex {
                         let Some(idx) = self.idx_of(id) else {
                             continue;
                         };
-                        if self.deleted.get(idx).copied().unwrap_or(false) {
+                        if self.deleted.with(idx, |b| b.load(Ordering::Acquire)) {
                             continue;
                         }
                         let Some(payload) = payloads.get(&id) else {
@@ -235,15 +230,16 @@ impl HNSWIndex {
             }
         }
 
-        let mut entry = match self.entry_point {
+        let (entry_point, current_max_level) = self.entry_level();
+        let mut entry = match entry_point {
             Some(idx) => {
                 if let Some(mask) = allowed_mask.as_ref() {
                     if mask.get(idx).copied().unwrap_or(false)
-                        && !self.deleted.get(idx).copied().unwrap_or(false)
+                        && !self.deleted.with(idx, |b| b.load(Ordering::Acquire))
                     {
                         idx
                     } else {
-                        match Self::best_entry_in_mask(mask, &self.levels, &self.deleted) {
+                        match self.best_entry_in_mask(mask) {
                             Some(best) => best,
                             None => return Ok(vec![]),
                         }
@@ -267,7 +263,7 @@ impl HNSWIndex {
             }
             None => {
                 if let Some(mask) = allowed_mask.as_ref() {
-                    match Self::best_entry_in_mask(mask, &self.levels, &self.deleted) {
+                    match self.best_entry_in_mask(mask) {
                         Some(best) => best,
                         None => return Ok(vec![]),
                     }
@@ -282,7 +278,7 @@ impl HNSWIndex {
             }
         };
 
-        for level in (1..=self.current_max_level()).rev() {
+        for level in (1..=current_max_level).rev() {
             entry = self.greedy_search_layer_with_filter(
                 query_for_greedy,
                 entry,
@@ -367,7 +363,7 @@ impl HNSWIndex {
 
             if let Some(mask) = allowed_mask.as_ref() {
                 let cap = filter_entry_candidates().unwrap_or(ef_search).max(1);
-                let entry_candidates = Self::top_entries_in_mask(mask, &self.levels, &self.deleted, cap);
+                let entry_candidates = self.top_entries_in_mask(mask, cap);
                 for idx in entry_candidates {
                     if idx == entry {
                         continue;
@@ -521,7 +517,9 @@ impl HNSWIndex {
                     {
                         continue;
                     }
-                    if self.deleted.get(idx).copied().unwrap_or(false) || !scratch.mark_visited(idx) {
+                    if self.deleted.with(idx, |b| b.load(Ordering::Acquire))
+                        || !scratch.mark_visited(idx)
+                    {
                         continue;
                     }
                     visited_count += 1;
@@ -608,7 +606,9 @@ impl HNSWIndex {
                         {
                             continue;
                         }
-                        if self.deleted.get(nb).copied().unwrap_or(false) || !scratch.mark_visited(nb) {
+                        if self.deleted.with(nb, |b| b.load(Ordering::Acquire))
+                            || !scratch.mark_visited(nb)
+                        {
                             continue;
                         }
                         visited_count += 1;

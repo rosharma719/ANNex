@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
@@ -8,8 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::utils::errors::DBError;
 use crate::utils::io::{adler32, write_atomic_with_checksum};
 use crate::utils::types::{DistanceMetric, PointId, Vector};
+use crate::vector::hnsw::arena::{ChunkedArray, VectorArena};
 
 use super::config::{exact_fallback_enabled_override, exact_fallback_threshold_override};
+use super::core::{MAX_STORED_LEVEL, NO_EP, pack_ep};
 use super::{HNSWIndex, HnswSnapshot};
 
 const HNSW_SNAPSHOT_MAGIC: [u8; 4] = *b"VDBH";
@@ -62,14 +65,19 @@ impl From<HnswSnapshotV1> for HnswSnapshot {
 
 impl HNSWIndex {
     pub fn to_snapshot(&self) -> HnswSnapshot {
-        let mut vectors = HashMap::with_capacity(self.len());
-        let mut levels = HashMap::with_capacity(self.levels.len());
+        let n = self.len();
+        let (entry_idx, current_max_level) = self.entry_level();
+        let mut vectors = HashMap::with_capacity(n);
+        let mut levels = HashMap::with_capacity(n);
         let mut deleted = HashSet::new();
-        for idx in 0..self.len() {
+        for idx in 0..n {
             let id = self.point_id(idx);
             vectors.insert(id, self.vector_slice(idx).to_vec());
-            levels.insert(id, self.levels.get(idx).copied().unwrap_or(0));
-            if self.deleted.get(idx).copied().unwrap_or(false) {
+            levels.insert(
+                id,
+                self.levels.with(idx, |l| l.load(Ordering::Relaxed)) as usize,
+            );
+            if self.deleted.with(idx, |b| b.load(Ordering::Relaxed)) {
                 deleted.insert(id);
             }
         }
@@ -98,7 +106,7 @@ impl HNSWIndex {
             layers,
             vectors,
             levels,
-            entry_point: self.entry_point.map(|idx| self.point_id(idx)),
+            entry_point: entry_idx.map(|idx| self.point_id(idx)),
             metric: self.metric,
             m: self.m,
             m0: self.m0,
@@ -107,7 +115,7 @@ impl HNSWIndex {
             ef_construct: self.ef_construct,
             max_level_cap: self.max_level_cap,
             level_scale: self.level_scale,
-            current_max_level: self.current_max_level,
+            current_max_level,
             dim: self.dim,
             deleted,
             exact_fallback_enabled: self.exact_fallback_enabled,
@@ -132,20 +140,39 @@ impl HNSWIndex {
         for (idx, id) in ids.iter().copied().enumerate() {
             point_to_idx.insert(id, idx);
         }
-        let mut vectors = Vec::with_capacity(ids.len() * snapshot.dim);
-        let mut levels = Vec::with_capacity(ids.len());
-        let mut deleted = vec![false; ids.len()];
+
+        const CHUNK_CAP: usize = 4096;
+        let vectors = VectorArena::new(snapshot.dim, CHUNK_CAP);
+        let levels_arr: ChunkedArray<std::sync::atomic::AtomicU8> = ChunkedArray::new(CHUNK_CAP);
+        let deleted_arr: ChunkedArray<std::sync::atomic::AtomicBool> = ChunkedArray::new(CHUNK_CAP);
+        let mut deleted_count = 0usize;
+
         for (idx, id) in ids.iter().copied().enumerate() {
             if let Some(vec) = snapshot.vectors.get(&id) {
-                vectors.extend_from_slice(vec);
+                let pushed = vectors.push(vec);
+                debug_assert_eq!(pushed, idx);
             } else {
-                vectors.extend(std::iter::repeat(0.0f32).take(snapshot.dim));
+                let zeros = vec![0.0f32; snapshot.dim];
+                let pushed = vectors.push(&zeros);
+                debug_assert_eq!(pushed, idx);
             }
-            levels.push(snapshot.levels.get(&id).copied().unwrap_or(0));
+            let li = levels_arr.push_default();
+            debug_assert_eq!(li, idx);
+            let level = snapshot
+                .levels
+                .get(&id)
+                .copied()
+                .unwrap_or(0)
+                .min(MAX_STORED_LEVEL) as u8;
+            levels_arr.with(idx, |l| l.store(level, Ordering::Relaxed));
+            let di = deleted_arr.push_default();
+            debug_assert_eq!(di, idx);
             if snapshot.deleted.contains(&id) {
-                deleted[idx] = true;
+                deleted_arr.with(idx, |b| b.store(true, Ordering::Relaxed));
+                deleted_count += 1;
             }
         }
+
         let num_levels = snapshot
             .layers
             .keys()
@@ -183,31 +210,37 @@ impl HNSWIndex {
             }
         }
 
-        // Edge distances are NOT backfilled on load. They are computed lazily by
-        // build_edge_distances() only when TI skip is actually needed. Pre-computing
-        // them on every snapshot load caused a ~50% throughput regression on the
-        // 290k NYT index due to heap fragmentation from 290k scattered Vec allocations.
+        // Edge distances are NOT backfilled on load — lazy via build_edge_distances().
         let edge_dists_l0: Vec<parking_lot::RwLock<Vec<f32>>> = Vec::new();
+
+        let stored_max_level = snapshot.current_max_level.min(MAX_STORED_LEVEL);
+        let entry_level_ep = {
+            use std::sync::atomic::AtomicU64;
+            let ep_idx = snapshot
+                .entry_point
+                .and_then(|id| point_to_idx.get(&id).copied());
+            AtomicU64::new(match ep_idx {
+                Some(idx) => pack_ep(idx, stored_max_level),
+                None => pack_ep(NO_EP as usize, 0),
+            })
+        };
 
         Self {
             layers,
             vectors,
-            levels,
-            entry_point: snapshot
-                .entry_point
-                .and_then(|id| point_to_idx.get(&id).copied()),
+            levels: levels_arr,
+            entry_level_ep,
             metric: snapshot.metric,
             m: snapshot.m,
             m0,
             stored_cap_l0,
             ef: snapshot.ef,
             ef_construct: snapshot.ef_construct,
-            max_level_cap: snapshot.max_level_cap,
+            max_level_cap: snapshot.max_level_cap.min(MAX_STORED_LEVEL),
             level_scale: snapshot.level_scale,
-            current_max_level: snapshot.current_max_level,
             dim: snapshot.dim,
-            deleted_count: deleted.iter().filter(|&&flag| flag).count(),
-            deleted,
+            deleted_count: std::sync::atomic::AtomicUsize::new(deleted_count),
+            deleted: deleted_arr,
             edge_dists_l0,
             // SQ8 quantization is not persisted; rebuilt lazily via quantize_all().
             quantized: Vec::new(),
@@ -218,7 +251,6 @@ impl HNSWIndex {
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),
             exact_fallback_threshold: exact_fallback_threshold_override()
                 .unwrap_or(snapshot.exact_fallback_threshold),
-            alloc_lock: parking_lot::RwLock::new(()),
         }
     }
 

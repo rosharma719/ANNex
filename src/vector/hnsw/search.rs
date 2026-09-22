@@ -122,19 +122,17 @@ fn prefetch_read<T>(ptr: *const T) {
     let _ = ptr;
 }
 
-impl HNSWIndex {
-    #[inline(always)]
-    fn prefetch_vector(&self, idx: usize) {
-        let vector = self.vector_slice(idx);
-        // Warm the beginning of the vector during batch collection. Bound each
-        // hint so short vectors are supported too; do not assume cache-line size.
-        for offset in [0, 16, 32, 48] {
-            if let Some(value) = vector.get(offset) {
-                prefetch_read(value);
-            }
+#[inline(always)]
+fn prefetch_from_view(view: &crate::vector::hnsw::arena::VectorArenaView, idx: usize) {
+    let vector = view.get(idx);
+    for offset in [0, 16, 32, 48] {
+        if let Some(value) = vector.get(offset) {
+            prefetch_read(value);
         }
     }
+}
 
+impl HNSWIndex {
     fn exact_scan(&self, query: &[f32], normalize_scores: bool, top_k: usize) -> Vec<ScoredPoint> {
         let mut brute: Vec<ScoredPoint> = (0..self.len())
             .filter_map(|idx| {
@@ -197,6 +195,11 @@ impl HNSWIndex {
         let expansion_cap_value =
             expansion_cap_override.or_else(|| Some(ef.saturating_mul(expansion_mult).max(ef)));
         log_neighbor_scan_state(expansion_mult, expansion_cap_value);
+        // Acquire the arena view once per BFS. All per-node vector reads on the
+        // hot path go through `vec_view.get(idx)`, which is a pure indexed slice
+        // with no synchronisation and no risk of racing a concurrent inserter's
+        // chunk publication.
+        let vec_view = self.vectors.view();
         SEARCH_SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
             // Capture the node count at BFS start. Any neighbor idx observed
@@ -233,7 +236,7 @@ impl HNSWIndex {
                     continue;
                 }
                 visited_count += 1;
-                let raw = self.fast_score(query, self.vector_slice(start));
+                let raw = self.fast_score(query, vec_view.get(start));
                 let score_val = if normalize {
                     self.normalize_score(raw)
                 } else {
@@ -254,7 +257,7 @@ impl HNSWIndex {
             // If all provided entries were deleted, fall back to first LIVE node.
             if scratch.result_set.is_empty() {
                 let fallback = (0..self.len()).find(|&idx| self.is_live(idx)).unwrap_or(0);
-                let raw = self.fast_score(query, self.vector_slice(fallback));
+                let raw = self.fast_score(query, vec_view.get(fallback));
                 let score_val = if normalize {
                     self.normalize_score(raw)
                 } else {
@@ -376,12 +379,12 @@ impl HNSWIndex {
                                 }
                                 visited_count += 1;
 
-                                self.prefetch_vector(neighbor);
+                                prefetch_from_view(&vec_view, neighbor);
                                 batch[batch_len] = neighbor;
                                 batch_len += 1;
                                 if batch_len == BATCH {
                                     for &idx in batch.iter().take(batch_len) {
-                                        let raw = self.fast_score(query, self.vector_slice(idx));
+                                        let raw = self.fast_score(query, vec_view.get(idx));
                                         let score_val = if normalize {
                                             self.normalize_score(raw)
                                         } else {
@@ -417,7 +420,7 @@ impl HNSWIndex {
                             }
                             if batch_len > 0 {
                                 for &idx in batch.iter().take(batch_len) {
-                                    let raw = self.fast_score(query, self.vector_slice(idx));
+                                    let raw = self.fast_score(query, vec_view.get(idx));
                                     let score_val = if normalize {
                                         self.normalize_score(raw)
                                     } else {
@@ -480,12 +483,12 @@ impl HNSWIndex {
                                     continue;
                                 }
                                 visited_count += 1;
-                                self.prefetch_vector(neighbor);
+                                prefetch_from_view(&vec_view, neighbor);
                                 batch[batch_len] = neighbor;
                                 batch_len += 1;
                                 if batch_len == BATCH {
                                     for &idx in batch.iter().take(batch_len) {
-                                        let raw = self.fast_score(query, self.vector_slice(idx));
+                                        let raw = self.fast_score(query, vec_view.get(idx));
                                         let score_val = if normalize {
                                             self.normalize_score(raw)
                                         } else {
@@ -518,7 +521,7 @@ impl HNSWIndex {
                             }
                             if batch_len > 0 {
                                 for &idx in batch.iter().take(batch_len) {
-                                    let raw = self.fast_score(query, self.vector_slice(idx));
+                                    let raw = self.fast_score(query, vec_view.get(idx));
                                     let score_val = if normalize {
                                         self.normalize_score(raw)
                                     } else {
@@ -578,12 +581,12 @@ impl HNSWIndex {
                                         continue;
                                     }
                                 }
-                                self.prefetch_vector(neighbor);
+                                prefetch_from_view(&vec_view, neighbor);
                                 batch[batch_len] = neighbor;
                                 batch_len += 1;
                                 if batch_len == BATCH {
                                     for &idx in batch.iter().take(batch_len) {
-                                        let raw = self.fast_score(query, self.vector_slice(idx));
+                                        let raw = self.fast_score(query, vec_view.get(idx));
                                         let score_val = if normalize {
                                             self.normalize_score(raw)
                                         } else {
@@ -621,7 +624,7 @@ impl HNSWIndex {
                             }
                             if batch_len > 0 {
                                 for &idx in batch.iter().take(batch_len) {
-                                    let raw = self.fast_score(query, self.vector_slice(idx));
+                                    let raw = self.fast_score(query, vec_view.get(idx));
                                     let score_val = if normalize {
                                         self.normalize_score(raw)
                                     } else {
@@ -706,7 +709,7 @@ impl HNSWIndex {
                                     }
                                     visited_count += 1;
 
-                                    self.prefetch_vector(neighbor);
+                                    prefetch_from_view(&vec_view, neighbor);
                                     batch[batch_len] = neighbor;
                                     batch_len += 1;
                                     if batch_len == BATCH {
@@ -714,8 +717,7 @@ impl HNSWIndex {
                                             if collect_counters {
                                                 distance_computations += 1;
                                             }
-                                            let raw =
-                                                self.fast_score(query, self.vector_slice(idx));
+                                            let raw = self.fast_score(query, vec_view.get(idx));
                                             let score_val = if normalize {
                                                 self.normalize_score(raw)
                                             } else {
@@ -773,7 +775,7 @@ impl HNSWIndex {
                                         if collect_counters {
                                             distance_computations += 1;
                                         }
-                                        let raw = self.fast_score(query, self.vector_slice(idx));
+                                        let raw = self.fast_score(query, vec_view.get(idx));
                                         let score_val = if normalize {
                                             self.normalize_score(raw)
                                         } else {
@@ -938,6 +940,7 @@ impl HNSWIndex {
         self.validate_dim(query)?;
 
         let mut trace = trace;
+        let vec_view = self.vectors.view();
         SEARCH_SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
             let bfs_bound = self.len();
@@ -1040,7 +1043,7 @@ impl HNSWIndex {
                         }
                         visited_count += 1;
 
-                        self.prefetch_vector(neighbor);
+                        prefetch_from_view(&vec_view, neighbor);
                         batch[batch_len] = neighbor;
                         batch_len += 1;
                         if batch_len == BATCH {

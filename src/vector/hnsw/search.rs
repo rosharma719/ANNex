@@ -199,7 +199,12 @@ impl HNSWIndex {
         log_neighbor_scan_state(expansion_mult, expansion_cap_value);
         SEARCH_SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
-            scratch.next_epoch(self.len());
+            // Capture the node count at BFS start. Any neighbor idx observed
+            // at or beyond this bound was appended by a concurrent inserter
+            // and is outside this search's world — must be filtered before
+            // it hits scratch/metadata arrays.
+            let node_bound = self.len();
+            scratch.next_epoch(node_bound);
             scratch.candidate_queue.clear();
             scratch.result_set.clear();
 
@@ -220,14 +225,10 @@ impl HNSWIndex {
             let mut first_seed_idx = 0usize;
             let mut first_seed_score = 0.0f32;
             for &entry in entries {
-                let start = if self
-                    .deleted
-                    .with(entry, |b| b.load(::std::sync::atomic::Ordering::Acquire))
-                {
+                if entry >= node_bound || !self.is_live(entry) {
                     continue;
-                } else {
-                    entry
-                };
+                }
+                let start = entry;
                 if !scratch.mark_visited(start) {
                     continue;
                 }
@@ -250,15 +251,9 @@ impl HNSWIndex {
                 scratch.candidate_queue.push(candidate);
                 scratch.result_set.push(NodeResult(candidate));
             }
-            // If all provided entries were deleted, fall back to first live node.
+            // If all provided entries were deleted, fall back to first LIVE node.
             if scratch.result_set.is_empty() {
-                let fallback = (0..self.len())
-                    .find(|&idx| {
-                        !self.deleted.with(idx, |flag| {
-                            flag.load(::std::sync::atomic::Ordering::Acquire)
-                        })
-                    })
-                    .unwrap_or(0);
+                let fallback = (0..self.len()).find(|&idx| self.is_live(idx)).unwrap_or(0);
                 let raw = self.fast_score(query, self.vector_slice(fallback));
                 let score_val = if normalize {
                     self.normalize_score(raw)
@@ -373,9 +368,9 @@ impl HNSWIndex {
                                 {
                                     prefetch_read(entry);
                                 }
-                                if self.deleted.with(neighbor, |b| {
-                                    b.load(::std::sync::atomic::Ordering::Acquire)
-                                }) || !scratch.mark_visited(neighbor)
+                                if neighbor >= node_bound
+                                    || !self.is_live(neighbor)
+                                    || !scratch.mark_visited(neighbor)
                                 {
                                     continue;
                                 }
@@ -478,9 +473,9 @@ impl HNSWIndex {
                                 {
                                     prefetch_read(entry);
                                 }
-                                if self.deleted.with(neighbor, |b| {
-                                    b.load(::std::sync::atomic::Ordering::Acquire)
-                                }) || !scratch.mark_visited(neighbor)
+                                if neighbor >= node_bound
+                                    || !self.is_live(neighbor)
+                                    || !scratch.mark_visited(neighbor)
                                 {
                                     continue;
                                 }
@@ -567,9 +562,9 @@ impl HNSWIndex {
                                 {
                                     prefetch_read(entry);
                                 }
-                                if self.deleted.with(neighbor, |b| {
-                                    b.load(::std::sync::atomic::Ordering::Acquire)
-                                }) || !scratch.mark_visited(neighbor)
+                                if neighbor >= node_bound
+                                    || !self.is_live(neighbor)
+                                    || !scratch.mark_visited(neighbor)
                                 {
                                     continue;
                                 }
@@ -703,9 +698,9 @@ impl HNSWIndex {
                                     if collect_counters {
                                         adjacency_reads += 1;
                                     }
-                                    if self.deleted.with(neighbor, |b| {
-                                        b.load(::std::sync::atomic::Ordering::Acquire)
-                                    }) || !scratch.mark_visited(neighbor)
+                                    if neighbor >= node_bound
+                                        || !self.is_live(neighbor)
+                                        || !scratch.mark_visited(neighbor)
                                     {
                                         continue;
                                     }
@@ -945,12 +940,14 @@ impl HNSWIndex {
         let mut trace = trace;
         SEARCH_SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
-            scratch.next_epoch(self.len());
+            let bfs_bound = self.len();
+            scratch.next_epoch(bfs_bound);
             scratch.candidate_queue.clear();
             scratch.result_set.clear();
 
             let mut visited_count = 0usize;
             let mut expanded = 0usize;
+            let node_bound = bfs_bound;
 
             // Score function: negate so lower sort_key = better (matches BFS convention).
             let sq8_sort_key = |idx: usize| -> f32 { -(self.sq8_approx_dot(query_q, idx) as f32) };
@@ -959,14 +956,10 @@ impl HNSWIndex {
             let mut first_seed_idx = 0usize;
             let mut first_seed_score = 0.0f32;
             for &entry in entries {
-                let start = if self
-                    .deleted
-                    .with(entry, |b| b.load(::std::sync::atomic::Ordering::Acquire))
-                {
+                if entry >= node_bound || !self.is_live(entry) {
                     continue;
-                } else {
-                    entry
-                };
+                }
+                let start = entry;
                 if !scratch.mark_visited(start) {
                     continue;
                 }
@@ -986,13 +979,7 @@ impl HNSWIndex {
             }
             // Fallback if all entries were deleted.
             if scratch.result_set.is_empty() {
-                let fallback = (0..self.len())
-                    .find(|&idx| {
-                        !self.deleted.with(idx, |flag| {
-                            flag.load(::std::sync::atomic::Ordering::Acquire)
-                        })
-                    })
-                    .unwrap_or(0);
+                let fallback = (0..self.len()).find(|&idx| self.is_live(idx)).unwrap_or(0);
                 let score_val = sq8_sort_key(fallback);
                 let candidate = NodeCandidate {
                     idx: fallback,
@@ -1045,9 +1032,8 @@ impl HNSWIndex {
                         {
                             prefetch_read(entry);
                         }
-                        if self
-                            .deleted
-                            .with(neighbor, |b| b.load(::std::sync::atomic::Ordering::Acquire))
+                        if neighbor >= node_bound
+                            || !self.is_live(neighbor)
                             || !scratch.mark_visited(neighbor)
                         {
                             continue;

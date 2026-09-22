@@ -829,3 +829,76 @@ fn snapshot_round_trip_preserves_max_level_without_entry() {
         "from_snapshot must preserve current_max_level when entry point is absent"
     );
 }
+
+/// Concurrent insert + query smoke test: two writer threads growing an
+/// initially-empty index while three reader threads issue searches. Every
+/// returned result must be a currently-live inserted node, so any leakage of
+/// RESERVED (mid-insert) or DELETED nodes into query output would surface as
+/// an id we never inserted or the search consuming a torn adjacency.
+#[test]
+fn concurrent_insert_and_query_returns_only_live_ids() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+
+    const DIM: usize = 16;
+    let index = Arc::new(HNSWIndex::new(DistanceMetric::Cosine, 8, 50, 4, DIM));
+
+    // Seed a few nodes so queries have something to bootstrap on.
+    for i in 0u64..32 {
+        let v: Vec<f32> = (0..DIM)
+            .map(|d| if d == (i as usize % DIM) { 1.0 } else { 0.0 })
+            .collect();
+        index.insert(i, v).unwrap();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let mut writers = Vec::new();
+    for w in 0..2u64 {
+        let idx = Arc::clone(&index);
+        writers.push(std::thread::spawn(move || {
+            let start = 32 + w * 200;
+            for i in start..(start + 200) {
+                let v: Vec<f32> = (0..DIM)
+                    .map(|d| if d == (i as usize % DIM) { 1.0 } else { 0.5 })
+                    .collect();
+                idx.insert(i, v).unwrap();
+            }
+        }));
+    }
+
+    let mut readers = Vec::new();
+    for _ in 0..3 {
+        let idx = Arc::clone(&index);
+        let stop_flag = Arc::clone(&stop);
+        readers.push(std::thread::spawn(move || {
+            let query: Vec<f32> = (0..DIM).map(|d| if d == 0 { 1.0 } else { 0.0 }).collect();
+            let mut iterations = 0usize;
+            while !stop_flag.load(AOrd::Relaxed) {
+                let results = idx.search(&query, 5).unwrap();
+                for r in results {
+                    // All returned ids must be from the id space we inserted.
+                    assert!(
+                        r.id < 32 + 400,
+                        "search returned unknown id {} (possibly RESERVED leak)",
+                        r.id
+                    );
+                }
+                iterations += 1;
+                if iterations > 5000 {
+                    break;
+                }
+            }
+        }));
+    }
+
+    for w in writers {
+        w.join().unwrap();
+    }
+    stop.store(true, AOrd::Release);
+    for r in readers {
+        r.join().unwrap();
+    }
+
+    // All 32 seeds + 400 concurrent writes should have landed.
+    assert_eq!(index.len(), 32 + 400);
+}

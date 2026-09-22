@@ -596,7 +596,7 @@ impl Segment {
         let mut new_payload_index = PayloadIndex::new();
         let mut new_payloads = HashMap::new();
 
-        for (&id, vector) in self.hnsw.iter_vectors() {
+        for (id, vector) in self.hnsw.iter_vectors() {
             if self.deleted.contains(&id) {
                 continue;
             }

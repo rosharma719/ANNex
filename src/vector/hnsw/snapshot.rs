@@ -135,10 +135,10 @@ impl HNSWIndex {
         } else {
             snapshot.stored_cap_l0
         };
-        let mut ids: Vec<PointId> = snapshot.vectors.keys().copied().collect();
-        ids.sort_unstable();
-        let mut point_to_idx = HashMap::with_capacity(ids.len());
-        for (idx, id) in ids.iter().copied().enumerate() {
+        let mut point_ids: Vec<PointId> = snapshot.vectors.keys().copied().collect();
+        point_ids.sort_unstable();
+        let mut point_to_idx = HashMap::with_capacity(point_ids.len());
+        for (idx, id) in point_ids.iter().copied().enumerate() {
             point_to_idx.insert(id, idx);
         }
 
@@ -146,9 +146,12 @@ impl HNSWIndex {
         let vectors = VectorArena::new(snapshot.dim, CHUNK_CAP);
         let levels_arr: ChunkedArray<std::sync::atomic::AtomicU8> = ChunkedArray::new(CHUNK_CAP);
         let deleted_arr: ChunkedArray<std::sync::atomic::AtomicBool> = ChunkedArray::new(CHUNK_CAP);
+        let node_state_arr: ChunkedArray<std::sync::atomic::AtomicU8> =
+            ChunkedArray::new(CHUNK_CAP);
+        let ids_arr: ChunkedArray<std::sync::atomic::AtomicU64> = ChunkedArray::new(CHUNK_CAP);
         let mut deleted_count = 0usize;
 
-        for (idx, id) in ids.iter().copied().enumerate() {
+        for (idx, id) in point_ids.iter().copied().enumerate() {
             if let Some(vec) = snapshot.vectors.get(&id) {
                 let pushed = vectors.push(vec);
                 debug_assert_eq!(pushed, idx);
@@ -168,10 +171,26 @@ impl HNSWIndex {
             levels_arr.with(idx, |l| l.store(level, Ordering::Relaxed));
             let di = deleted_arr.push_default();
             debug_assert_eq!(di, idx);
-            if snapshot.deleted.contains(&id) {
+            let is_deleted = snapshot.deleted.contains(&id);
+            if is_deleted {
                 deleted_arr.with(idx, |b| b.store(true, Ordering::Relaxed));
                 deleted_count += 1;
             }
+            let si = node_state_arr.push_default();
+            debug_assert_eq!(si, idx);
+            node_state_arr.with(idx, |s| {
+                s.store(
+                    if is_deleted {
+                        super::core::NODE_DELETED
+                    } else {
+                        super::core::NODE_LIVE
+                    },
+                    Ordering::Relaxed,
+                )
+            });
+            let ii = ids_arr.push_default();
+            debug_assert_eq!(ii, idx);
+            ids_arr.with(idx, |a| a.store(id, Ordering::Relaxed));
         }
 
         // Preserve the pre-allocated level-slot layout that `HNSWIndex::new`
@@ -191,7 +210,7 @@ impl HNSWIndex {
             Vec::with_capacity(num_levels);
         for _ in 0..num_levels {
             let arr: ChunkedArray<parking_lot::RwLock<Vec<usize>>> = ChunkedArray::new(CHUNK_CAP);
-            for _ in 0..ids.len() {
+            for _ in 0..point_ids.len() {
                 arr.push_default();
             }
             layers.push(arr);
@@ -218,7 +237,7 @@ impl HNSWIndex {
         // read-side code can safely index by node idx.
         let edge_dists_l0: ChunkedArray<parking_lot::RwLock<Vec<f32>>> =
             ChunkedArray::new(CHUNK_CAP);
-        for _ in 0..ids.len() {
+        for _ in 0..point_ids.len() {
             edge_dists_l0.push_default();
         }
 
@@ -255,8 +274,13 @@ impl HNSWIndex {
             quantized: Vec::new(),
             quant_min: Vec::new(),
             quant_scale: Vec::new(),
-            point_to_idx,
-            idx_to_point: ids,
+            node_state: node_state_arr,
+            ids: ids_arr,
+            alloc: std::sync::Mutex::new(super::core::AllocState {
+                point_to_idx,
+                idx_to_point: point_ids.clone(),
+                node_count: point_ids.len(),
+            }),
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),
             exact_fallback_threshold: exact_fallback_threshold_override()
                 .unwrap_or(snapshot.exact_fallback_threshold),

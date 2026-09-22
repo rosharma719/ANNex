@@ -228,7 +228,7 @@ fn compute_stats(snapshot_path: &Path, pair_samples: usize) -> Result<IndexStats
 
 fn level_degrees(hnsw: &HNSWIndex, level: usize) -> Vec<usize> {
     let mut degrees = Vec::with_capacity(hnsw.len());
-    for point_id in hnsw.iter_active_vectors().map(|(id, _)| *id) {
+    for point_id in hnsw.iter_active_vectors().map(|(id, _)| id) {
         let deg = hnsw
             .point_degree(point_id, level)
             .unwrap_or(0)

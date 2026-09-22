@@ -50,14 +50,7 @@ fn log_insert_trace(entry: &InsertTraceEntry) {
 }
 
 impl HNSWIndex {
-    pub fn insert(&mut self, point_id: PointId, vector: Vector) -> Result<(), DBError> {
-        if self.point_to_idx.contains_key(&point_id) {
-            if VERBOSE {
-                log::debug!(target: "vector::hnsw", "[INSERT] Point {} already exists. Skipping.", point_id);
-            }
-            return Ok(());
-        }
-
+    pub fn insert(&self, point_id: PointId, vector: Vector) -> Result<(), DBError> {
         self.validate_dim(&vector)?;
         let trace_id = next_insert_trace_seq();
         let trace_mod = trace_every() as u64;
@@ -70,10 +63,15 @@ impl HNSWIndex {
 
         let level = self.assign_random_level();
         let vec = self.maybe_normalize(&vector);
-        let idx = self.register_node(point_id, vec, level);
-        let nodes_len = self.len();
-        self.ensure_level_capacity(level, nodes_len);
-        self.extend_layers_for_new_node(nodes_len);
+        // ALLOC: reserves the node under the alloc mutex, publishes its id and
+        // per-array slots, but leaves `node_state == NODE_RESERVED` so BFS
+        // readers cannot yet reach it.
+        let Some(idx) = self.alloc_node(point_id, vec, level) else {
+            if VERBOSE {
+                log::debug!(target: "vector::hnsw", "[INSERT] Point {} already exists. Skipping.", point_id);
+            }
+            return Ok(());
+        };
 
         for l in 0..=level {
             self.layers[l].with(idx, |lock| lock.write().push(idx));
@@ -89,6 +87,7 @@ impl HNSWIndex {
                 );
             }
             self.allocate_entry_point(idx, level);
+            self.publish_live(idx);
             return Ok(());
         }
 
@@ -227,6 +226,8 @@ impl HNSWIndex {
             }
         }
 
+        // Promote entry point under CAS so concurrent inserters at overlapping
+        // upper levels don't drop each other's promotion.
         if level > current_max_level {
             if VERBOSE {
                 log::debug!(
@@ -236,8 +237,13 @@ impl HNSWIndex {
                     level
                 );
             }
-            self.store_entry_level(idx, level);
+            self.promote_entry_if_higher(idx, level);
         }
+
+        // PUBLISH: transition from RESERVED → LIVE. Release pairs with the
+        // Acquire loads in BFS readers so all neighbor/edge writes above are
+        // observed atomically with the node becoming reachable.
+        self.publish_live(idx);
 
         Ok(())
     }
@@ -327,10 +333,8 @@ impl HNSWIndex {
     ///
     /// New nodes allocated in the same batch do not see each other as candidates during Phase 2
     /// (they have no graph edges yet), which is the standard trade-off for batch HNSW builds.
-    pub fn par_insert_batch(&mut self, entries: &[(PointId, Vector)]) -> Result<usize, DBError> {
+    pub fn par_insert_batch(&self, entries: &[(PointId, Vector)]) -> Result<usize, DBError> {
         use super::config::lid_sort_enabled;
-        // LID sort: build a permuted view of entries without changing the signature.
-        // When enabled, high-LID vectors are allocated first so they reach upper layers.
         let sort_order: Vec<usize> = if lid_sort_enabled() && entries.len() > 3 {
             let mut owned: Vec<(u64, Vec<f32>)> =
                 entries.iter().map(|(id, v)| (*id, v.clone())).collect();
@@ -345,19 +349,18 @@ impl HNSWIndex {
             (0..entries.len()).collect()
         };
 
-        let mut node_infos: Vec<(usize, usize)> = Vec::new(); // (idx, level)
+        // Phase 1 (ALLOC): reserve slots for every non-duplicate entry.
+        // alloc_node serialises on the alloc mutex; slots start RESERVED so
+        // in-flight concurrent queries never reach them.
+        let mut node_infos: Vec<(usize, usize)> = Vec::new();
         for i in 0..entries.len() {
             let (point_id, vector) = &entries[sort_order[i]];
-            if self.point_to_idx.contains_key(point_id) {
-                continue;
-            }
             self.validate_dim(vector)?;
             let level = self.assign_random_level();
             let normalized = self.maybe_normalize(vector);
-            let idx = self.register_node(*point_id, normalized, level);
-            let nodes_len = self.len();
-            self.ensure_level_capacity(level, nodes_len);
-            self.extend_layers_for_new_node(nodes_len);
+            let Some(idx) = self.alloc_node(*point_id, normalized, level) else {
+                continue;
+            };
             for l in 0..=level {
                 self.layers[l].with(idx, |lock| lock.write().push(idx));
             }
@@ -369,29 +372,30 @@ impl HNSWIndex {
             return Ok(0);
         }
 
-        // Determine the initial entry point for Phase 2 searches.
-        // When the graph is empty, the first node in the batch becomes the entry. It has no
-        // neighbors to connect to (only its self-link), so search_and_link is skipped for it.
-        // Every other node in the batch CAN search from that entry and connect to it, so the
-        // batch builds up real connectivity rather than every node being an isolated self-link.
-        let (first_batch_node, skip_first) = match self.entry_point() {
+        // Bootstrap the entry point from within the alloc-critical region: if
+        // no entry existed, choose the batch's first reserved node and publish
+        // it LIVE before other threads can start linking. This guarantees a
+        // single connected component even under simultaneous par_insert_batch
+        // calls into an empty index.
+        let (initial_entry, skip_first) = match self.entry_point() {
             Some(ep) => (ep, false),
             None => {
                 let (first_idx, first_level) = node_infos[0];
                 self.store_entry_level(first_idx, first_level);
-                (first_idx, true) // skip linking first node — nothing to connect to yet
+                self.publish_live(first_idx);
+                (first_idx, true)
             }
         };
-        let initial_entry = first_batch_node;
         let link_slice = if skip_first {
             &node_infos[1..]
         } else {
             &node_infos[..]
         };
 
-        // Phase 2: search + link in parallel.
-        // Spawn exactly `parallelism` threads regardless of batch size. Each thread processes
-        // its slice of link_slice sequentially, avoiding per-entry thread lifecycle costs.
+        // Phase 2 (LINK): find neighbors and write both directions of edges
+        // for each reserved node in parallel. Each thread scopes its work to
+        // the disjoint slice of `link_slice` it was given; per-node RwLocks
+        // handle the fine-grained back-edge writes.
         let n_link = link_slice.len();
         let first_error: std::sync::Mutex<Option<DBError>> = std::sync::Mutex::new(None);
         if n_link > 0 {
@@ -399,7 +403,7 @@ impl HNSWIndex {
                 .map(|n| n.get())
                 .unwrap_or(4)
                 .min(n_link);
-            let chunk_size = (n_link + parallelism - 1) / parallelism;
+            let chunk_size = n_link.div_ceil(parallelism);
             let self_ref: &Self = self;
             let error_ref = &first_error;
             std::thread::scope(|s| {
@@ -413,6 +417,10 @@ impl HNSWIndex {
                                 }
                                 return;
                             }
+                            // PUBLISH each reserved node as soon as its own
+                            // links (both directions) are written. Concurrent
+                            // BFS readers will then observe it as LIVE.
+                            self_ref.publish_live(idx);
                         }
                     });
                 }
@@ -422,11 +430,11 @@ impl HNSWIndex {
             return Err(e);
         }
 
-        // Phase 3: promote entry point.
+        // Phase 3 (PROMOTE): CAS-elect entry point if any linked node beat the
+        // published max level. Multiple concurrent batches converge to the
+        // globally-highest node without dropping promotions.
         for &(idx, level) in &node_infos {
-            if level > self.current_max_level() {
-                self.store_entry_level(idx, level);
-            }
+            self.promote_entry_if_higher(idx, level);
         }
 
         Ok(n_new)
@@ -440,9 +448,7 @@ impl HNSWIndex {
         level: usize,
         initial_entry: usize,
     ) -> Result<(), DBError> {
-        if !self.deleted.with(initial_entry, |b| {
-            !b.load(::std::sync::atomic::Ordering::Acquire)
-        }) {
+        if !self.is_live(initial_entry) {
             return Ok(());
         }
         let mut current_entry = initial_entry;
@@ -767,7 +773,7 @@ impl HNSWIndex {
         Ok(())
     }
 
-    pub fn add_bidirectional_edge(&mut self, level: usize, a: PointId, b: PointId) {
+    pub fn add_bidirectional_edge(&self, level: usize, a: PointId, b: PointId) {
         let (Some(a_idx), Some(b_idx)) = (self.idx_of(a), self.idx_of(b)) else {
             return;
         };
@@ -784,7 +790,7 @@ impl HNSWIndex {
         }
     }
 
-    pub fn add_one_way_edge(&mut self, level: usize, from: PointId, to: PointId) {
+    pub fn add_one_way_edge(&self, level: usize, from: PointId, to: PointId) {
         let (Some(from_idx), Some(to_idx)) = (self.idx_of(from), self.idx_of(to)) else {
             return;
         };
@@ -828,10 +834,7 @@ impl HNSWIndex {
             }
             let neighbors: Vec<usize> = layer.with(current, |rw| rw.read().clone());
             for neighbor in neighbors {
-                if self
-                    .deleted
-                    .with(neighbor, |b| b.load(::std::sync::atomic::Ordering::Acquire))
-                {
+                if !self.is_live(neighbor) {
                     continue;
                 }
 
@@ -896,10 +899,7 @@ impl HNSWIndex {
                 let nb_count = scratch.extend_neighbors.len();
                 for j in 0..nb_count {
                     let nb = scratch.extend_neighbors[j];
-                    if self
-                        .deleted
-                        .with(nb, |b| b.load(::std::sync::atomic::Ordering::Acquire))
-                    {
+                    if !self.is_live(nb) {
                         continue;
                     }
                     if !scratch.mark_extend_seen(nb) {
@@ -991,7 +991,7 @@ impl HNSWIndex {
         });
     }
 
-    fn cap_layer_neighbors(&mut self, level: usize, node_idx: usize) {
+    fn cap_layer_neighbors(&self, level: usize, node_idx: usize) {
         if level >= self.layers.len() {
             return;
         }
@@ -1046,7 +1046,7 @@ impl HNSWIndex {
         }
     }
 
-    fn sort_layer_neighbors(&mut self, level: usize, node_idx: usize) {
+    fn sort_layer_neighbors(&self, level: usize, node_idx: usize) {
         if level >= self.layers.len() {
             return;
         }

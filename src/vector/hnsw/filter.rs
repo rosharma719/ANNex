@@ -81,7 +81,7 @@ impl HNSWIndex {
         match filter {
             Filter::Match { key, value } => payload_index.query_exact(key, value).and_then(|ids| {
                 ids.iter()
-                    .filter_map(|id| self.point_to_idx.get(id).copied())
+                    .filter_map(|id| self.idx_of(*id))
                     .filter(|&idx| !self.deleted.with(idx, |flag| flag.load(Ordering::Acquire)))
                     .max_by_key(|&idx| self.levels.with(idx, |level| level.load(Ordering::Relaxed)))
             }),
@@ -214,9 +214,19 @@ impl HNSWIndex {
                     return Ok(out);
                 }
             }
+            let alloc_snapshot = self.alloc.lock().expect("alloc mutex poisoned");
+            let mask_opt = if allowed_mask.is_none() {
+                payload_index.build_filter_mask(
+                    f,
+                    &alloc_snapshot.point_to_idx,
+                    alloc_snapshot.point_to_idx.len(),
+                )
+            } else {
+                None
+            };
+            drop(alloc_snapshot);
             if allowed_mask.is_none()
-                && let Some(mask) =
-                    payload_index.build_filter_mask(f, &self.point_to_idx, self.point_to_idx.len())
+                && let Some(mask) = mask_opt
             {
                 if !mask.iter().any(|v| *v) {
                     return Ok(vec![]);
@@ -294,7 +304,8 @@ impl HNSWIndex {
 
         let result = SEARCH_SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
-            scratch.next_epoch(self.len());
+            let node_bound = self.len();
+            scratch.next_epoch(node_bound);
             scratch.routing_pq.clear();
             scratch.results_pq.clear();
             let mut visited_count = 0usize;
@@ -500,7 +511,15 @@ impl HNSWIndex {
             {
                 scratch.reset_seed(seed_len);
                 scratch.reset_temp(seed_len);
-                collect_match_ids(f, payload_index, &mut scratch, &self.point_to_idx, seed_len, true);
+                let alloc = self.alloc.lock().expect("alloc mutex poisoned");
+                collect_match_ids(
+                    f,
+                    payload_index,
+                    &mut scratch,
+                    &alloc.point_to_idx,
+                    seed_len,
+                    true,
+                );
             }
             let seed_pool_size = scratch.seed_list.len();
             let mut seeds_added = 0usize;
@@ -606,9 +625,7 @@ impl HNSWIndex {
                         {
                             continue;
                         }
-                        if self.deleted.with(nb, |b| b.load(Ordering::Acquire))
-                            || !scratch.mark_visited(nb)
-                        {
+                        if nb >= node_bound || !self.is_live(nb) || !scratch.mark_visited(nb) {
                             continue;
                         }
                         visited_count += 1;

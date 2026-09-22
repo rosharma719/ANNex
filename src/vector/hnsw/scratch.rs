@@ -73,6 +73,15 @@ impl SearchScratch {
     }
 
     pub(crate) fn mark_visited(&mut self, idx: usize) -> bool {
+        // Bounds check: BFS callers capture a node bound before iterating,
+        // but neighbor lists on live nodes may reference indices appended by
+        // concurrent inserts after the capture. Rather than panic on the
+        // stale index, treat it as "not visitable in this search". Callers
+        // MUST still filter by the captured bound before consulting other
+        // per-node arrays (vectors, deleted, etc.).
+        if idx >= self.visited_epoch.len() {
+            return false;
+        }
         if self.visited_epoch[idx] == self.epoch {
             false
         } else {
@@ -114,6 +123,9 @@ impl SearchScratch {
     }
 
     pub(crate) fn mark_seed(&mut self, idx: usize) {
+        if idx >= self.seed_epoch.len() {
+            return;
+        }
         if self.seed_epoch[idx] != self.seed_epoch_val {
             self.seed_epoch[idx] = self.seed_epoch_val;
             self.seed_list.push(idx);
@@ -121,6 +133,9 @@ impl SearchScratch {
     }
 
     pub(crate) fn mark_temp(&mut self, idx: usize) {
+        if idx >= self.temp_epoch.len() {
+            return;
+        }
         if self.temp_epoch[idx] != self.temp_epoch_val {
             self.temp_epoch[idx] = self.temp_epoch_val;
             self.temp_list.push(idx);
@@ -143,7 +158,12 @@ impl SearchScratch {
     }
 
     /// Returns true if `idx` was newly marked (i.e., not already seen this epoch).
+    /// Concurrent inserts may append nodes with idx beyond the captured
+    /// length; treat those as "not visitable" rather than panic.
     pub(crate) fn mark_extend_seen(&mut self, idx: usize) -> bool {
+        if idx >= self.extend_seen_epoch.len() {
+            return false;
+        }
         if self.extend_seen_epoch[idx] == self.extend_seen_val {
             false
         } else {

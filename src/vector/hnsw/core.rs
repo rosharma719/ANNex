@@ -40,6 +40,14 @@ pub struct HnswSnapshot {
     pub exact_fallback_threshold: usize,
 }
 
+// ── Node lifecycle states ────────────────────────────────────────────────────
+// A node is transiently RESERVED between the allocation of its slots and the
+// publication of its neighbor links. Readers must skip anything that is not
+// LIVE so that half-initialised nodes cannot leak into search results.
+pub(crate) const NODE_RESERVED: u8 = 0;
+pub(crate) const NODE_LIVE: u8 = 1;
+pub(crate) const NODE_DELETED: u8 = 2;
+
 /// Packed `(current_max_level, entry_point_idx)` in one `AtomicU64`.
 /// Upper 32 bits = max_level; lower 32 bits = entry_idx.
 /// `NO_EP` in the lower 32 bits means no entry point has been set.
@@ -62,6 +70,17 @@ pub(crate) fn unpack_ep(v: u64) -> (Option<usize>, usize) {
     } else {
         (Some(idx as usize), level)
     }
+}
+
+/// Mutex-guarded allocation state shared by all concurrent writers.
+///
+/// Holds the id ↔ idx mapping and the running node count. Every `insert`
+/// takes the mutex only during ALLOC (slot reservation + id publication);
+/// LINK and PUBLISH work off per-node RwLocks / atomics.
+pub struct AllocState {
+    pub(crate) point_to_idx: HashMap<PointId, usize>,
+    pub(crate) idx_to_point: Vec<PointId>,
+    pub(crate) node_count: usize,
 }
 
 pub struct HNSWIndex {
@@ -104,9 +123,19 @@ pub struct HNSWIndex {
     pub(crate) quant_min: Vec<f32>,
     /// Per-dimension scale: (max - min) / 255.0. Set to 1.0 for constant dimensions.
     pub(crate) quant_scale: Vec<f32>,
-    // TODO(Task 5): move to Mutex<AllocState> for concurrent insert+query
-    pub(crate) point_to_idx: HashMap<PointId, usize>,
-    pub(crate) idx_to_point: Vec<PointId>,
+    /// Per-node lifecycle state (RESERVED / LIVE / DELETED). Written with
+    /// Release when transitioning; readers use Acquire so a node becomes
+    /// reachable only after its links are fully published.
+    pub(crate) node_state: ChunkedArray<AtomicU8>,
+    /// Stable-slot id storage: `ids.get(idx)` holds the `PointId` for slot
+    /// `idx`. Written under the `alloc` mutex before the node transitions to
+    /// LIVE, so any Acquire-load of `node_state == LIVE` sees a valid id.
+    /// Read locklessly on the hot query paths (Relaxed is sufficient because
+    /// the LIVE check on `node_state` provides the happens-before edge).
+    pub(crate) ids: ChunkedArray<AtomicU64>,
+    /// Shared allocation state guarded by a single mutex. Held only for the
+    /// ALLOC phase of a concurrent insert; hot query paths never touch it.
+    pub(crate) alloc: std::sync::Mutex<AllocState>,
     pub(crate) exact_fallback_enabled: bool,
     pub(crate) exact_fallback_threshold: usize,
 }
@@ -172,11 +201,16 @@ impl HNSWIndex {
             deleted: ChunkedArray::new(CHUNK_CAP),
             deleted_count: AtomicUsize::new(0),
             edge_dists_l0: ChunkedArray::new(CHUNK_CAP),
+            node_state: ChunkedArray::new(CHUNK_CAP),
+            ids: ChunkedArray::new(CHUNK_CAP),
+            alloc: std::sync::Mutex::new(AllocState {
+                point_to_idx: HashMap::new(),
+                idx_to_point: Vec::new(),
+                node_count: 0,
+            }),
             quantized: Vec::new(),
             quant_min: Vec::new(),
             quant_scale: Vec::new(),
-            point_to_idx: HashMap::new(),
-            idx_to_point: Vec::new(),
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),
             exact_fallback_threshold: exact_fallback_threshold_override()
                 .unwrap_or(DEFAULT_EXACT_FALLBACK_THRESHOLD),
@@ -184,12 +218,12 @@ impl HNSWIndex {
     }
 
     pub fn point_level(&self, point_id: PointId) -> Option<usize> {
-        let idx = *self.point_to_idx.get(&point_id)?;
+        let idx = self.idx_of(point_id)?;
         Some(self.levels.with(idx, |l| l.load(Ordering::Relaxed)) as usize)
     }
 
     pub fn point_degree(&self, point_id: PointId, level: usize) -> Option<usize> {
-        let idx = *self.point_to_idx.get(&point_id)?;
+        let idx = self.idx_of(point_id)?;
         let layer = self.layers.get(level)?;
         if idx >= layer.len() {
             return None;
@@ -218,12 +252,57 @@ impl HNSWIndex {
     }
 
     /// Atomically set both entry point and max level together.
+    ///
+    /// Uses interior mutability on the packed `AtomicU64` so it is safe to
+    /// call under `&self` from concurrent inserters.
     #[inline]
-    pub(crate) fn store_entry_level(&mut self, idx: usize, level: usize) {
+    pub(crate) fn store_entry_level(&self, idx: usize, level: usize) {
         debug_assert!(idx < NO_EP as usize);
         debug_assert!(level <= MAX_STORED_LEVEL);
         self.entry_level_ep
             .store(pack_ep(idx, level), Ordering::Release);
+    }
+
+    /// Promote `idx` to entry point only if `level` strictly exceeds the
+    /// currently-published `current_max_level`. Uses a CAS loop so two
+    /// concurrent inserters at overlapping upper levels resolve to a single
+    /// winner without dropping either promotion.
+    #[inline]
+    pub(crate) fn promote_entry_if_higher(&self, idx: usize, level: usize) {
+        debug_assert!(idx < NO_EP as usize);
+        debug_assert!(level <= MAX_STORED_LEVEL);
+        let new_val = pack_ep(idx, level);
+        loop {
+            let old = self.entry_level_ep.load(Ordering::Acquire);
+            let (_, old_max) = unpack_ep(old);
+            if level <= old_max {
+                return;
+            }
+            match self.entry_level_ep.compare_exchange_weak(
+                old,
+                new_val,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Acquire-load the lifecycle state for `idx`. Pairs with the Release
+    /// store in `publish_live` / `mark_deleted` so all upstream writes are
+    /// observed before the state is inspected.
+    #[inline]
+    pub(crate) fn state_of(&self, idx: usize) -> u8 {
+        self.node_state.with(idx, |s| s.load(Ordering::Acquire))
+    }
+
+    /// True only if the node at `idx` is fully published and not deleted.
+    /// The canonical visibility check for concurrent BFS readers.
+    #[inline]
+    pub(crate) fn is_live(&self, idx: usize) -> bool {
+        self.state_of(idx) == NODE_LIVE
     }
 
     // ── vector_slice bridge ───────────────────────────────────────────────────
@@ -268,7 +347,7 @@ impl HNSWIndex {
         }
     }
 
-    pub fn mark_deleted(&mut self, point_id: PointId) {
+    pub fn mark_deleted(&self, point_id: PointId) {
         let Some(idx) = self.idx_of(point_id) else {
             return;
         };
@@ -278,6 +357,11 @@ impl HNSWIndex {
             self.deleted.with(idx, |b| b.store(true, Ordering::Release));
             self.deleted_count.fetch_add(1, Ordering::Relaxed);
         }
+        // Publish DELETED so BFS readers filtering on node_state also skip it.
+        // This is a Release store so any prior writes are visible to readers
+        // that later Acquire the state.
+        self.node_state
+            .with(idx, |s| s.store(NODE_DELETED, Ordering::Release));
         if Some(idx) == self.entry_point() {
             let new_ep = self.find_highest_level_entry_point();
             match new_ep {
@@ -312,12 +396,21 @@ impl HNSWIndex {
 
     #[inline]
     pub(crate) fn idx_of(&self, point_id: PointId) -> Option<usize> {
-        self.point_to_idx.get(&point_id).copied()
+        self.alloc
+            .lock()
+            .expect("alloc mutex poisoned")
+            .point_to_idx
+            .get(&point_id)
+            .copied()
     }
 
+    /// Lockless read of the stable id for slot `idx`. Callers must ensure
+    /// the slot was allocated (idx < len()); the load is Relaxed because the
+    /// happens-before edge is established by the LIVE-state Acquire load
+    /// that gates BFS neighbor traversal.
     #[inline]
     pub(crate) fn point_id(&self, idx: usize) -> PointId {
-        self.idx_to_point[idx]
+        self.ids.with(idx, |a| a.load(Ordering::Relaxed))
     }
 
     #[inline]
@@ -341,7 +434,7 @@ impl HNSWIndex {
     /// The outer level `Vec` is pre-sized to `max_level_cap + 1` at construction,
     /// so no dynamic growth of the level axis is needed. Left in place as a
     /// bounds assertion / no-op for callers migrated from the growable layout.
-    pub(crate) fn ensure_level_capacity(&mut self, level: usize, _nodes_len: usize) {
+    pub(crate) fn ensure_level_capacity(&self, level: usize, _nodes_len: usize) {
         debug_assert!(
             level < self.layers.len(),
             "level {} exceeds pre-allocated layers ({})",
@@ -354,7 +447,7 @@ impl HNSWIndex {
     /// registered node at `nodes_len - 1` has a per-level `RwLock` at a stable
     /// address. Idempotent — extra pushes are avoided by comparing to the
     /// existing chunked-array length.
-    pub(crate) fn extend_layers_for_new_node(&mut self, nodes_len: usize) {
+    pub(crate) fn extend_layers_for_new_node(&self, nodes_len: usize) {
         for layer in self.layers.iter() {
             while layer.len() < nodes_len {
                 layer.push_default();
@@ -366,11 +459,15 @@ impl HNSWIndex {
     }
 
     pub fn contains(&self, point_id: &PointId) -> bool {
-        self.point_to_idx.contains_key(point_id)
+        self.alloc
+            .lock()
+            .expect("alloc mutex poisoned")
+            .point_to_idx
+            .contains_key(point_id)
     }
 
     pub fn len(&self) -> usize {
-        self.idx_to_point.len()
+        self.alloc.lock().expect("alloc mutex poisoned").node_count
     }
 
     pub fn config_summary(&self) -> HnswConfigSummary {
@@ -416,14 +513,14 @@ impl HNSWIndex {
         Some(layer.with(idx, |rw| f(&rw.read())))
     }
 
-    pub fn iter_vectors(&self) -> impl Iterator<Item = (&PointId, &[f32])> {
-        (0..self.len()).map(move |idx| (&self.idx_to_point[idx], self.vector_slice(idx)))
+    pub fn iter_vectors(&self) -> impl Iterator<Item = (PointId, &[f32])> {
+        (0..self.len()).map(move |idx| (self.point_id(idx), self.vector_slice(idx)))
     }
 
-    pub fn iter_active_vectors(&self) -> impl Iterator<Item = (&PointId, &[f32])> {
+    pub fn iter_active_vectors(&self) -> impl Iterator<Item = (PointId, &[f32])> {
         (0..self.len())
             .filter(move |&idx| !self.deleted.with(idx, |b| b.load(Ordering::Acquire)))
-            .map(move |idx| (&self.idx_to_point[idx], self.vector_slice(idx)))
+            .map(move |idx| (self.point_id(idx), self.vector_slice(idx)))
     }
 
     pub fn deleted_count(&self) -> usize {
@@ -925,32 +1022,87 @@ unsafe fn l2_neon(query: &[f32], vec: &[f32]) -> f32 {
 }
 
 impl HNSWIndex {
+    /// ALLOC phase for a single node.
+    ///
+    /// Serialised on `alloc.lock()`: publishes fresh slots in every stable
+    /// storage (`vectors`, `levels`, `deleted`, `edge_dists_l0`, `node_state`,
+    /// `ids`) and every pre-allocated per-level `layers` array, then registers
+    /// the id ↔ idx mapping. Returns the newly-assigned `idx`, still in
+    /// `NODE_RESERVED` state.
+    ///
+    /// The mutex holds throughout so `idx` is monotonic and every array's
+    /// `push` returns the same index.
+    pub(crate) fn alloc_node(
+        &self,
+        point_id: PointId,
+        vector: Vector,
+        level: usize,
+    ) -> Option<usize> {
+        let stored_level = u8::try_from(level).expect("HNSW level exceeds u8 storage");
+        let mut alloc = self.alloc.lock().expect("alloc mutex poisoned");
+        if alloc.point_to_idx.contains_key(&point_id) {
+            return None;
+        }
+        let idx = alloc.node_count;
+        let vector_idx = self.vectors.push(&vector);
+        debug_assert_eq!(vector_idx, idx);
+        let lvl_idx = self.levels.push_default();
+        debug_assert_eq!(lvl_idx, idx);
+        self.levels
+            .with(idx, |l| l.store(stored_level, Ordering::Relaxed));
+        let del_idx = self.deleted.push_default();
+        debug_assert_eq!(del_idx, idx);
+        let ed_idx = self.edge_dists_l0.push_default();
+        debug_assert_eq!(ed_idx, idx);
+        let st_idx = self.node_state.push_default();
+        debug_assert_eq!(st_idx, idx);
+        self.node_state
+            .with(idx, |s| s.store(NODE_RESERVED, Ordering::Relaxed));
+        let id_idx = self.ids.push_default();
+        debug_assert_eq!(id_idx, idx);
+        self.ids.with(idx, |a| a.store(point_id, Ordering::Relaxed));
+        for layer in self.layers.iter() {
+            let li = layer.push_default();
+            debug_assert_eq!(li, idx);
+        }
+        alloc.idx_to_point.push(point_id);
+        alloc.point_to_idx.insert(point_id, idx);
+        alloc.node_count = idx + 1;
+        Some(idx)
+    }
+
+    /// Publish a node as reachable to queries. Must be called after every
+    /// per-node array is populated and every back-edge into `idx` is written.
+    #[inline]
+    pub(crate) fn publish_live(&self, idx: usize) {
+        // Release so that all prior neighbor/edge/id writes are observed by
+        // readers that Acquire-load `node_state == NODE_LIVE`.
+        self.node_state
+            .with(idx, |s| s.store(NODE_LIVE, Ordering::Release));
+    }
+
+    /// Legacy synchronous variant retained for the offline (`&mut self`) build
+    /// paths that still assume single-threaded insertion. Reservers under the
+    /// same alloc mutex, publishes LIVE immediately, and returns the idx.
     pub(crate) fn register_node(
         &mut self,
         point_id: PointId,
         vector: Vector,
         level: usize,
     ) -> usize {
-        let idx = self.idx_to_point.len();
-        let vector_idx = self.vectors.push(&vector);
-        debug_assert_eq!(vector_idx, idx);
-        let lvl_idx = self.levels.push_default();
-        debug_assert_eq!(lvl_idx, idx);
-        let stored_level = u8::try_from(level).expect("HNSW level exceeds u8 storage");
-        self.levels
-            .with(idx, |l| l.store(stored_level, Ordering::Relaxed));
-        let del_idx = self.deleted.push_default(); // AtomicBool::default() = false
-        debug_assert_eq!(del_idx, idx);
-        let ed_idx = self.edge_dists_l0.push_default();
-        debug_assert_eq!(ed_idx, idx);
-        self.idx_to_point.push(point_id);
-        self.point_to_idx.insert(point_id, idx);
+        let idx = self.alloc_node(point_id, vector, level).unwrap_or_else(|| {
+            self.alloc
+                .lock()
+                .expect("alloc mutex poisoned")
+                .point_to_idx[&point_id]
+        });
+        self.publish_live(idx);
         idx
     }
 }
 
 impl HNSWIndex {
-    pub(crate) fn allocate_entry_point(&mut self, idx: usize, level: usize) {
+    pub(crate) fn allocate_entry_point(&self, idx: usize, level: usize) {
         self.store_entry_level(idx, level);
     }
 }
@@ -1094,10 +1246,15 @@ impl HNSWIndex {
         }
         self.vectors = new_vectors;
 
-        // Permute idx_to_point, deleted, and levels.
-        let old_itp: Vec<PointId> = std::mem::take(&mut self.idx_to_point);
+        // Permute idx_to_point, deleted, levels, node_state, and ids.
+        let old_itp: Vec<PointId> = {
+            let mut alloc = self.alloc.lock().expect("alloc mutex poisoned");
+            std::mem::take(&mut alloc.idx_to_point)
+        };
         let new_del: ChunkedArray<AtomicBool> = ChunkedArray::new(CHUNK_CAP);
         let new_lvl: ChunkedArray<AtomicU8> = ChunkedArray::new(CHUNK_CAP);
+        let new_state: ChunkedArray<AtomicU8> = ChunkedArray::new(CHUNK_CAP);
+        let new_ids: ChunkedArray<AtomicU64> = ChunkedArray::new(CHUNK_CAP);
         for &old_idx in &perm {
             let di = new_del.push_default();
             let was_deleted = self.deleted.with(old_idx, |b| b.load(Ordering::Relaxed));
@@ -1105,15 +1262,28 @@ impl HNSWIndex {
             let li = new_lvl.push_default();
             let lvl = self.levels.with(old_idx, |l| l.load(Ordering::Relaxed));
             new_lvl.with(li, |l| l.store(lvl, Ordering::Relaxed));
+            let si = new_state.push_default();
+            let st = self.node_state.with(old_idx, |s| s.load(Ordering::Relaxed));
+            new_state.with(si, |s| s.store(st, Ordering::Relaxed));
+            let ii = new_ids.push_default();
+            let id_val = self.ids.with(old_idx, |a| a.load(Ordering::Relaxed));
+            new_ids.with(ii, |a| a.store(id_val, Ordering::Relaxed));
         }
-        self.idx_to_point = perm.iter().map(|&o| old_itp[o]).collect();
         self.deleted = new_del;
         self.levels = new_lvl;
+        self.node_state = new_state;
+        self.ids = new_ids;
 
-        // Rebuild point_to_idx from new idx_to_point.
-        self.point_to_idx.clear();
-        for (new_idx, &id) in self.idx_to_point.iter().enumerate() {
-            self.point_to_idx.insert(id, new_idx);
+        // Rebuild alloc state from the permuted idx_to_point.
+        {
+            let mut alloc = self.alloc.lock().expect("alloc mutex poisoned");
+            let new_itp: Vec<PointId> = perm.iter().map(|&o| old_itp[o]).collect();
+            alloc.point_to_idx.clear();
+            for (new_idx, &id) in new_itp.iter().enumerate() {
+                alloc.point_to_idx.insert(id, new_idx);
+            }
+            alloc.node_count = new_itp.len();
+            alloc.idx_to_point = new_itp;
         }
 
         // Update entry point, preserving the packed current_max_level as-is

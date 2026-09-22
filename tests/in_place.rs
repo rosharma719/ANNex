@@ -98,7 +98,7 @@ fn benchmark_segment_ops_large() {
         let mut ground: Vec<ScoredPoint> = segment
             .hnsw()
             .iter_vectors()
-            .filter_map(|(&id, vec)| {
+            .filter_map(|(id, vec)| {
                 if segment.is_deleted(id) {
                     return None;
                 }

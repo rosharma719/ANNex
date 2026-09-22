@@ -221,7 +221,7 @@ impl HNSWIndex {
                 .and_then(|id| point_to_idx.get(&id).copied());
             AtomicU64::new(match ep_idx {
                 Some(idx) => pack_ep(idx, stored_max_level),
-                None => pack_ep(NO_EP as usize, 0),
+                None => pack_ep(NO_EP as usize, stored_max_level),
             })
         };
 

@@ -1090,11 +1090,12 @@ impl HNSWIndex {
             self.point_to_idx.insert(id, new_idx);
         }
 
-        // Update entry point.
-        if let Some(ep) = self.entry_point() {
+        // Update entry point, preserving the packed current_max_level as-is
+        // (it may legitimately differ from the entry node's own level via set_current_max_level).
+        let (old_ep, preserved_max_level) = self.entry_level();
+        if let Some(ep) = old_ep {
             let new_ep = inv_perm[ep];
-            let level = self.levels.with(new_ep, |l| l.load(Ordering::Relaxed)) as usize;
-            self.store_entry_level(new_ep, level);
+            self.store_entry_level(new_ep, preserved_max_level);
         }
 
         // Permute all layers: remap neighbor indices through inv_perm.

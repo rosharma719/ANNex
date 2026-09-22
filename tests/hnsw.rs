@@ -777,3 +777,55 @@ fn atomic_metadata_and_vector_arena_survive_snapshot_round_trip() {
             .all(|result| result.id != 3)
     );
 }
+
+#[test]
+fn reorder_rcm_preserves_independent_entry_and_max_level() {
+    let mut index = HNSWIndex::new(DistanceMetric::Euclidean, 4, 20, 300, 4);
+    for id in 0..8u64 {
+        index.insert(id, vec![id as f32, 0.0, 0.0, 0.0]).unwrap();
+    }
+
+    // Force current_max_level to a value independent of the entry node's own level.
+    let bumped = index.current_max_level().saturating_add(3);
+    index.set_current_max_level(bumped);
+    let observed_max = index.current_max_level();
+    let entry_id_before = index
+        .get_entry_point()
+        .expect("entry point must exist after inserts");
+
+    index.reorder_rcm();
+
+    let entry_id_after = index
+        .get_entry_point()
+        .expect("entry point must survive reorder");
+    assert_eq!(
+        entry_id_after, entry_id_before,
+        "reorder must preserve the entry point's public id"
+    );
+    assert_eq!(
+        index.current_max_level(),
+        observed_max,
+        "reorder must preserve the packed current_max_level independent of entry node's level"
+    );
+}
+
+#[test]
+fn snapshot_round_trip_preserves_max_level_without_entry() {
+    let mut index = HNSWIndex::new(DistanceMetric::Euclidean, 4, 20, 300, 4);
+    // No inserts: get_entry_point() is None. Set a nonzero current_max_level.
+    index.set_current_max_level(5);
+    assert!(index.get_entry_point().is_none());
+    assert_eq!(index.current_max_level(), 5);
+
+    let snapshot = index.to_snapshot();
+    assert_eq!(snapshot.current_max_level, 5);
+    assert!(snapshot.entry_point.is_none());
+
+    let restored = HNSWIndex::from_snapshot(snapshot);
+    assert!(restored.get_entry_point().is_none());
+    assert_eq!(
+        restored.current_max_level(),
+        5,
+        "from_snapshot must preserve current_max_level when entry point is absent"
+    );
+}

@@ -76,7 +76,7 @@ impl HNSWIndex {
         self.extend_layers_for_new_node(nodes_len);
 
         for l in 0..=level {
-            self.layers[l][idx].write().push(idx);
+            self.layers[l].with(idx, |lock| lock.write().push(idx));
         }
 
         if self.entry_point().is_none() {
@@ -149,7 +149,7 @@ impl HNSWIndex {
                         linked.push(n);
                     }
                 }
-                *self.layers[l][idx].write() = linked.clone();
+                self.layers[l].with(idx, |lock| *lock.write() = linked.clone());
                 if l == 0 {
                     let src = self.vector_slice(idx).to_vec();
                     let dists: Vec<f32> = linked
@@ -161,7 +161,7 @@ impl HNSWIndex {
                             self.fast_score(&src, self.vector_slice(n))
                         })
                         .collect();
-                    *self.edge_dists_l0[idx].write() = dists;
+                    self.edge_dists_l0.with(idx, |lock| *lock.write() = dists);
                 }
             }
             if enforce_neighbor_caps() {
@@ -175,8 +175,8 @@ impl HNSWIndex {
                 let n_vec = n_vec.to_vec();
                 let new_score =
                     self.normalize_score(self.fast_score(&n_vec, self.vector_slice(idx)));
-                {
-                    let mut nb_list = self.layers[l][n].write();
+                self.layers[l].with(n, |lock| {
+                    let mut nb_list = lock.write();
                     // idx is freshly allocated; it can't already be in nb_list.
                     let pos = nb_list.partition_point(|&nb| {
                         self.get_vector_by_idx(nb)
@@ -194,9 +194,9 @@ impl HNSWIndex {
                                 self.fast_score(&n_vec, self.vector_slice(nb))
                             })
                             .collect();
-                        *self.edge_dists_l0[n].write() = n_dists;
+                        self.edge_dists_l0.with(n, |ed| *ed.write() = n_dists);
                     }
-                }
+                });
                 if enforce_neighbor_caps() {
                     self.cap_layer_neighbors(l, n);
                 }
@@ -359,7 +359,7 @@ impl HNSWIndex {
             self.ensure_level_capacity(level, nodes_len);
             self.extend_layers_for_new_node(nodes_len);
             for l in 0..=level {
-                self.layers[l][idx].write().push(idx);
+                self.layers[l].with(idx, |lock| lock.write().push(idx));
             }
             node_infos.push((idx, level));
         }
@@ -487,7 +487,7 @@ impl HNSWIndex {
                         linked.push(n);
                     }
                 }
-                *self.layers[l][idx].write() = linked.clone();
+                self.layers[l].with(idx, |lock| *lock.write() = linked.clone());
                 if l == 0 {
                     let src = self.vector_slice(idx).to_vec();
                     let dists: Vec<f32> = linked
@@ -499,7 +499,7 @@ impl HNSWIndex {
                             self.fast_score(&src, self.vector_slice(n))
                         })
                         .collect();
-                    *self.edge_dists_l0[idx].write() = dists;
+                    self.edge_dists_l0.with(idx, |lock| *lock.write() = dists);
                 }
             }
 
@@ -511,8 +511,8 @@ impl HNSWIndex {
                 let n_vec = n_vec.to_vec();
                 let new_score =
                     self.normalize_score(self.fast_score(&n_vec, self.vector_slice(idx)));
-                {
-                    let mut nb_list = self.layers[l][n].write();
+                self.layers[l].with(n, |lock| {
+                    let mut nb_list = lock.write();
                     // idx is freshly allocated; it can't already be in nb_list.
                     let pos = nb_list.partition_point(|&nb| {
                         self.get_vector_by_idx(nb)
@@ -530,15 +530,16 @@ impl HNSWIndex {
                                 self.fast_score(&n_vec, self.vector_slice(nb))
                             })
                             .collect();
-                        *self.edge_dists_l0[n].write() = n_dists;
+                        self.edge_dists_l0.with(n, |ed| *ed.write() = n_dists);
                     }
-                }
+                });
                 // Apply diversity cap if enabled — only does work when caps are on.
                 if enforce_neighbor_caps() {
                     let cap = self.neighbor_list_capacity(l);
-                    let len = self.layers[l][n].read().len();
+                    let len = self.layers[l].with(n, |lock| lock.read().len());
                     if len > cap {
-                        let nb_indices: Vec<usize> = self.layers[l][n].read().clone();
+                        let nb_indices: Vec<usize> =
+                            self.layers[l].with(n, |lock| lock.read().clone());
                         let mut cands: Vec<NodeCandidate> = nb_indices
                             .into_iter()
                             .map(|nb_idx| {
@@ -556,7 +557,7 @@ impl HNSWIndex {
                                 .unwrap_or(Ordering::Equal)
                         });
                         let selected = self.select_diverse_neighbors(&cands, cap, use_norm, l);
-                        *self.layers[l][n].write() = selected.clone();
+                        self.layers[l].with(n, |lock| *lock.write() = selected.clone());
                         // Keep edge_dists_l0 in sync with the post-cap neighbor list.
                         if l == 0 && !self.edge_dists_l0.is_empty() {
                             let dists: Vec<f32> = selected
@@ -568,7 +569,7 @@ impl HNSWIndex {
                                     self.fast_score(&n_vec, self.vector_slice(nb))
                                 })
                                 .collect();
-                            *self.edge_dists_l0[n].write() = dists;
+                            self.edge_dists_l0.with(n, |lock| *lock.write() = dists);
                         }
                     }
                 }
@@ -773,8 +774,8 @@ impl HNSWIndex {
         let nodes_len = self.len();
         self.ensure_level_capacity(level, nodes_len);
         self.extend_layers_for_new_node(nodes_len);
-        Self::push_unique(&mut self.layers[level][a_idx].write(), b_idx);
-        Self::push_unique(&mut self.layers[level][b_idx].write(), a_idx);
+        self.layers[level].with(a_idx, |lock| Self::push_unique(&mut lock.write(), b_idx));
+        self.layers[level].with(b_idx, |lock| Self::push_unique(&mut lock.write(), a_idx));
         self.sort_layer_neighbors(level, a_idx);
         self.sort_layer_neighbors(level, b_idx);
         if enforce_neighbor_caps() {
@@ -790,7 +791,9 @@ impl HNSWIndex {
         let nodes_len = self.len();
         self.ensure_level_capacity(level, nodes_len);
         self.extend_layers_for_new_node(nodes_len);
-        Self::push_unique(&mut self.layers[level][from_idx].write(), to_idx);
+        self.layers[level].with(from_idx, |lock| {
+            Self::push_unique(&mut lock.write(), to_idx)
+        });
         self.sort_layer_neighbors(level, from_idx);
         if enforce_neighbor_caps() {
             self.cap_layer_neighbors(level, from_idx);
@@ -817,26 +820,30 @@ impl HNSWIndex {
         while changed && steps < 1000 {
             steps += 1;
             changed = false;
-            if let Some(neighbors_lock) = self.layers.get(level).and_then(|l| l.get(current)) {
-                let neighbors = neighbors_lock.read();
-                for &neighbor in neighbors.iter() {
-                    if self
-                        .deleted
-                        .with(neighbor, |b| b.load(::std::sync::atomic::Ordering::Acquire))
-                    {
-                        continue;
-                    }
+            let Some(layer) = self.layers.get(level) else {
+                break;
+            };
+            if current >= layer.len() {
+                break;
+            }
+            let neighbors: Vec<usize> = layer.with(current, |rw| rw.read().clone());
+            for neighbor in neighbors {
+                if self
+                    .deleted
+                    .with(neighbor, |b| b.load(::std::sync::atomic::Ordering::Acquire))
+                {
+                    continue;
+                }
 
-                    let d_current = self.fast_score(query, self.vector_slice(current));
-                    let d_new = self.fast_score(query, self.vector_slice(neighbor));
-                    let s_current = self.normalize_score(d_current);
-                    let s_new = self.normalize_score(d_new);
+                let d_current = self.fast_score(query, self.vector_slice(current));
+                let d_new = self.fast_score(query, self.vector_slice(neighbor));
+                let s_current = self.normalize_score(d_current);
+                let s_new = self.normalize_score(d_new);
 
-                    if s_new < s_current {
-                        current = neighbor;
-                        changed = true;
-                        break;
-                    }
+                if s_new < s_current {
+                    current = neighbor;
+                    changed = true;
+                    break;
                 }
             }
         }
@@ -880,9 +887,10 @@ impl HNSWIndex {
                 let base_idx = scratch.extend_base[i];
                 scratch.extend_neighbors.clear();
                 if let Some(layer) = self.layers.get(level) {
-                    if let Some(rw) = layer.get(base_idx) {
-                        let guard = rw.read();
-                        scratch.extend_neighbors.extend_from_slice(&guard);
+                    if base_idx < layer.len() {
+                        layer.with(base_idx, |rw| {
+                            scratch.extend_neighbors.extend_from_slice(&rw.read());
+                        });
                     }
                 }
                 let nb_count = scratch.extend_neighbors.len();
@@ -988,16 +996,16 @@ impl HNSWIndex {
             return;
         }
         let cap = self.neighbor_list_capacity(level);
-        let neighbors_len = self
-            .layers
-            .get(level)
-            .and_then(|l| l.get(node_idx))
-            .map_or(0, |rw| rw.read().len());
+        let layer = &self.layers[level];
+        if node_idx >= layer.len() {
+            return;
+        }
+        let neighbors_len = layer.with(node_idx, |rw| rw.read().len());
         if neighbors_len <= cap {
             return;
         }
 
-        let neighbor_indices: Vec<usize> = self.layers[level][node_idx].read().clone();
+        let neighbor_indices: Vec<usize> = layer.with(node_idx, |rw| rw.read().clone());
         let node_vec: Vec<f32> = self.vector_slice(node_idx).to_vec();
 
         let mut candidates: Vec<NodeCandidate> = neighbor_indices
@@ -1020,7 +1028,7 @@ impl HNSWIndex {
         });
 
         let selected = self.select_diverse_neighbors(&candidates, cap, true, level);
-        *self.layers[level][node_idx].write() = selected.clone();
+        self.layers[level].with(node_idx, |lock| *lock.write() = selected.clone());
         // Keep edge_dists_l0 in sync with the post-cap neighbor list.
         if level == 0 && !self.edge_dists_l0.is_empty() {
             let node_vec = self.vector_slice(node_idx).to_vec();
@@ -1033,7 +1041,8 @@ impl HNSWIndex {
                     self.fast_score(&node_vec, self.vector_slice(nb))
                 })
                 .collect();
-            *self.edge_dists_l0[node_idx].write() = dists;
+            self.edge_dists_l0
+                .with(node_idx, |lock| *lock.write() = dists);
         }
     }
 
@@ -1041,7 +1050,11 @@ impl HNSWIndex {
         if level >= self.layers.len() {
             return;
         }
-        let neighbors_len = self.layers[level][node_idx].read().len();
+        let layer = &self.layers[level];
+        if node_idx >= layer.len() {
+            return;
+        }
+        let neighbors_len = layer.with(node_idx, |rw| rw.read().len());
         if neighbors_len <= 1 {
             return;
         }
@@ -1049,7 +1062,7 @@ impl HNSWIndex {
             return;
         };
         let node_vec = node_vec.to_vec();
-        let neighbors: Vec<usize> = self.layers[level][node_idx].read().clone();
+        let neighbors: Vec<usize> = layer.with(node_idx, |rw| rw.read().clone());
         let mut scored: Vec<(usize, f32)> = neighbors
             .into_iter()
             .filter_map(|nb| {
@@ -1061,7 +1074,7 @@ impl HNSWIndex {
             .collect();
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let sorted_indices: Vec<usize> = scored.iter().map(|(idx, _)| *idx).collect();
-        *self.layers[level][node_idx].write() = sorted_indices.clone();
+        self.layers[level].with(node_idx, |lock| *lock.write() = sorted_indices.clone());
         // Keep edge_dists_l0 in sync with the reordered neighbor list.
         if level == 0 && !self.edge_dists_l0.is_empty() {
             let dists: Vec<f32> = sorted_indices
@@ -1073,7 +1086,8 @@ impl HNSWIndex {
                     self.fast_score(&node_vec, self.vector_slice(nb))
                 })
                 .collect();
-            *self.edge_dists_l0[node_idx].write() = dists;
+            self.edge_dists_l0
+                .with(node_idx, |lock| *lock.write() = dists);
         }
     }
 }

@@ -1,4 +1,4 @@
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::RwLock;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -66,10 +66,11 @@ pub(crate) fn unpack_ep(v: u64) -> (Option<usize>, usize) {
 
 pub struct HNSWIndex {
     /// Per-node neighbor lists at each level.
-    /// `layers[level][node]` is protected by a `RwLock` so concurrent
-    /// inserts can modify different nodes simultaneously while searches
-    /// hold shared read locks.
-    pub(crate) layers: Vec<Vec<RwLock<Vec<usize>>>>,
+    /// The outer `Vec` is pre-allocated to `max_level_cap + 1` at construction
+    /// and never grown; the inner `ChunkedArray` grows by node idx and keeps
+    /// each per-node `RwLock` at a stable address so concurrent readers can
+    /// safely hold shared references while other nodes are being appended.
+    pub(crate) layers: Vec<ChunkedArray<RwLock<Vec<usize>>>>,
     /// Stable-address vector storage. Never reallocates existing data.
     pub(crate) vectors: VectorArena,
     /// Per-node assigned level (fits in u8; max_level_cap ≤ 255).
@@ -90,11 +91,12 @@ pub struct HNSWIndex {
     pub(crate) deleted: ChunkedArray<AtomicBool>,
     /// Maintained on deletion; cached count for O(1) deleted_count().
     pub(crate) deleted_count: AtomicUsize,
-    /// Parallel to layers[0]: edge_dists_l0[idx] holds the distance from node idx to
-    /// each of its L0 neighbors, co-indexed with layers[0][idx].
-    /// Protected by the same logical lock as layers[0][idx]: always write under
-    /// layers[0][idx].write() and read under layers[0][idx].read().
-    pub(crate) edge_dists_l0: Vec<parking_lot::RwLock<Vec<f32>>>,
+    /// Parallel to layers[0]: edge_dists_l0.get(idx) holds the distance from
+    /// node idx to each of its L0 neighbors, co-indexed with layers[0].get(idx).
+    /// Protected by the same logical lock as layers[0].get(idx): always write
+    /// under layers[0].with(idx, |l| l.write()) and read under `.read()`.
+    /// Empty (per-slot `Vec` empty) until [`build_edge_distances`] runs.
+    pub(crate) edge_dists_l0: ChunkedArray<RwLock<Vec<f32>>>,
     /// SQ8 quantized vectors: quantized[idx * dim + d] = u8 encoding of dimension d.
     /// Empty until `quantize_all()` is called.
     pub(crate) quantized: Vec<u8>,
@@ -150,8 +152,11 @@ impl HNSWIndex {
             );
         }
         const CHUNK_CAP: usize = 4096;
+        let layers: Vec<ChunkedArray<RwLock<Vec<usize>>>> = (0..=max_level_cap)
+            .map(|_| ChunkedArray::new(CHUNK_CAP))
+            .collect();
         Self {
-            layers: Vec::new(),
+            layers,
             vectors: VectorArena::new(dim, CHUNK_CAP),
             levels: ChunkedArray::new(CHUNK_CAP),
             entry_level_ep: AtomicU64::new(pack_ep(NO_EP as usize, 0)),
@@ -166,7 +171,7 @@ impl HNSWIndex {
             dim,
             deleted: ChunkedArray::new(CHUNK_CAP),
             deleted_count: AtomicUsize::new(0),
-            edge_dists_l0: Vec::new(),
+            edge_dists_l0: ChunkedArray::new(CHUNK_CAP),
             quantized: Vec::new(),
             quant_min: Vec::new(),
             quant_scale: Vec::new(),
@@ -185,10 +190,11 @@ impl HNSWIndex {
 
     pub fn point_degree(&self, point_id: PointId, level: usize) -> Option<usize> {
         let idx = *self.point_to_idx.get(&point_id)?;
-        self.layers
-            .get(level)
-            .and_then(|layer| layer.get(idx))
-            .map(|rw| rw.read().len())
+        let layer = self.layers.get(level)?;
+        if idx >= layer.len() {
+            return None;
+        }
+        Some(layer.with(idx, |rw| rw.read().len()))
     }
 
     // ── Entry-point / level helpers ───────────────────────────────────────────
@@ -332,31 +338,30 @@ impl HNSWIndex {
         }
     }
 
-    pub(crate) fn ensure_level_capacity(&mut self, level: usize, nodes_len: usize) {
-        if self.layers.len() <= level {
-            let start = self.layers.len();
-            for level_idx in start..=level {
-                let mut layer = Vec::with_capacity(nodes_len);
-                for _ in 0..nodes_len {
-                    layer.push(RwLock::new(Vec::with_capacity(
-                        self.neighbor_list_capacity(level_idx),
-                    )));
-                }
-                self.layers.push(layer);
-            }
-        }
+    /// The outer level `Vec` is pre-sized to `max_level_cap + 1` at construction,
+    /// so no dynamic growth of the level axis is needed. Left in place as a
+    /// bounds assertion / no-op for callers migrated from the growable layout.
+    pub(crate) fn ensure_level_capacity(&mut self, level: usize, _nodes_len: usize) {
+        debug_assert!(
+            level < self.layers.len(),
+            "level {} exceeds pre-allocated layers ({})",
+            level,
+            self.layers.len()
+        );
     }
 
+    /// Allocate one stable slot per level (and one edge-dist slot) so the newly
+    /// registered node at `nodes_len - 1` has a per-level `RwLock` at a stable
+    /// address. Idempotent — extra pushes are avoided by comparing to the
+    /// existing chunked-array length.
     pub(crate) fn extend_layers_for_new_node(&mut self, nodes_len: usize) {
-        for level in 0..self.layers.len() {
-            let cap = self.neighbor_list_capacity(level);
-            if self.layers[level].len() < nodes_len {
-                self.layers[level].push(RwLock::new(Vec::with_capacity(cap)));
+        for layer in self.layers.iter() {
+            while layer.len() < nodes_len {
+                layer.push_default();
             }
         }
         while self.edge_dists_l0.len() < nodes_len {
-            self.edge_dists_l0
-                .push(parking_lot::RwLock::new(Vec::new()));
+            self.edge_dists_l0.push_default();
         }
     }
 
@@ -385,12 +390,30 @@ impl HNSWIndex {
         }
     }
 
-    pub fn layer_neighbors(
-        &self,
-        level: usize,
-        idx: usize,
-    ) -> Option<RwLockReadGuard<'_, Vec<usize>>> {
-        Some(self.layers.get(level)?.get(idx)?.read())
+    /// Return a cloned snapshot of the neighbor list at `layers[level][idx]`.
+    /// Cloning avoids returning a `RwLockReadGuard` that would borrow into
+    /// the `ChunkedArray`; callers that need zero-copy access should use
+    /// [`with_layer_neighbors`].
+    pub fn layer_neighbors(&self, level: usize, idx: usize) -> Option<Vec<usize>> {
+        let layer = self.layers.get(level)?;
+        if idx >= layer.len() {
+            return None;
+        }
+        Some(layer.with(idx, |rw| rw.read().clone()))
+    }
+
+    /// Invoke `f` with a shared reference to the neighbor list at `layers[level][idx]`.
+    /// The `RwLock` read-guard is held only for the duration of the callback.
+    #[inline]
+    pub fn with_layer_neighbors<F, R>(&self, level: usize, idx: usize, f: F) -> Option<R>
+    where
+        F: FnOnce(&[usize]) -> R,
+    {
+        let layer = self.layers.get(level)?;
+        if idx >= layer.len() {
+            return None;
+        }
+        Some(layer.with(idx, |rw| f(&rw.read())))
     }
 
     pub fn iter_vectors(&self) -> impl Iterator<Item = (&PointId, &[f32])> {
@@ -918,8 +941,8 @@ impl HNSWIndex {
             .with(idx, |l| l.store(stored_level, Ordering::Relaxed));
         let del_idx = self.deleted.push_default(); // AtomicBool::default() = false
         debug_assert_eq!(del_idx, idx);
-        self.edge_dists_l0
-            .push(parking_lot::RwLock::new(Vec::new()));
+        let ed_idx = self.edge_dists_l0.push_default();
+        debug_assert_eq!(ed_idx, idx);
         self.idx_to_point.push(point_id);
         self.point_to_idx.insert(point_id, idx);
         idx
@@ -942,29 +965,30 @@ impl HNSWIndex {
     /// loading or building an index when TI skip is actually needed.
     pub fn build_edge_distances(&mut self) {
         let n = self.len();
-        // Allocate the outer Vec once; inner Vecs are populated below.
-        if self.edge_dists_l0.is_empty() {
-            self.edge_dists_l0 = (0..n)
-                .map(|_| parking_lot::RwLock::new(Vec::new()))
-                .collect();
+        // Ensure a stable slot per node in the chunked array. All slots are
+        // default-initialised (empty `Vec`) at chunk creation.
+        while self.edge_dists_l0.len() < n {
+            self.edge_dists_l0.push_default();
         }
         if let Some(l0) = self.layers.first() {
-            for (idx, nb_lock) in l0.iter().enumerate() {
-                let nb: Vec<usize> = nb_lock.read().clone();
+            let l0_view = l0.view();
+            let ed_view = self.edge_dists_l0.view();
+            for idx in 0..l0_view.len() {
+                let nb: Vec<usize> = l0_view.get(idx).read().clone();
                 if nb.is_empty() {
                     continue;
                 }
                 let src: Vec<f32> = self.vector_slice(idx).to_vec();
                 let dists: Vec<f32> = nb
                     .iter()
-                    .map(|&n| {
-                        if n == idx {
+                    .map(|&nbi| {
+                        if nbi == idx {
                             return 0.0;
                         }
-                        self.fast_score(&src, self.vector_slice(n))
+                        self.fast_score(&src, self.vector_slice(nbi))
                     })
                     .collect();
-                *self.edge_dists_l0[idx].write() = dists;
+                *ed_view.get(idx).write() = dists;
             }
         }
     }
@@ -1013,7 +1037,9 @@ impl HNSWIndex {
         // Build undirected adjacency list from L0.
         let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
         if let Some(l0) = self.layers.first() {
-            for (u, nb_lock) in l0.iter().enumerate() {
+            let view = l0.view();
+            for u in 0..view.len() {
+                let nb_lock = view.get(u);
                 for &v in nb_lock.read().iter() {
                     if v != u {
                         if !adj[u].contains(&v) {
@@ -1100,24 +1126,31 @@ impl HNSWIndex {
 
         // Permute all layers: remap neighbor indices through inv_perm.
         for layer in self.layers.iter_mut() {
-            let new_layer: Vec<parking_lot::RwLock<Vec<usize>>> = (0..n)
-                .map(|_| parking_lot::RwLock::new(Vec::new()))
-                .collect();
-            for (old_idx, nb_lock) in layer.iter().enumerate() {
+            let new_layer: ChunkedArray<RwLock<Vec<usize>>> = ChunkedArray::new(CHUNK_CAP);
+            for _ in 0..n {
+                new_layer.push_default();
+            }
+            let old_view = layer.view();
+            let new_view = new_layer.view();
+            for old_idx in 0..old_view.len() {
+                let nb_lock = old_view.get(old_idx);
                 let new_nbs: Vec<usize> = nb_lock.read().iter().map(|&nb| inv_perm[nb]).collect();
-                *new_layer[inv_perm[old_idx]].write() = new_nbs;
+                *new_view.get(inv_perm[old_idx]).write() = new_nbs;
             }
             *layer = new_layer;
         }
 
         // Permute edge_dists_l0 if present.
         if !self.edge_dists_l0.is_empty() {
-            let new_ed: Vec<parking_lot::RwLock<Vec<f32>>> = (0..n)
-                .map(|_| parking_lot::RwLock::new(Vec::new()))
-                .collect();
-            for (old_idx, ed_lock) in self.edge_dists_l0.iter().enumerate() {
-                let dists = ed_lock.read().clone();
-                *new_ed[inv_perm[old_idx]].write() = dists;
+            let new_ed: ChunkedArray<RwLock<Vec<f32>>> = ChunkedArray::new(CHUNK_CAP);
+            for _ in 0..n {
+                new_ed.push_default();
+            }
+            let old_view = self.edge_dists_l0.view();
+            let new_view = new_ed.view();
+            for old_idx in 0..old_view.len() {
+                let dists = old_view.get(old_idx).read().clone();
+                *new_view.get(inv_perm[old_idx]).write() = dists;
             }
             self.edge_dists_l0 = new_ed;
         }

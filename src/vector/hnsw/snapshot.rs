@@ -85,8 +85,9 @@ impl HNSWIndex {
         let mut layers = HashMap::new();
         for (level, layer) in self.layers.iter().enumerate() {
             let mut level_map: HashMap<PointId, Vec<PointId>> = HashMap::new();
-            for (idx, neighbors_lock) in layer.iter().enumerate() {
-                let neighbors = neighbors_lock.read();
+            let view = layer.view();
+            for idx in 0..view.len() {
+                let neighbors = view.get(idx).read();
                 if neighbors.is_empty() {
                     continue;
                 }
@@ -173,31 +174,33 @@ impl HNSWIndex {
             }
         }
 
-        let num_levels = snapshot
+        // Preserve the pre-allocated level-slot layout that `HNSWIndex::new`
+        // establishes so query-side code (and reorder/quantize) never observe
+        // level-axis growth during operation. Cover both the snapshot's own
+        // max level and the index's configured cap.
+        let max_level_cap = snapshot.max_level_cap.min(MAX_STORED_LEVEL);
+        let snapshot_max_level = snapshot
             .layers
             .keys()
             .copied()
             .max()
             .unwrap_or(0)
-            .max(snapshot.current_max_level)
-            + 1;
-        let mut layers = Vec::with_capacity(num_levels);
-        for level in 0..num_levels {
-            let cap = if level == 0 {
-                stored_cap_l0 + 1
-            } else {
-                snapshot.m + 1
-            };
-            let mut layer = Vec::with_capacity(ids.len());
+            .max(snapshot.current_max_level);
+        let num_levels = max_level_cap.max(snapshot_max_level) + 1;
+        let mut layers: Vec<ChunkedArray<parking_lot::RwLock<Vec<usize>>>> =
+            Vec::with_capacity(num_levels);
+        for _ in 0..num_levels {
+            let arr: ChunkedArray<parking_lot::RwLock<Vec<usize>>> = ChunkedArray::new(CHUNK_CAP);
             for _ in 0..ids.len() {
-                layer.push(parking_lot::RwLock::new(Vec::with_capacity(cap)));
+                arr.push_default();
             }
-            layers.push(layer);
+            layers.push(arr);
         }
         for (level, layer_map) in snapshot.layers.iter() {
             if *level >= layers.len() {
                 continue;
             }
+            let view = layers[*level].view();
             for (id, neighbors) in layer_map {
                 let Some(&idx) = point_to_idx.get(id) else {
                     continue;
@@ -206,12 +209,18 @@ impl HNSWIndex {
                     .iter()
                     .filter_map(|n| point_to_idx.get(n).copied())
                     .collect::<Vec<_>>();
-                *layers[*level][idx].write() = mapped;
+                *view.get(idx).write() = mapped;
             }
         }
 
         // Edge distances are NOT backfilled on load — lazy via build_edge_distances().
-        let edge_dists_l0: Vec<parking_lot::RwLock<Vec<f32>>> = Vec::new();
+        // Allocate a stable slot per node so that build_edge_distances() and
+        // read-side code can safely index by node idx.
+        let edge_dists_l0: ChunkedArray<parking_lot::RwLock<Vec<f32>>> =
+            ChunkedArray::new(CHUNK_CAP);
+        for _ in 0..ids.len() {
+            edge_dists_l0.push_default();
+        }
 
         let stored_max_level = snapshot.current_max_level.min(MAX_STORED_LEVEL);
         let entry_level_ep = {
@@ -236,7 +245,7 @@ impl HNSWIndex {
             stored_cap_l0,
             ef: snapshot.ef,
             ef_construct: snapshot.ef_construct,
-            max_level_cap: snapshot.max_level_cap.min(MAX_STORED_LEVEL),
+            max_level_cap,
             level_scale: snapshot.level_scale,
             dim: snapshot.dim,
             deleted_count: std::sync::atomic::AtomicUsize::new(deleted_count),

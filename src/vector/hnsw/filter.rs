@@ -598,7 +598,7 @@ impl HNSWIndex {
                     continue;
                 }
 
-                if let Some(neighs) = self.layer_neighbors(0, curr.node.idx) {
+                self.with_layer_neighbors(0, curr.node.idx, |neighs| {
                     for &nb in neighs.iter() {
                         if allowed_mask
                             .as_ref()
@@ -651,7 +651,7 @@ impl HNSWIndex {
                             }
                         }
                     }
-                }
+                });
             }
 
             let mut out = std::mem::take(&mut scratch.results_pq)

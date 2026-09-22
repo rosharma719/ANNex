@@ -322,11 +322,20 @@ impl<T: Default + Send + Sync + 'static> ChunkedArray<T> {
         idx
     }
 
-    /// Acquire a snapshot view. One `Arc` clone; no lock held afterwards.
+    /// Acquire a snapshot view.
+    ///
+    /// Captures both the chunk snapshot and the logical length under the writer
+    /// lock so `view.len()` and `view.get(idx)` are always consistent — any
+    /// `idx < view.len()` is guaranteed to reside in a published chunk.
     pub fn view(&self) -> ChunkedArrayView<T> {
+        let w = self.writer.lock();
+        let chunks = self.chunks.read().clone();
+        let len = w.total;
+        drop(w);
         ChunkedArrayView {
-            chunks: self.chunks.read().clone(),
+            chunks,
             chunk_capacity: self.chunk_capacity,
+            len,
         }
     }
 
@@ -359,6 +368,7 @@ impl<T: Default + Send + Sync + 'static> ChunkedArray<T> {
 pub struct ChunkedArrayView<T: Send + Sync + 'static> {
     chunks: Arc<[Arc<ArrayChunk<T>>]>,
     chunk_capacity: usize,
+    len: usize,
 }
 
 impl<T: Default + Send + Sync + 'static> ChunkedArrayView<T> {
@@ -373,6 +383,27 @@ impl<T: Default + Send + Sync + 'static> ChunkedArrayView<T> {
         //         (b) this view holds an Arc to the chunk, keeping its Box alive;
         //         (c) T is never moved after initialisation.
         unsafe { self.chunks[idx / self.chunk_capacity].get(idx % self.chunk_capacity) }
+    }
+
+    /// Logical length of the array captured at view time.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Return a reference to slot `idx` if `idx < self.len()`.
+    #[inline]
+    pub fn get_opt(&self, idx: usize) -> Option<&T> {
+        if idx < self.len {
+            Some(self.get(idx))
+        } else {
+            None
+        }
     }
 }
 

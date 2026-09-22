@@ -304,6 +304,17 @@ impl HNSWIndex {
             let mut no_improve_streak = 0usize;
             let mut stop_reason = "queue_empty";
 
+            // Hoist a stable snapshot of the layer's per-node RwLock slots and
+            // (if TI-skip is on) the parallel edge-distance array. Both views
+            // capture the logical length at BFS start; any new nodes added
+            // afterwards are outside the search's world.
+            let layer_view = self.layers.get(level).map(|l| l.view());
+            let ed_view = if use_ti {
+                Some(self.edge_dists_l0.view())
+            } else {
+                None
+            };
+
             while let Some(current) = scratch.candidate_queue.peek() {
                 if allow_early_exit && scratch.result_set.len() >= ef {
                     if current.sort_key > worst_score {
@@ -319,7 +330,7 @@ impl HNSWIndex {
 
                 let current = scratch.candidate_queue.pop().unwrap();
                 expanded += 1;
-                let neighbors_lock_opt = self.layers.get(level).and_then(|l| l.get(current.idx));
+                let neighbors_lock_opt = layer_view.as_ref().and_then(|v| v.get_opt(current.idx));
                 if let Some(neighbors_lock) = neighbors_lock_opt {
                     let neighbors = neighbors_lock.read();
                     const BATCH: usize = 16;
@@ -446,7 +457,10 @@ impl HNSWIndex {
                         } else if use_ti_scan {
                             // TI-skip fast path: same structure as simple_scan but applies
                             // triangle-inequality lower-bound check before each distance call.
-                            let ed_guard = self.edge_dists_l0.get(current.idx).map(|l| l.read());
+                            let ed_guard = ed_view
+                                .as_ref()
+                                .and_then(|v| v.get_opt(current.idx))
+                                .map(|l| l.read());
                             for (position, &neighbor) in neighbors.iter().enumerate() {
                                 // TI lower-bound: d(q,n) >= d(q,c) - d(c,n).
                                 // If lower bound already exceeds worst result, skip.
@@ -999,6 +1013,10 @@ impl HNSWIndex {
             let patience_limit = opts.early_exit_patience.unwrap_or_else(early_exit_patience);
             let mut no_improve_streak = 0usize;
 
+            // Hoist a stable view of the layer's slot array — see the note in
+            // `search_layer_unfiltered`.
+            let layer_view = self.layers.get(level).map(|l| l.view());
+
             while let Some(current) = scratch.candidate_queue.peek() {
                 if allow_early_exit && scratch.result_set.len() >= ef {
                     if current.sort_key > worst_score {
@@ -1014,7 +1032,7 @@ impl HNSWIndex {
                 let current = scratch.candidate_queue.pop().unwrap();
                 expanded += 1;
 
-                let neighbors_lock_opt = self.layers.get(level).and_then(|l| l.get(current.idx));
+                let neighbors_lock_opt = layer_view.as_ref().and_then(|v| v.get_opt(current.idx));
                 if let Some(neighbors_lock) = neighbors_lock_opt {
                     let neighbors = neighbors_lock.read();
                     const BATCH: usize = 16;

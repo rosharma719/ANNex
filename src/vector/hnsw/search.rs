@@ -132,6 +132,16 @@ fn prefetch_from_view(view: &crate::vector::hnsw::arena::VectorArenaView, idx: u
     }
 }
 
+/// Lockless LIVE check against a hoisted `node_state` view. Callers must
+/// have already bounded `idx` by the node count captured at BFS start.
+#[inline(always)]
+fn is_live_via(
+    view: &crate::vector::hnsw::arena::ChunkedArrayView<std::sync::atomic::AtomicU8>,
+    idx: usize,
+) -> bool {
+    view.get(idx).load(std::sync::atomic::Ordering::Acquire) == crate::vector::hnsw::core::NODE_LIVE
+}
+
 impl HNSWIndex {
     fn exact_scan(&self, query: &[f32], normalize_scores: bool, top_k: usize) -> Vec<ScoredPoint> {
         let mut brute: Vec<ScoredPoint> = (0..self.len())
@@ -200,6 +210,9 @@ impl HNSWIndex {
         // with no synchronisation and no risk of racing a concurrent inserter's
         // chunk publication.
         let vec_view = self.vectors.view();
+        // Same trick for the per-node lifecycle state — one Arc clone per BFS
+        // instead of a writer-lock acquisition per candidate/neighbor.
+        let state_view = self.node_state.view();
         SEARCH_SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
             // Capture the node count at BFS start. Any neighbor idx observed
@@ -228,7 +241,7 @@ impl HNSWIndex {
             let mut first_seed_idx = 0usize;
             let mut first_seed_score = 0.0f32;
             for &entry in entries {
-                if entry >= node_bound || !self.is_live(entry) {
+                if entry >= node_bound || !is_live_via(&state_view, entry) {
                     continue;
                 }
                 let start = entry;
@@ -372,7 +385,7 @@ impl HNSWIndex {
                                     prefetch_read(entry);
                                 }
                                 if neighbor >= node_bound
-                                    || !self.is_live(neighbor)
+                                    || !is_live_via(&state_view, neighbor)
                                     || !scratch.mark_visited(neighbor)
                                 {
                                     continue;
@@ -477,7 +490,7 @@ impl HNSWIndex {
                                     prefetch_read(entry);
                                 }
                                 if neighbor >= node_bound
-                                    || !self.is_live(neighbor)
+                                    || !is_live_via(&state_view, neighbor)
                                     || !scratch.mark_visited(neighbor)
                                 {
                                     continue;
@@ -566,7 +579,7 @@ impl HNSWIndex {
                                     prefetch_read(entry);
                                 }
                                 if neighbor >= node_bound
-                                    || !self.is_live(neighbor)
+                                    || !is_live_via(&state_view, neighbor)
                                     || !scratch.mark_visited(neighbor)
                                 {
                                     continue;
@@ -702,7 +715,7 @@ impl HNSWIndex {
                                         adjacency_reads += 1;
                                     }
                                     if neighbor >= node_bound
-                                        || !self.is_live(neighbor)
+                                        || !is_live_via(&state_view, neighbor)
                                         || !scratch.mark_visited(neighbor)
                                     {
                                         continue;
@@ -941,6 +954,7 @@ impl HNSWIndex {
 
         let mut trace = trace;
         let vec_view = self.vectors.view();
+        let state_view = self.node_state.view();
         SEARCH_SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
             let bfs_bound = self.len();
@@ -959,7 +973,7 @@ impl HNSWIndex {
             let mut first_seed_idx = 0usize;
             let mut first_seed_score = 0.0f32;
             for &entry in entries {
-                if entry >= node_bound || !self.is_live(entry) {
+                if entry >= node_bound || !is_live_via(&state_view, entry) {
                     continue;
                 }
                 let start = entry;
@@ -1036,7 +1050,7 @@ impl HNSWIndex {
                             prefetch_read(entry);
                         }
                         if neighbor >= node_bound
-                            || !self.is_live(neighbor)
+                            || !is_live_via(&state_view, neighbor)
                             || !scratch.mark_visited(neighbor)
                         {
                             continue;

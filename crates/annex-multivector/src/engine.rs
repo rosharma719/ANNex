@@ -665,6 +665,16 @@ impl MultiVectorIndex {
         let timing = *TIMING.get_or_init(|| std::env::var("MULTIVECTOR_TIMING").is_ok());
         let decode_ns = std::sync::atomic::AtomicU64::new(0);
         let maxsim_ns = std::sync::atomic::AtomicU64::new(0);
+        // Per-worker scratch buffer for compressed decode. Reused across every
+        // candidate this thread scores in this rescoring call — turns
+        // (candidates x per-doc) Vec::with_capacity(count*dim) allocations
+        // into one grow-once-per-thread. Concretely on a FiQA-shaped query
+        // with 250 candidates x 200 tokens x 128 dims that removes about
+        // 25 MB of scratch f32 allocs per query.
+        thread_local! {
+            static DECODE_SCRATCH: std::cell::RefCell<Vec<f32>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
         let mut hits = approximate
             .par_iter()
             .take(count)
@@ -675,18 +685,24 @@ impl MultiVectorIndex {
                 } else {
                     None
                 };
-                let doc = CompressedVectorStore::decode(
-                    &mapped,
-                    record.location,
-                    &s.codebook,
-                    &s.residual_codebook,
+                let (score, t1) = DECODE_SCRATCH.with(
+                    |cell| -> Result<(f32, Option<std::time::Instant>), io::Error> {
+                        let mut scratch = cell.borrow_mut();
+                        let dim = CompressedVectorStore::decode_into(
+                            &mapped,
+                            record.location,
+                            &s.codebook,
+                            &s.residual_codebook,
+                            &mut scratch,
+                        )?;
+                        let t1 = if timing {
+                            Some(std::time::Instant::now())
+                        } else {
+                            None
+                        };
+                        Ok((maxsim_flat(normalized, &scratch, dim), t1))
+                    },
                 )?;
-                let t1 = if timing {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-                let score = maxsim_flat(normalized, &doc.values, doc.dimension);
                 let t2 = if timing {
                     Some(std::time::Instant::now())
                 } else {

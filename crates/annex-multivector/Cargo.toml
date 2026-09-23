@@ -14,6 +14,10 @@ name = "multivector"
 name = "annex-multivector"
 path = "src/main.rs"
 
+[[bin]]
+name = "maxsim-bench"
+path = "src/bin/maxsim_bench.rs"
+
 [dependencies]
 annex-core = { path = "../annex-core" }
 axum = "0.8"

@@ -1,0 +1,780 @@
+use crate::{
+    fde::{Vector, dot, maxsim_flat, normalize},
+    muvera::FdeEncoder,
+    storage::{CompressedVectorStore, FixedVectorStore, ObjectLocation, atomic_write},
+};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    fs, io,
+    path::{Path, PathBuf},
+    sync::RwLock,
+};
+use thiserror::Error;
+use annex::{
+    utils::types::DistanceMetric,
+    vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
+};
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct IndexConfig {
+    pub dimension: usize,
+    #[serde(default = "default_centroids")]
+    pub centroids: usize,
+    #[serde(default = "default_bits")]
+    pub residual_bits: u8,
+    #[serde(default = "default_probes")]
+    pub probes: usize,
+    #[serde(default = "default_fde_repetitions")]
+    pub fde_repetitions: usize,
+    #[serde(default = "default_fde_ksim")]
+    pub fde_ksim: usize,
+    #[serde(default = "default_fde_projected")]
+    pub fde_projected: usize,
+}
+fn default_centroids() -> usize {
+    64
+}
+fn default_bits() -> u8 {
+    2
+}
+fn default_probes() -> usize {
+    4
+}
+fn default_fde_repetitions() -> usize {
+    20
+}
+fn default_fde_ksim() -> usize {
+    4
+}
+fn default_fde_projected() -> usize {
+    8
+}
+impl IndexConfig {
+    pub fn new(dimension: usize) -> Self {
+        Self {
+            dimension,
+            centroids: 64,
+            residual_bits: 2,
+            probes: 4,
+            fde_repetitions: 20,
+            fde_ksim: 4,
+            fde_projected: 8,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DocumentRecord {
+    centroid_ids: Vec<u32>,
+    unique_centroids: Vec<u32>,
+    location: ObjectLocation,
+    fde_location: ObjectLocation,
+    metadata: Value,
+    tokens: usize,
+    compressed_bytes: u64,
+}
+#[derive(Deserialize, Serialize)]
+struct Manifest {
+    config: IndexConfig,
+    codebook: Vec<Vector>,
+    residual_codebook: Vec<f32>,
+    documents: HashMap<String, DocumentRecord>,
+}
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct Hit {
+    pub id: String,
+    pub score: f32,
+    pub metadata: Value,
+}
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct CandidateHit {
+    pub id: String,
+    pub score: f32,
+}
+#[derive(Clone, Debug)]
+pub struct UpsertDocument {
+    pub id: String,
+    pub vectors: Vec<Vector>,
+    pub metadata: Value,
+}
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct IndexStats {
+    pub documents: usize,
+    pub token_vectors: usize,
+    pub compressed_bytes: u64,
+    pub centroids: usize,
+    pub residual_bits: u8,
+    pub trained: bool,
+    pub fde_dimension: usize,
+    pub fde_ann_nodes: usize,
+}
+#[derive(Debug, Error)]
+pub enum IndexError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("index configuration is {actual:?}, requested {requested:?}")]
+    Config {
+        actual: IndexConfig,
+        requested: IndexConfig,
+    },
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+struct State {
+    codebook: Vec<Vector>,
+    residual_codebook: Vec<f32>,
+    documents: HashMap<String, DocumentRecord>,
+    postings: Vec<HashSet<String>>,
+    fde_ann: Option<Arc<HNSWIndex>>,
+    fde_ann_ids: Vec<String>,
+}
+pub struct MultiVectorIndex {
+    root: PathBuf,
+    config: IndexConfig,
+    objects: CompressedVectorStore,
+    fde: FdeEncoder,
+    fde_store: FixedVectorStore,
+    state: RwLock<State>,
+}
+
+impl MultiVectorIndex {
+    pub fn open(path: impl AsRef<Path>, config: IndexConfig) -> Result<Self, IndexError> {
+        if config.dimension == 0
+            || config.centroids == 0
+            || config.probes == 0
+            || !(1..=8).contains(&config.residual_bits)
+            || config.fde_repetitions == 0
+            || config.fde_ksim == 0
+            || config.fde_ksim > 12
+            || config.fde_projected == 0
+        {
+            return Err(IndexError::Invalid(
+                "dimension, centroids, probes, and residual_bits (1..=8) must be valid".into(),
+            ));
+        }
+        let root = path.as_ref().to_owned();
+        fs::create_dir_all(&root)?;
+        let path = root.join("manifest.json");
+        let (codebook, residual_codebook, documents) = if path.exists() {
+            let m: Manifest = serde_json::from_slice(&fs::read(path)?)?;
+            if m.config != config {
+                return Err(IndexError::Config {
+                    actual: m.config,
+                    requested: config,
+                });
+            }
+            (m.codebook, m.residual_codebook, m.documents)
+        } else {
+            (vec![], vec![], HashMap::new())
+        };
+        let mut postings = vec![HashSet::new(); codebook.len()];
+        for (id, d) in &documents {
+            for &c in &d.centroid_ids {
+                postings[c as usize].insert(id.clone());
+            }
+        }
+        Ok(Self {
+            fde: FdeEncoder::new(
+                config.dimension,
+                config.fde_ksim,
+                config.fde_projected,
+                config.fde_repetitions,
+                0x4d55_5645_5241,
+            ),
+            fde_store: FixedVectorStore::new(root.join("fde"))?,
+            objects: CompressedVectorStore::new(root.join("objects"))?,
+            state: RwLock::new(State {
+                codebook,
+                residual_codebook,
+                documents,
+                postings,
+                fde_ann: None,
+                fde_ann_ids: Vec::new(),
+            }),
+            root,
+            config,
+        })
+    }
+    fn validate(&self, v: &[Vector]) -> Result<(), IndexError> {
+        if v.is_empty()
+            || v.iter()
+                .any(|x| x.len() != self.config.dimension || x.iter().any(|n| !n.is_finite()))
+        {
+            Err(IndexError::Invalid(format!(
+                "vectors must be a non-empty matrix of {} finite values",
+                self.config.dimension
+            )))
+        } else {
+            Ok(())
+        }
+    }
+    fn persist(&self, s: &State) -> Result<(), IndexError> {
+        atomic_write(
+            &self.root.join("manifest.json"),
+            &serde_json::to_vec(&Manifest {
+                config: self.config.clone(),
+                codebook: s.codebook.clone(),
+                residual_codebook: s.residual_codebook.clone(),
+                documents: s.documents.clone(),
+            })?,
+        )?;
+        Ok(())
+    }
+    /// Train PLAID's coarse k-means codebook. Must happen before ingestion.
+    pub fn train(&self, samples: &[Vector], iterations: usize) -> Result<(), IndexError> {
+        self.validate(samples)?;
+        if samples.len() < self.config.centroids {
+            return Err(IndexError::Invalid(
+                "training samples must be >= centroid count".into(),
+            ));
+        }
+        let mut s = self.state.write().unwrap();
+        if !s.documents.is_empty() {
+            return Err(IndexError::Invalid(
+                "cannot retrain a non-empty index".into(),
+            ));
+        }
+        let samples: Vec<_> = samples.iter().map(|sample| normalize(sample)).collect();
+        let mut centers: Vec<_> = (0..self.config.centroids)
+            .map(|i| samples[i * samples.len() / self.config.centroids].clone())
+            .collect();
+        for _ in 0..iterations.max(1) {
+            let mut sums = vec![vec![0.; self.config.dimension]; centers.len()];
+            let mut counts = vec![0usize; centers.len()];
+            for v in &samples {
+                let c = nearest(v, &centers);
+                counts[c] += 1;
+                for (i, x) in v.iter().enumerate() {
+                    sums[c][i] += x;
+                }
+            }
+            for c in 0..centers.len() {
+                if counts[c] > 0 {
+                    for x in &mut sums[c] {
+                        *x /= counts[c] as f32;
+                    }
+                    centers[c] = normalize(&sums[c]);
+                }
+            }
+        }
+        s.codebook = centers;
+        let residuals: Vec<f32> = samples
+            .iter()
+            .flat_map(|vector| {
+                let center = &s.codebook[nearest(vector, &s.codebook)];
+                vector
+                    .iter()
+                    .zip(center)
+                    .map(|(value, centroid)| value - centroid)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        s.residual_codebook =
+            train_scalar_codebook(&residuals, 1usize << self.config.residual_bits, 12);
+        s.postings = vec![HashSet::new(); s.codebook.len()];
+        self.persist(&s)
+    }
+    pub fn upsert(
+        &self,
+        id: impl Into<String>,
+        vectors: Vec<Vector>,
+        metadata: Value,
+    ) -> Result<(), IndexError> {
+        self.upsert_batch(vec![UpsertDocument {
+            id: id.into(),
+            vectors,
+            metadata,
+        }])
+    }
+    /// Ingest a batch while writing the persistent manifest only once.
+    pub fn upsert_batch(&self, batch: Vec<UpsertDocument>) -> Result<(), IndexError> {
+        for document in &batch {
+            self.validate(&document.vectors)?;
+        }
+        let mut s = self.state.write().unwrap();
+        s.fde_ann = None;
+        s.fde_ann_ids.clear();
+        if s.codebook.is_empty() {
+            return Err(IndexError::Invalid(
+                "index is untrained; call train first".into(),
+            ));
+        }
+        for document in batch {
+            let id = document.id;
+            if let Some(old_ids) = s.documents.get(&id).map(|old| old.unique_centroids.clone()) {
+                for c in old_ids {
+                    s.postings[c as usize].remove(&id);
+                }
+            }
+            let vectors: Vec<_> = document
+                .vectors
+                .iter()
+                .map(|vector| normalize(vector))
+                .collect();
+            let ids: Vec<u32> = vectors
+                .iter()
+                .map(|v| nearest(v, &s.codebook) as u32)
+                .collect();
+            let mut unique_centroids = ids.clone();
+            unique_centroids.sort_unstable();
+            unique_centroids.dedup();
+            let (location, size) = self.objects.put(
+                &vectors,
+                &ids,
+                &s.codebook,
+                &s.residual_codebook,
+                self.config.residual_bits,
+            )?;
+            let fde = self.fde.encode_document(&vectors);
+            let fde_location = self.fde_store.put(&fde)?;
+            for &c in &unique_centroids {
+                s.postings[c as usize].insert(id.clone());
+            }
+            s.documents.insert(
+                id,
+                DocumentRecord {
+                    centroid_ids: ids,
+                    unique_centroids,
+                    location,
+                    fde_location,
+                    metadata: document.metadata,
+                    tokens: vectors.len(),
+                    compressed_bytes: size,
+                },
+            );
+        }
+        self.persist(&s)
+    }
+    pub fn delete(&self, id: &str) -> Result<bool, IndexError> {
+        let mut s = self.state.write().unwrap();
+        if let Some(d) = s.documents.remove(id) {
+            for c in d.unique_centroids {
+                s.postings[c as usize].remove(id);
+            }
+            self.persist(&s)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    /// PLAID centroid interaction -> inverted-list candidate generation -> residual MaxSim.
+    pub fn query(
+        &self,
+        vectors: &[Vector],
+        top_k: usize,
+        candidates: Option<usize>,
+    ) -> Result<Vec<Hit>, IndexError> {
+        self.validate(vectors)?;
+        if top_k == 0 {
+            return Err(IndexError::Invalid("top_k must be positive".into()));
+        }
+        let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
+        let approximate = self.exact_fde_scores(&normalized)?;
+        let s = self.state.read().unwrap();
+        self.rescore(&s, &normalized, approximate, top_k, candidates)
+    }
+    /// Generate broad FDE candidates, prune with centroid-only MaxSim, then
+    /// decode residuals only for the surviving documents.
+    pub fn query_with_centroid_pruning(
+        &self,
+        vectors: &[Vector],
+        top_k: usize,
+        candidates: usize,
+        rerank_candidates: usize,
+    ) -> Result<Vec<Hit>, IndexError> {
+        self.validate(vectors)?;
+        check_pruning_shape(top_k, candidates, rerank_candidates)?;
+        let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
+        let approximate = self.exact_fde_scores(&normalized)?;
+        let s = self.state.read().unwrap();
+        self.prune_and_rescore(&s, &normalized, approximate, top_k, candidates, rerank_candidates)
+    }
+    /// Same pipeline as `query_with_centroid_pruning`, but pulls the broad
+    /// candidate set from the FDE HNSW graph instead of the exact FDE scan.
+    pub fn query_with_fde_ann_and_pruning(
+        &self,
+        vectors: &[Vector],
+        top_k: usize,
+        candidates: usize,
+        rerank_candidates: usize,
+        ef_search: usize,
+    ) -> Result<Vec<Hit>, IndexError> {
+        self.validate(vectors)?;
+        if ef_search == 0 {
+            return Err(IndexError::Invalid("ef_search must be positive".into()));
+        }
+        check_pruning_shape(top_k, candidates, rerank_candidates)?;
+        let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
+        let query_fde = self.fde.encode_query(&normalized);
+        let s = self.state.read().unwrap();
+        let approximate = self.ann_fde_scores(&s, &query_fde, candidates, ef_search)?;
+        self.prune_and_rescore(&s, &normalized, approximate, top_k, candidates, rerank_candidates)
+    }
+    fn prune_and_rescore(
+        &self,
+        s: &State,
+        normalized: &[Vector],
+        approximate: Vec<(String, f32)>,
+        top_k: usize,
+        candidates: usize,
+        rerank_candidates: usize,
+    ) -> Result<Vec<Hit>, IndexError> {
+        let broad: Vec<_> = approximate.into_iter().take(candidates).collect();
+        let pruned = centroid_prune(s, normalized, broad, rerank_candidates);
+        self.rescore(s, normalized, pruned, top_k, Some(rerank_candidates))
+    }
+    fn exact_fde_scores(&self, normalized: &[Vector]) -> Result<Vec<(String, f32)>, IndexError> {
+        let query_fde = self.fde.encode_query(normalized);
+        let s = self.state.read().unwrap();
+        let mapped_fdes = self.fde_store.map()?;
+        let fde_dimension = self.fde.output_dimension();
+        let approximate_results: Result<Vec<_>, io::Error> = s
+            .documents
+            .par_iter()
+            .map(|(id, record)| {
+                Ok((
+                    id.clone(),
+                    dot(
+                        &query_fde,
+                        FixedVectorStore::get(&mapped_fdes, record.fde_location, fde_dimension)?,
+                    ),
+                ))
+            })
+            .collect();
+        let mut approximate = approximate_results?;
+        approximate.par_sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(approximate)
+    }
+    /// Return exact FDE candidates before compressed MaxSim reranking.
+    pub fn exact_fde_candidates(
+        &self,
+        vectors: &[Vector],
+        count: usize,
+    ) -> Result<Vec<CandidateHit>, IndexError> {
+        self.validate(vectors)?;
+        if count == 0 {
+            return Err(IndexError::Invalid(
+                "candidate count must be positive".into(),
+            ));
+        }
+        let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
+        Ok(self
+            .exact_fde_scores(&normalized)?
+            .into_iter()
+            .take(count)
+            .map(|(id, score)| CandidateHit { id, score })
+            .collect())
+    }
+    /// Build an HNSW index over persisted FDEs. Exact FDE scan remains available as an oracle.
+    pub fn build_fde_ann(&self, m: usize, ef_construct: usize) -> Result<usize, IndexError> {
+        if m == 0 || ef_construct == 0 {
+            return Err(IndexError::Invalid(
+                "HNSW m and ef_construct must be positive".into(),
+            ));
+        }
+        let s = self.state.read().unwrap();
+        let dimension = self.fde.output_dimension();
+        let mapped = self.fde_store.map()?;
+        let mut ids: Vec<_> = s.documents.keys().cloned().collect();
+        ids.sort();
+        let mut hnsw = HNSWIndex::new(DistanceMetric::Dot, m, ef_construct, 16, dimension);
+        for (point, id) in ids.iter().enumerate() {
+            let vector =
+                FixedVectorStore::get(&mapped, s.documents[id].fde_location, dimension)?.to_vec();
+            hnsw.insert(point as u64, vector)
+                .map_err(|error| IndexError::Invalid(format!("HNSW insert failed: {error}")))?;
+        }
+        drop(s);
+        let mut s = self.state.write().unwrap();
+        s.fde_ann = Some(Arc::new(hnsw));
+        s.fde_ann_ids = ids;
+        Ok(s.fde_ann_ids.len())
+    }
+    pub fn query_with_fde_ann(
+        &self,
+        vectors: &[Vector],
+        top_k: usize,
+        candidates: Option<usize>,
+        ef_search: usize,
+    ) -> Result<Vec<Hit>, IndexError> {
+        self.validate(vectors)?;
+        if top_k == 0 || ef_search == 0 {
+            return Err(IndexError::Invalid(
+                "top_k and ef_search must be positive".into(),
+            ));
+        }
+        let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
+        let query_fde = self.fde.encode_query(&normalized);
+        let s = self.state.read().unwrap();
+        let count = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
+        let approximate = self.ann_fde_scores(&s, &query_fde, count, ef_search)?;
+        self.rescore(&s, &normalized, approximate, top_k, candidates)
+    }
+    fn ann_fde_scores(
+        &self,
+        s: &State,
+        query_fde: &Vector,
+        count: usize,
+        ef_search: usize,
+    ) -> Result<Vec<(String, f32)>, IndexError> {
+        let ann = s.fde_ann.as_ref().ok_or_else(|| {
+            IndexError::Invalid("FDE ANN is not built; call /v1/fde/index".into())
+        })?;
+        let options = SearchRuntimeOptions {
+            ef_search: Some(ef_search.max(count)),
+            ..SearchRuntimeOptions::default()
+        };
+        let points = ann
+            .search_with_options(query_fde, count, &options)
+            .map_err(|error| IndexError::Invalid(format!("HNSW search failed: {error}")))?;
+        points
+            .into_iter()
+            .map(|point| {
+                let id = s
+                    .fde_ann_ids
+                    .get(point.id as usize)
+                    .ok_or_else(|| IndexError::Invalid("invalid HNSW point id".into()))?;
+                Ok((id.clone(), -point.sort_key))
+            })
+            .collect::<Result<Vec<_>, IndexError>>()
+    }
+    /// Return HNSW FDE candidates before compressed MaxSim reranking.
+    pub fn ann_fde_candidates(
+        &self,
+        vectors: &[Vector],
+        count: usize,
+        ef_search: usize,
+    ) -> Result<Vec<CandidateHit>, IndexError> {
+        self.validate(vectors)?;
+        if count == 0 || ef_search == 0 {
+            return Err(IndexError::Invalid(
+                "candidate count and ef_search must be positive".into(),
+            ));
+        }
+        let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
+        let query_fde = self.fde.encode_query(&normalized);
+        let s = self.state.read().unwrap();
+        Ok(self
+            .ann_fde_scores(&s, &query_fde, count, ef_search)?
+            .into_iter()
+            .map(|(id, score)| CandidateHit { id, score })
+            .collect())
+    }
+    pub fn query_with_probes(
+        &self,
+        vectors: &[Vector],
+        top_k: usize,
+        candidates: Option<usize>,
+        probes: usize,
+    ) -> Result<Vec<Hit>, IndexError> {
+        self.validate(vectors)?;
+        if top_k == 0 {
+            return Err(IndexError::Invalid("top_k must be positive".into()));
+        }
+        let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
+        let s = self.state.read().unwrap();
+        if s.codebook.is_empty() {
+            return Err(IndexError::Invalid("index is untrained".into()));
+        }
+        // Compute Q x C once; all later centroid interaction is a table lookup.
+        let interaction: Vec<Vec<f32>> = normalized
+            .iter()
+            .map(|q| s.codebook.iter().map(|c| dot(q, c)).collect())
+            .collect();
+        let mut selected = HashSet::new();
+        for row in &interaction {
+            let mut scored: Vec<_> = row.iter().copied().enumerate().collect();
+            scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+            for &(c, _) in scored.iter().take(probes.max(1)) {
+                selected.insert(c);
+            }
+        }
+        let mut candidate_ids = HashSet::new();
+        for c in selected {
+            candidate_ids.extend(s.postings[c].iter().cloned());
+        }
+        let mut approx: Vec<_> = candidate_ids
+            .into_iter()
+            .map(|id| {
+                let d = &s.documents[&id];
+                let score = interaction
+                    .iter()
+                    .map(|row| {
+                        d.unique_centroids
+                            .iter()
+                            .map(|&c| row[c as usize])
+                            .fold(f32::NEG_INFINITY, f32::max)
+                    })
+                    .sum::<f32>();
+                (id, score)
+            })
+            .collect();
+        approx.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        self.rescore(&s, &normalized, approx, top_k, candidates)
+    }
+    fn rescore(
+        &self,
+        s: &State,
+        normalized: &[Vector],
+        approximate: Vec<(String, f32)>,
+        top_k: usize,
+        candidates: Option<usize>,
+    ) -> Result<Vec<Hit>, IndexError> {
+        let count = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
+        let mapped = self.objects.map()?;
+        let mut hits = approximate
+            .par_iter()
+            .take(count)
+            .map(|(id, _)| -> Result<Hit, io::Error> {
+                let record = &s.documents[id];
+                let doc = CompressedVectorStore::decode(
+                    &mapped,
+                    record.location,
+                    &s.codebook,
+                    &s.residual_codebook,
+                )?;
+                Ok(Hit {
+                    id: id.clone(),
+                    score: maxsim_flat(normalized, &doc.values, doc.dimension),
+                    metadata: record.metadata.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, io::Error>>()?;
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+        hits.truncate(top_k);
+        Ok(hits)
+    }
+    pub fn stats(&self) -> IndexStats {
+        let s = self.state.read().unwrap();
+        IndexStats {
+            documents: s.documents.len(),
+            token_vectors: s.documents.values().map(|d| d.tokens).sum(),
+            compressed_bytes: s.documents.values().map(|d| d.compressed_bytes).sum(),
+            centroids: s.codebook.len(),
+            residual_bits: self.config.residual_bits,
+            trained: !s.codebook.is_empty(),
+            fde_dimension: self.fde.output_dimension(),
+            fde_ann_nodes: s.fde_ann_ids.len(),
+        }
+    }
+    /// Diagnostic score over caller-provided vectors; used to verify scorer parity.
+    pub fn score_uncompressed(
+        &self,
+        query: &[Vector],
+        document: &[Vector],
+    ) -> Result<f32, IndexError> {
+        self.validate(query)?;
+        self.validate(document)?;
+        let query: Vec<_> = query.iter().map(|v| normalize(v)).collect();
+        let document: Vec<_> = document.iter().map(|v| normalize(v)).collect();
+        let flat: Vec<_> = document.into_iter().flatten().collect();
+        Ok(maxsim_flat(&query, &flat, self.config.dimension))
+    }
+    /// Diagnostic score over the actual compressed bytes stored for a document.
+    pub fn score_compressed(&self, query: &[Vector], id: &str) -> Result<f32, IndexError> {
+        self.validate(query)?;
+        let query: Vec<_> = query.iter().map(|v| normalize(v)).collect();
+        let s = self.state.read().unwrap();
+        let record = s
+            .documents
+            .get(id)
+            .ok_or_else(|| IndexError::Invalid(format!("unknown document: {id}")))?;
+        let mapped = self.objects.map()?;
+        let document = CompressedVectorStore::decode(
+            &mapped,
+            record.location,
+            &s.codebook,
+            &s.residual_codebook,
+        )?;
+        Ok(maxsim_flat(&query, &document.values, document.dimension))
+    }
+}
+
+fn check_pruning_shape(
+    top_k: usize,
+    candidates: usize,
+    rerank_candidates: usize,
+) -> Result<(), IndexError> {
+    if top_k == 0 || rerank_candidates < top_k || candidates < rerank_candidates {
+        return Err(IndexError::Invalid(
+            "require top_k > 0 and candidates >= rerank_candidates >= top_k".into(),
+        ));
+    }
+    Ok(())
+}
+fn centroid_prune(
+    s: &State,
+    query: &[Vector],
+    candidates: Vec<(String, f32)>,
+    survivors: usize,
+) -> Vec<(String, f32)> {
+    let interaction: Vec<Vec<f32>> = query
+        .iter()
+        .map(|q| s.codebook.iter().map(|centroid| dot(q, centroid)).collect())
+        .collect();
+    let mut scored: Vec<_> = candidates
+        .into_par_iter()
+        .map(|(id, _)| {
+            let document = &s.documents[&id];
+            let score = interaction
+                .iter()
+                .map(|row| {
+                    document
+                        .unique_centroids
+                        .iter()
+                        .map(|&centroid| row[centroid as usize])
+                        .fold(f32::NEG_INFINITY, f32::max)
+                })
+                .sum::<f32>();
+            (id, score)
+        })
+        .collect();
+    scored.par_sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    scored.truncate(survivors);
+    scored
+}
+fn nearest(vector: &Vector, centroids: &[Vector]) -> usize {
+    centroids
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| distance(vector, a).total_cmp(&distance(vector, b)))
+        .unwrap()
+        .0
+}
+fn distance(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+}
+fn train_scalar_codebook(values: &[f32], levels: usize, iterations: usize) -> Vec<f32> {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+    let mut centers: Vec<_> = (0..levels)
+        .map(|i| sorted[((2 * i + 1) * sorted.len() / (2 * levels)).min(sorted.len() - 1)])
+        .collect();
+    for _ in 0..iterations {
+        let mut sums = vec![0.; levels];
+        let mut counts = vec![0usize; levels];
+        for &value in values {
+            let index = centers
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| (value - **a).abs().total_cmp(&(value - **b).abs()))
+                .unwrap()
+                .0;
+            sums[index] += value;
+            counts[index] += 1;
+        }
+        for i in 0..levels {
+            if counts[i] > 0 {
+                centers[i] = sums[i] / counts[i] as f32;
+            }
+        }
+    }
+    centers.sort_unstable_by(|a, b| a.total_cmp(b));
+    centers
+}

@@ -657,24 +657,67 @@ impl MultiVectorIndex {
     ) -> Result<Vec<Hit>, IndexError> {
         let count = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
         let mapped = self.objects.map()?;
+        // Per-stage timing accumulators, gated by MULTIVECTOR_TIMING. Cached
+        // in a OnceLock so a live server pays the env::var HashMap lookup
+        // exactly once, not per rescoring call.
+        use std::sync::OnceLock;
+        static TIMING: OnceLock<bool> = OnceLock::new();
+        let timing = *TIMING.get_or_init(|| std::env::var("MULTIVECTOR_TIMING").is_ok());
+        let decode_ns = std::sync::atomic::AtomicU64::new(0);
+        let maxsim_ns = std::sync::atomic::AtomicU64::new(0);
         let mut hits = approximate
             .par_iter()
             .take(count)
             .map(|(id, _)| -> Result<Hit, io::Error> {
                 let record = &s.documents[id];
+                let t0 = if timing {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 let doc = CompressedVectorStore::decode(
                     &mapped,
                     record.location,
                     &s.codebook,
                     &s.residual_codebook,
                 )?;
+                let t1 = if timing {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let score = maxsim_flat(normalized, &doc.values, doc.dimension);
+                let t2 = if timing {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+                    decode_ns.fetch_add(
+                        t1.duration_since(t0).as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    maxsim_ns.fetch_add(
+                        t2.duration_since(t1).as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
                 Ok(Hit {
                     id: id.clone(),
-                    score: maxsim_flat(normalized, &doc.values, doc.dimension),
+                    score,
                     metadata: record.metadata.clone(),
                 })
             })
             .collect::<Result<Vec<_>, io::Error>>()?;
+        if timing {
+            let d = decode_ns.load(std::sync::atomic::Ordering::Relaxed);
+            let m = maxsim_ns.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[timing] candidates={count} decode_us={} maxsim_us={} (per-thread aggregate)",
+                d / 1000,
+                m / 1000
+            );
+        }
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
         hits.truncate(top_k);
         Ok(hits)

@@ -9,10 +9,10 @@ pub fn normalize(vector: &[f32]) -> Vector {
     }
 }
 
-/// Scalar dot product. Kept as a portable fallback; hot paths route through the
-/// architecture-specific kernels below.
+/// Scalar dot product. Kept as a portable fallback and used for tail elements
+/// past the SIMD-aligned prefix.
 #[inline]
-pub fn dot(left: &[f32], right: &[f32]) -> f32 {
+fn dot_scalar(left: &[f32], right: &[f32]) -> f32 {
     debug_assert_eq!(left.len(), right.len());
     let n = left.len().min(right.len());
     let mut s = 0.0f32;
@@ -20,6 +20,30 @@ pub fn dot(left: &[f32], right: &[f32]) -> f32 {
         s += left[i] * right[i];
     }
     s
+}
+
+/// Public dot product with architecture dispatch. Routes to a NEON FMA
+/// implementation on aarch64 for the multiple-of-16 prefix and mops up the
+/// tail with the scalar path. Every hot path in the crate (FDE exhaustive
+/// scan, MaxSim rescoring) goes through this — reason enough to keep the
+/// dispatch cheap.
+#[inline]
+pub fn dot(left: &[f32], right: &[f32]) -> f32 {
+    debug_assert_eq!(left.len(), right.len());
+    let n = left.len().min(right.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        let prefix = n & !15;
+        if prefix >= 16 {
+            // SAFETY: prefix is a multiple of 16 and prefix <= n <= left.len().
+            let head = unsafe { dot_neon_multiple_of_16(left.as_ptr(), right.as_ptr(), prefix) };
+            if prefix == n {
+                return head;
+            }
+            return head + dot_scalar(&left[prefix..n], &right[prefix..n]);
+        }
+    }
+    dot_scalar(&left[..n], &right[..n])
 }
 
 /// NEON FP32 dot product for a length that is a multiple of 16.

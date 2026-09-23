@@ -30,21 +30,56 @@ from env import load_env
 
 
 def evaluate(qrels, run, k=10):
+    """Return aggregate {nDCG@10, R@10} plus per-query series so callers can
+    plot tail distributions or feed a recall-difficulty analysis."""
     ndcg = []
     recall = []
+    per_query = []
     for qid, relevant in qrels.items():
         ranked = run.get(qid, [])[:k]
         gains = [relevant.get(doc, 0) for doc in ranked]
         dcg = sum((2**g - 1) / math.log2(i + 2) for i, g in enumerate(gains))
         ideal = sorted(relevant.values(), reverse=True)[:k]
         idcg = sum((2**g - 1) / math.log2(i + 2) for i, g in enumerate(ideal))
-        ndcg.append(dcg / idcg if idcg else 0)
+        q_ndcg = float(dcg / idcg) if idcg else 0.0
         wanted = {doc for doc, g in relevant.items() if g > 0}
-        recall.append(len(wanted.intersection(ranked)) / len(wanted) if wanted else 0)
+        q_recall = float(len(wanted.intersection(ranked)) / len(wanted)) if wanted else 0.0
+        ndcg.append(q_ndcg)
+        recall.append(q_recall)
+        per_query.append({"qid": qid, "ndcg@10": q_ndcg, "recall@10": q_recall})
     return {
         "ndcg@10": float(np.mean(ndcg)),
         "recall@10": float(np.mean(recall)),
+        # p10 / p01 of per-query nDCG — reframes benchmarks on tail quality
+        # rather than just the mean. A high mean can hide a fat left tail.
+        "ndcg@10_p10": float(np.percentile(ndcg, 10)),
+        "ndcg@10_p01": float(np.percentile(ndcg, 1)),
+        "recall@10_p10": float(np.percentile(recall, 10)),
+        "recall@10_p01": float(np.percentile(recall, 1)),
+        "queries_meeting_ndcg_0_5": float(np.mean([1 if n >= 0.5 else 0 for n in ndcg])),
+        "queries_meeting_recall_0_8": float(np.mean([1 if r >= 0.8 else 0 for r in recall])),
+        "per_query": per_query,
     }
+
+
+def merge_latency(scores, qids, times_s, per_query_extra=None):
+    """Merge per-query latency + optional extra features (top score, top-vs-2nd
+    margin) into scores['per_query']. Keeps aggregate percentiles too."""
+    times_ms = [t * 1000.0 for t in times_s]
+    by_qid = {q["qid"]: q for q in scores["per_query"]}
+    for qid, t_ms in zip(qids, times_ms):
+        entry = by_qid.get(qid)
+        if entry is not None:
+            entry["latency_ms"] = float(t_ms)
+    if per_query_extra:
+        for qid, extra in per_query_extra.items():
+            entry = by_qid.get(qid)
+            if entry is not None:
+                entry.update(extra)
+    scores["p50_ms"] = float(np.percentile(times_ms, 50))
+    scores["p95_ms"] = float(np.percentile(times_ms, 95))
+    scores["p99_ms"] = float(np.percentile(times_ms, 99))
+    return scores
 
 
 def http(base, route, body=None):
@@ -107,9 +142,14 @@ def bench_annex_multivector(docs, queries, multi_docs, multi_queries, qrels, wor
             })
         build_s = time.perf_counter() - build_t0
 
-        # Query
+        # Query. Record per-query extras: top hit score and top-vs-2nd margin.
+        # These are the two cheapest per-query difficulty signals — small
+        # margin means the top candidate is close to the runners-up, which
+        # correlates with "this query is hard, we might need more candidates".
         run = {}
         times = []
+        extras = {}
+        qids = []
         for q, v in zip(queries, multi_queries):
             t0 = time.perf_counter()
             result = http(base, "/v1/query", {
@@ -118,19 +158,24 @@ def bench_annex_multivector(docs, queries, multi_docs, multi_queries, qrels, wor
                 "candidates": candidates,
             })
             times.append(time.perf_counter() - t0)
-            run[q.query_id] = [x["id"] for x in result["matches"]]
+            qids.append(q.query_id)
+            matches = result["matches"]
+            run[q.query_id] = [x["id"] for x in matches]
+            top_score = float(matches[0]["score"]) if matches else 0.0
+            second_score = float(matches[1]["score"]) if len(matches) > 1 else top_score
+            extras[q.query_id] = {
+                "top_score": top_score,
+                "top_minus_second": top_score - second_score,
+                "returned": len(matches),
+            }
     finally:
         server.terminate()
         server.wait(timeout=30)
 
     scores = evaluate(qrels, run)
-    return {
-        **scores,
-        "p50_ms": float(np.percentile(times, 50) * 1000),
-        "p95_ms": float(np.percentile(times, 95) * 1000),
-        "p99_ms": float(np.percentile(times, 99) * 1000),
-        "build_s": build_s,
-    }
+    scores = merge_latency(scores, qids, times, extras)
+    scores["build_s"] = build_s
+    return scores
 
 
 def bench_qdrant(docs, queries, multi_docs, multi_queries, qrels):
@@ -174,6 +219,8 @@ def bench_qdrant(docs, queries, multi_docs, multi_queries, qrels):
     # Query
     run = {}
     times = []
+    qids = []
+    extras = {}
     for q, v in zip(queries, multi_queries):
         t0 = time.perf_counter()
         result = client.query_points(
@@ -183,16 +230,21 @@ def bench_qdrant(docs, queries, multi_docs, multi_queries, qrels):
             with_payload=True,
         )
         times.append(time.perf_counter() - t0)
-        run[q.query_id] = [p.payload["doc_id"] for p in result.points]
+        qids.append(q.query_id)
+        pts = result.points
+        run[q.query_id] = [p.payload["doc_id"] for p in pts]
+        top_score = float(pts[0].score) if pts else 0.0
+        second_score = float(pts[1].score) if len(pts) > 1 else top_score
+        extras[q.query_id] = {
+            "top_score": top_score,
+            "top_minus_second": top_score - second_score,
+            "returned": len(pts),
+        }
 
     scores = evaluate(qrels, run)
-    return {
-        **scores,
-        "p50_ms": float(np.percentile(times, 50) * 1000),
-        "p95_ms": float(np.percentile(times, 95) * 1000),
-        "p99_ms": float(np.percentile(times, 99) * 1000),
-        "build_s": build_s,
-    }
+    scores = merge_latency(scores, qids, times, extras)
+    scores["build_s"] = build_s
+    return scores
 
 
 def bench_lancedb(docs, queries, multi_docs, multi_queries, qrels):
@@ -234,21 +286,19 @@ def bench_lancedb(docs, queries, multi_docs, multi_queries, qrels):
 
     run = {}
     times = []
+    qids = []
     for q, qv in zip(queries, query_means):
         t0 = time.perf_counter()
         result = table.search(qv.tolist()).limit(100).to_list()
         times.append(time.perf_counter() - t0)
+        qids.append(q.query_id)
         run[q.query_id] = [row["doc_id"] for row in result]
 
     scores = evaluate(qrels, run)
-    return {
-        **scores,
-        "p50_ms": float(np.percentile(times, 50) * 1000),
-        "p95_ms": float(np.percentile(times, 95) * 1000),
-        "p99_ms": float(np.percentile(times, 99) * 1000),
-        "build_s": build_s,
-        "note": "LanceDB row is mean-pool dense baseline, NOT late-interaction MaxSim",
-    }
+    scores = merge_latency(scores, qids, times)
+    scores["build_s"] = build_s
+    scores["note"] = "LanceDB row is mean-pool dense baseline, NOT late-interaction MaxSim"
+    return scores
 
 
 def main():
@@ -311,12 +361,16 @@ def main():
     print()
     print(f"wrote {out_path}")
     print()
-    print(f"{'system':<24} {'nDCG@10':>8} {'R@10':>7} {'p50 ms':>8} {'p95 ms':>8} {'build s':>8}")
-    print("-" * 72)
+    print(
+        f"{'system':<24} {'nDCG@10':>8} {'p10-nDCG':>9} {'R@10':>7} "
+        f"{'>=0.5':>6} {'p50 ms':>7} {'p95 ms':>7} {'build s':>8}"
+    )
+    print("-" * 82)
     for name, s in results["systems"].items():
         print(
-            f"{name:<24} {s.get('ndcg@10', 0):>8.4f} {s.get('recall@10', 0):>7.4f} "
-            f"{s.get('p50_ms', 0):>8.2f} {s.get('p95_ms', 0):>8.2f} {s.get('build_s', 0):>8.2f}"
+            f"{name:<24} {s.get('ndcg@10', 0):>8.4f} {s.get('ndcg@10_p10', 0):>9.4f} "
+            f"{s.get('recall@10', 0):>7.4f} {s.get('queries_meeting_ndcg_0_5', 0):>6.1%} "
+            f"{s.get('p50_ms', 0):>7.2f} {s.get('p95_ms', 0):>7.2f} {s.get('build_s', 0):>8.2f}"
         )
         if s.get("note"):
             print(f"    note: {s['note']}")

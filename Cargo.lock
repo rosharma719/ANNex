@@ -62,6 +62,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "annex-server"
+version = "0.1.0"
+dependencies = [
+ "annex-core",
+ "axum",
+ "bytemuck",
+ "clap",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "anstream"
 version = "0.6.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"

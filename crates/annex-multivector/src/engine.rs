@@ -3,6 +3,10 @@ use crate::{
     muvera::FdeEncoder,
     storage::{CompressedVectorStore, FixedVectorStore, ObjectLocation, atomic_write},
 };
+use annex::{
+    utils::types::DistanceMetric,
+    vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,10 +18,6 @@ use std::{
     sync::RwLock,
 };
 use thiserror::Error;
-use annex::{
-    utils::types::DistanceMetric,
-    vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
-};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct IndexConfig {
@@ -393,7 +393,14 @@ impl MultiVectorIndex {
         let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
         let approximate = self.exact_fde_scores(&normalized)?;
         let s = self.state.read().unwrap();
-        self.prune_and_rescore(&s, &normalized, approximate, top_k, candidates, rerank_candidates)
+        self.prune_and_rescore(
+            &s,
+            &normalized,
+            approximate,
+            top_k,
+            candidates,
+            rerank_candidates,
+        )
     }
     /// Same pipeline as `query_with_centroid_pruning`, but pulls the broad
     /// candidate set from the FDE HNSW graph instead of the exact FDE scan.
@@ -414,7 +421,14 @@ impl MultiVectorIndex {
         let query_fde = self.fde.encode_query(&normalized);
         let s = self.state.read().unwrap();
         let approximate = self.ann_fde_scores(&s, &query_fde, candidates, ef_search)?;
-        self.prune_and_rescore(&s, &normalized, approximate, top_k, candidates, rerank_candidates)
+        self.prune_and_rescore(
+            &s,
+            &normalized,
+            approximate,
+            top_k,
+            candidates,
+            rerank_candidates,
+        )
     }
     fn prune_and_rescore(
         &self,
@@ -483,12 +497,27 @@ impl MultiVectorIndex {
         let mapped = self.fde_store.map()?;
         let mut ids: Vec<_> = s.documents.keys().cloned().collect();
         ids.sort();
-        let mut hnsw = HNSWIndex::new(DistanceMetric::Dot, m, ef_construct, 16, dimension);
-        for (point, id) in ids.iter().enumerate() {
-            let vector =
-                FixedVectorStore::get(&mapped, s.documents[id].fde_location, dimension)?.to_vec();
-            hnsw.insert(point as u64, vector)
-                .map_err(|error| IndexError::Invalid(format!("HNSW insert failed: {error}")))?;
+        let hnsw = HNSWIndex::new(DistanceMetric::Dot, m, ef_construct, 16, dimension);
+        // Build in chunks so peak memory stays bounded regardless of corpus
+        // size (each chunk holds only its own decoded vectors). Each chunk is
+        // handed to par_insert_batch, which uses annex-core's concurrent
+        // &self insert path to parallelise linking across threads.
+        const CHUNK: usize = 4096;
+        for (chunk_idx, chunk_ids) in ids.chunks(CHUNK).enumerate() {
+            let base = chunk_idx * CHUNK;
+            let entries: Vec<(u64, Vec<f32>)> = chunk_ids
+                .iter()
+                .enumerate()
+                .map(|(offset, id)| {
+                    let vector =
+                        FixedVectorStore::get(&mapped, s.documents[id].fde_location, dimension)?
+                            .to_vec();
+                    Ok::<_, IndexError>(((base + offset) as u64, vector))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            hnsw.par_insert_batch(&entries).map_err(|error| {
+                IndexError::Invalid(format!("HNSW par_insert_batch failed: {error}"))
+            })?;
         }
         drop(s);
         let mut s = self.state.write().unwrap();

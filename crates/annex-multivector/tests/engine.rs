@@ -79,13 +79,7 @@ fn late_interaction_persists_and_ranks() {
     );
     assert_eq!(
         index
-            .query_with_fde_ann_and_pruning(
-                &[vec![1., 0., 0.], vec![0., 1., 0.]],
-                1,
-                2,
-                1,
-                16,
-            )
+            .query_with_fde_ann_and_pruning(&[vec![1., 0., 0.], vec![0., 1., 0.]], 1, 2, 1, 16,)
             .unwrap()[0]
             .id,
         "code"

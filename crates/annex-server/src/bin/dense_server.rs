@@ -5,6 +5,10 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use annex::{
+    utils::types::DistanceMetric,
+    vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
+};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
@@ -15,10 +19,6 @@ use clap::Parser;
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use annex::{
-    utils::types::DistanceMetric,
-    vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
-};
 
 #[derive(Parser)]
 #[command(version)]
@@ -127,16 +127,26 @@ async fn build(
         ));
     }
     let state_read = state.read().unwrap();
-    let mut index = HNSWIndex::new(
+    let index = HNSWIndex::new(
         DistanceMetric::Dot,
         body.m,
         body.ef_construct,
         16,
         state_read.dimension,
     );
-    for (point, vector) in state_read.vectors.iter().enumerate() {
+    // Parallel build via annex-core's concurrent &self insert path. Chunked
+    // so peak memory stays bounded even for very large corpora.
+    const CHUNK: usize = 4096;
+    for chunk in state_read.vectors.chunks(CHUNK).enumerate() {
+        let (chunk_idx, chunk_vectors) = chunk;
+        let base = chunk_idx * CHUNK;
+        let entries: Vec<(u64, Vec<f32>)> = chunk_vectors
+            .iter()
+            .enumerate()
+            .map(|(offset, v)| ((base + offset) as u64, v.clone()))
+            .collect();
         index
-            .insert(point as u64, vector.clone())
+            .par_insert_batch(&entries)
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     }
     fs::create_dir_all(&state_read.path)

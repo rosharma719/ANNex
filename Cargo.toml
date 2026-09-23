@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/annex-core",
     "crates/annex-multivector",
+    "crates/annex-server",
 ]
 
 [profile.release]

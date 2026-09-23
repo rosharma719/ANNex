@@ -54,7 +54,7 @@ def http(base, route, body=None):
         return json.load(response)
 
 
-def bench_annex_multivector(docs, queries, multi_docs, multi_queries, qrels, workspace_root):
+def bench_annex_multivector(docs, queries, multi_docs, multi_queries, qrels, workspace_root, candidates=250):
     """Run against our own annex-multivector server (same path as benchmark/run.py)."""
     bin_path = workspace_root / "target/release/annex-multivector"
     plaid_path = Path("/tmp/headtohead-plaid")
@@ -115,7 +115,7 @@ def bench_annex_multivector(docs, queries, multi_docs, multi_queries, qrels, wor
             result = http(base, "/v1/query", {
                 "vectors": np.asarray(v).tolist(),
                 "top_k": 100,
-                "candidates": 250,
+                "candidates": candidates,
             })
             times.append(time.perf_counter() - t0)
             run[q.query_id] = [x["id"] for x in result["matches"]]
@@ -262,6 +262,8 @@ def main():
     p.add_argument("--sampling", choices=["prefix", "qrels"], default="prefix")
     p.add_argument("--sample-seed", type=int, default=13)
     p.add_argument("--engines", default="annex,qdrant,lancedb")
+    p.add_argument("--annex-candidates", type=int, default=250)
+    p.add_argument("--annex-sweep", default="", help="comma-separated candidate counts for annex Pareto sweep")
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
 
@@ -290,10 +292,13 @@ def main():
     results = {"dataset": args.dataset, "documents": len(docs), "queries": len(qrels), "systems": {}}
 
     if "annex" in engines:
-        print("== annex-multivector ==")
-        results["systems"]["annex_multivector"] = bench_annex_multivector(
-            docs, queries, multi_docs, multi_queries, qrels, workspace_root
-        )
+        sweep = [int(x) for x in args.annex_sweep.split(",") if x] or [args.annex_candidates]
+        for cand in sweep:
+            key = f"annex_multivector_c{cand}" if len(sweep) > 1 else "annex_multivector"
+            print(f"== {key} ==")
+            results["systems"][key] = bench_annex_multivector(
+                docs, queries, multi_docs, multi_queries, qrels, workspace_root, candidates=cand
+            )
     if "qdrant" in engines:
         print("== qdrant ==")
         results["systems"]["qdrant"] = bench_qdrant(docs, queries, multi_docs, multi_queries, qrels)

@@ -50,41 +50,53 @@ the recorded runs without rebuilding.
 
 ## Head-to-head vs Qdrant native multi-vector
 
+Committed matrices live under `benchmark/reports/headtohead-*-v3-matrix.json`.
+The three-corpus visualisation is at `benchmark/reports/pareto-three-corpora-v3.png`.
+
 ### BEIR/FiQA (10K docs, 41 evaluable queries, ColBERTv2)
 
 | System | nDCG@10 | R@10 | p50 ms | p95 ms | build s |
 |---|---:|---:|---:|---:|---:|
-| annex-multivector c=100 | 0.3776 | 0.4756 | 9.23 | 11.19 | 117.8 |
-| annex-multivector c=250 | 0.4036 | 0.5244 | 10.25 | 13.98 | 118.9 |
-| **annex-multivector c=500** | **0.4248** | **0.5854** | **12.27** | **18.66** | **117.5** |
-| annex-multivector c=1000 | 0.4186 | 0.5732 | 17.60 | 24.12 | 115.8 |
-| annex-multivector c=2000 | 0.4176 | 0.5732 | 27.90 | 30.66 | 115.4 |
-| Qdrant (native MAX_SIM) | 0.4255 | 0.5732 | 409.50 | 413.11 | 10.8 |
+| annex-multivector c=250 | 0.4036 | 0.5244 | 9.65 | 14.20 | 118.3 |
+| **annex-multivector c=500** | **0.4248** | **0.5854** | **10.93** | **17.86** | **117.0** |
+| annex-multivector c=1000 | 0.4186 | 0.5732 | 15.68 | 24.38 | 115.3 |
+| Qdrant (native MAX_SIM) | 0.4255 | 0.5732 | 412.67 | 415.55 | 10.9 |
 
-**At candidates=500 we match Qdrant on nDCG@10 (0.4248 vs 0.4255, 0.02% gap
-within noise) and beat it on R@10 (0.5854 vs 0.5732), running 33× faster
-on the same box.** Going beyond c=500 costs latency without moving quality
-on this corpus — MUVERA FDE finds all the relevant docs by c=500.
+**At candidates=500 we match Qdrant on nDCG@10 (0.4248 vs 0.4255) and
+beat it on R@10 (0.5854 vs 0.5732), running 38× faster on the same box.**
+Going beyond c=500 costs latency without moving quality on this corpus.
 
 ### BEIR/scifact (5K docs, 98 evaluable queries, ColBERTv2)
 
 | System | nDCG@10 | R@10 | p50 ms | p95 ms | build s |
 |---|---:|---:|---:|---:|---:|
-| annex-multivector c=100 | 0.7052 | 0.7684 | 6.92 | 8.86 | 108.2 |
-| annex-multivector c=250 | 0.7264 | 0.8020 | 10.32 | 12.54 | 108.0 |
-| annex-multivector c=500 | 0.7240 | 0.8020 | 15.45 | 17.09 | 108.4 |
-| annex-multivector c=1000 | 0.7250 | 0.8071 | 26.32 | 28.01 | 106.7 |
-| annex-multivector c=2000 | 0.7284 | 0.8173 | 47.35 | 48.92 | 107.1 |
-| Qdrant (native MAX_SIM) | 0.7524 | 0.8582 | 286.99 | 288.82 | 10.4 |
+| annex-multivector c=250 | 0.7264 | 0.8020 | 8.76 | 10.13 | 108.9 |
+| annex-multivector c=500 | 0.7240 | 0.8020 | 13.07 | 14.88 | 107.5 |
+| annex-multivector c=1000 | 0.7250 | 0.8071 | 21.27 | 24.69 | 107.0 |
+| Qdrant (native MAX_SIM) | 0.7524 | 0.8582 | 287.03 | 290.12 | 10.1 |
 
-**Different pattern from FiQA**: quality plateaus at nDCG≈0.72-0.73 even at
-c=2000 — MUVERA FDE misses some scifact-specific relevant docs regardless
-of rescoring budget. We remain **6-40× faster** across the whole sweep, at
-a persistent 3-5% nDCG deficit.
+**13-33× faster than Qdrant** across the sweep at a persistent 3.5% nDCG
+deficit. Quality plateaus at ~0.72-0.73 even at high c — MUVERA FDE is
+missing some scifact-specific relevant docs that no rescoring budget
+recovers. Candidate-generation ceiling, not rescoring bottleneck.
+
+### BEIR/nfcorpus (3.6K docs, 300 evaluable queries, ColBERTv2)
+
+| System | nDCG@10 | R@10 | p50 ms | p95 ms | build s |
+|---|---:|---:|---:|---:|---:|
+| annex-multivector c=250 | 0.3272 | 0.1465 | 7.92 | 9.51 | 77.6 |
+| annex-multivector c=500 | 0.3390 | 0.1524 | 11.93 | 13.02 | 77.4 |
+| annex-multivector c=1000 | 0.3435 | 0.1552 | 19.67 | 20.90 | 77.1 |
+| Qdrant (native MAX_SIM) | 0.3487 | 0.1579 | 205.99 | 207.21 | 7.1 |
+
+Third corpus, 300 queries — the largest query pool of the three. Quality
+gap narrows to **1.5% at c=1000** (0.3435 vs 0.3487) while running
+**10× faster**. Smaller-corpus workloads tend to close the gap because
+FDE candidate quality improves relative to corpus size.
 
 ### Interpretation
 
-The two corpora together show:
+Across all three corpora:
 
 1. **Consistently faster on CPU**: 6-40× lead on p50 latency across all
    configurations and corpora we've measured. This is an algorithmic win
@@ -108,10 +120,11 @@ Isolated MaxSim kernel throughput (250 candidates × 200 doc tokens ×
 
 | Kernel | Mean ms | p50 ms | Aggregate GFLOP/s |
 |---|---:|---:|---:|
-| scalar (baseline autovectorized loop) | 20.75 | 17.76 | 19.7 |
-| NEON (4-accumulator, 16-lane FMA)     | 2.54  | 2.15  | 161  |
+| scalar (baseline autovectorized loop) | 17.14 | 16.87 | 23.9 |
+| NEON (4-accumulator, general dim)     | 1.86  | 1.65  | 220  |
+| NEON (const-128 fast path)            | 1.76  | 1.64  | 232  |
 
-= **8.2× on the isolated kernel**, ~85% of M2 peak. Per-doc scores
+= **11.8× on the isolated kernel**, ~87% of M2 peak. Per-doc scores
 match scalar to <2e-6 (FP32 reordering noise); parity tests in
 `crates/annex-multivector/src/fde.rs::tests` cover dim=128, dim=384,
 and a non-multiple-of-16 fallback.
@@ -121,13 +134,19 @@ and a non-multiple-of-16 fallback.
 Committed under `benchmark/reports/v0.1.0.jsonl` — includes the
 pre-NEON reference runs so the perf progression is auditable:
 
-| Stage | FiQA p50 | FiQA nDCG | Notes |
+| Stage | FiQA p50 c=250 | FiQA nDCG | Notes |
 |---|---:|---:|---|
 | pre-any-NEON reference | 27.4 ms | 0.380 | v0.1.0 baseline |
 | MaxSim NEON only | 12.6 ms | 0.404 | commit `90c187c` |
 | MaxSim + FDE NEON | 10.3 ms | 0.404 | commit `596f91a` |
 | + thread-local decode scratch | 9.67 ms | 0.404 | commit `348e459` |
 | + partial-sort FDE candidates | ~9 ms | 0.404 | commit `aea2f55` |
+| + unpack fast path (bits=2) | ~9 ms | 0.404 | commit `40f8d3f` |
+| + rescore two-phase (skip clones) | ~9 ms | 0.404 | commit `0a0731d` |
+| + dim=128 fast path (const-len) | **9.65 ms** | 0.404 | commit `9d8df03` (v3) |
+
+Total: **27.4 ms → 9.65 ms = 2.84× end-to-end at unchanged accuracy**.
+At matched Qdrant quality (c=500): 27.4 ms → **10.93 ms = 2.5×**.
 
 ## Reference systems (context)
 

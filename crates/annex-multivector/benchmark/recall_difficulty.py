@@ -137,6 +137,30 @@ def analyze(dataset, series):
         print(f"  top_score      → nDCG@10:       pearson={r_top_ndcg:+.3f}")
         print(f"  top-vs-2nd     → nDCG@10:       pearson={r_margin_ndcg:+.3f}")
 
+        # Rank-disagreement signal: if the top-K ids at cheap c differ a lot
+        # from the top-K ids at high c, the candidate pool is unstable — a
+        # richer difficulty signal than just top score / margin. Uses top-10
+        # Jaccard as the cheap approximation. Higher disagreement should
+        # correlate with higher improvement delta if the C thesis holds.
+        if "ranked_ids" in series[cheap][qids[0]]:
+            def jaccard(a, b, k=10):
+                sa = set(a[:k])
+                sb = set(b[:k])
+                if not sa and not sb:
+                    return 1.0
+                return len(sa & sb) / len(sa | sb)
+
+            disagree = np.array([
+                1.0 - jaccard(series[cheap][qid]["ranked_ids"], series[high][qid]["ranked_ids"])
+                for qid in qids
+            ])
+            r_disagree_pearson = pearson(disagree, delta)
+            r_disagree_spearman = spearman(disagree, delta)
+            print()
+            print("Rank-disagreement signal (top-10 Jaccard distance between cheap and high c):")
+            print(f"  disagreement   → improvement:   pearson={r_disagree_pearson:+.3f}  spearman={r_disagree_spearman:+.3f}")
+            print(f"  mean disagreement: {np.mean(disagree):.3f}   queries with any disagreement: {np.mean(disagree > 0):.1%}")
+
         # Decile analysis: bucket queries by top_minus_second, look at
         # how often each bucket benefits from more candidates.
         print()

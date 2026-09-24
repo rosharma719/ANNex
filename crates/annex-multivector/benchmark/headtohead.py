@@ -46,7 +46,15 @@ def evaluate(qrels, run, k=10):
         q_recall = float(len(wanted.intersection(ranked)) / len(wanted)) if wanted else 0.0
         ndcg.append(q_ndcg)
         recall.append(q_recall)
-        per_query.append({"qid": qid, "ndcg@10": q_ndcg, "recall@10": q_recall})
+        # ranked_ids: keep the top-K returned IDs so offline analyses can
+        # compute rank disagreement between two candidate levels (a proxy
+        # for candidate-pool stability / query difficulty).
+        per_query.append({
+            "qid": qid,
+            "ndcg@10": q_ndcg,
+            "recall@10": q_recall,
+            "ranked_ids": list(ranked),
+        })
     return {
         "ndcg@10": float(np.mean(ndcg)),
         "recall@10": float(np.mean(recall)),

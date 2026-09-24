@@ -704,10 +704,18 @@ impl MultiVectorIndex {
             static DECODE_SCRATCH: std::cell::RefCell<Vec<f32>> =
                 const { std::cell::RefCell::new(Vec::new()) };
         }
-        let mut hits = approximate
+        // Two-phase: (1) score every candidate producing only (idx, score),
+        // then (2) pick the top_k and materialise Hit structs only for the
+        // survivors. This avoids cloning id + metadata for the (count -
+        // top_k) candidates that get thrown away after the sort — on a
+        // typical query with candidates=500 and top_k=100 that saves 400
+        // String + Value clones per query.
+        let approximate_slice: &[(String, f32)] = approximate.as_slice();
+        let scored: Vec<(usize, f32)> = approximate_slice
             .par_iter()
             .take(count)
-            .map(|(id, _)| -> Result<Hit, io::Error> {
+            .enumerate()
+            .map(|(idx, (id, _))| -> Result<(usize, f32), io::Error> {
                 let record = &s.documents[id];
                 let t0 = if timing {
                     Some(std::time::Instant::now())
@@ -747,11 +755,7 @@ impl MultiVectorIndex {
                         std::sync::atomic::Ordering::Relaxed,
                     );
                 }
-                Ok(Hit {
-                    id: id.clone(),
-                    score,
-                    metadata: record.metadata.clone(),
-                })
+                Ok((idx, score))
             })
             .collect::<Result<Vec<_>, io::Error>>()?;
         if timing {
@@ -763,8 +767,33 @@ impl MultiVectorIndex {
                 m / 1000
             );
         }
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
-        hits.truncate(top_k);
+        // Partition + sort only the top_k survivors, then materialise the
+        // Hit structs — avoids id/metadata clones for candidates outside
+        // top_k. select_nth_unstable_by would be O(n) but we still need a
+        // sorted top_k, so partition then sort the small prefix.
+        let mut scored = scored;
+        let n = scored.len();
+        let by_score_desc = |a: &(usize, f32), b: &(usize, f32)| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| approximate_slice[a.0].0.cmp(&approximate_slice[b.0].0))
+        };
+        if top_k < n {
+            scored.select_nth_unstable_by(top_k, by_score_desc);
+            scored.truncate(top_k);
+        }
+        scored.sort_unstable_by(by_score_desc);
+        let hits: Vec<Hit> = scored
+            .into_iter()
+            .map(|(idx, score)| {
+                let id = &approximate_slice[idx].0;
+                let record = &s.documents[id];
+                Hit {
+                    id: id.clone(),
+                    score,
+                    metadata: record.metadata.clone(),
+                }
+            })
+            .collect();
         Ok(hits)
     }
     pub fn stats(&self) -> IndexStats {

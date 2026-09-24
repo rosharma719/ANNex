@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -41,25 +42,48 @@ def load_sweep(path: Path):
     return dataset, levels
 
 
-def simulate_adaptive(cheap_rows, high_rows, threshold_percentile):
+def simulate_adaptive(cheap_rows, high_rows, threshold_percentile, signal="margin"):
     """Run every query at cheap c. Escalate the fraction of queries whose
-    top_minus_second margin at cheap c falls in the bottom `threshold_percentile`
-    percent. Return per-query nDCG + total latency ms."""
+    chosen difficulty signal (at cheap c) falls in the bottom
+    `threshold_percentile` percent. Signals:
+      - 'margin'         : top_minus_second (small = low confidence)
+      - 'fde_disagree'   : 1.0 - fde_maxsim_agreement (large = disagreement)
+      - 'fde_top_rank'   : position of MaxSim #1 in FDE order (large = MaxSim
+                           rescued something FDE buried; disagreement)
+      - 'combined'       : margin × (1 - fde_agreement); small = confident
+    """
     qids = sorted(set(cheap_rows.keys()) & set(high_rows.keys()))
-    margins = np.asarray([cheap_rows[q]["top_minus_second"] for q in qids])
-    # Threshold = value at the given percentile of margins. Queries with margin
-    # <= threshold are escalated. So threshold_percentile=20 escalates the
-    # bottom 20%.
-    threshold = np.percentile(margins, threshold_percentile) if threshold_percentile > 0 else -1.0
+
+    def score_for(qid):
+        r = cheap_rows[qid]
+        if signal == "margin":
+            return r.get("top_minus_second", 0.0)
+        if signal == "fde_disagree":
+            # We escalate when disagreement is HIGH → convert to "small = escalate"
+            # by negating so the percentile threshold works uniformly.
+            return -(1.0 - r.get("fde_maxsim_agreement", 1.0))
+        if signal == "fde_top_rank":
+            return -r.get("fde_top_rank_in_fde", 0)
+        if signal == "combined":
+            margin = r.get("top_minus_second", 0.0)
+            disagree = 1.0 - r.get("fde_maxsim_agreement", 1.0)
+            # Small margin OR high disagreement → escalate. Invert to match
+            # "small value = escalate" convention.
+            return margin * (1.0 - disagree * 0.5)
+        raise ValueError(signal)
+
+    scores_v = np.asarray([score_for(q) for q in qids])
+    threshold = (
+        np.percentile(scores_v, threshold_percentile) if threshold_percentile > 0 else -math.inf
+    )
     escalated = 0
     ndcgs = []
     latencies = []
     for qid in qids:
         cheap = cheap_rows[qid]
         high = high_rows[qid]
-        if cheap["top_minus_second"] <= threshold:
+        if score_for(qid) <= threshold:
             # Escalate: pay both the cheap probe AND the full high-c run.
-            # (In a real implementation we'd cache the cheap-c neighbors.)
             escalated += 1
             ndcgs.append(high["ndcg@10"])
             latencies.append(cheap["latency_ms"] + high["latency_ms"])
@@ -104,27 +128,33 @@ def report_corpus(dataset, levels):
     fixed_high = simulate_fixed(high)
 
     print(
-        f"  {'policy':<28} {'nDCG':>7} {'p10':>7} {'p50 lat':>9} {'p95 lat':>9} "
+        f"  {'policy':<38} {'nDCG':>7} {'p10':>7} {'p50 lat':>9} {'p95 lat':>9} "
         f"{'mean lat':>9} {'escalated':>10}"
     )
     print(
-        f"  {'fixed c=250':<28} {fixed_cheap['mean_ndcg']:>7.4f} {fixed_cheap['p10_ndcg']:>7.4f} "
+        f"  {'fixed c=250':<38} {fixed_cheap['mean_ndcg']:>7.4f} {fixed_cheap['p10_ndcg']:>7.4f} "
         f"{fixed_cheap['p50_latency']:>9.2f} {fixed_cheap['p95_latency']:>9.2f} "
         f"{fixed_cheap['mean_latency']:>9.2f} {'—':>10}"
     )
     print(
-        f"  {'fixed c=1000':<28} {fixed_high['mean_ndcg']:>7.4f} {fixed_high['p10_ndcg']:>7.4f} "
+        f"  {'fixed c=1000':<38} {fixed_high['mean_ndcg']:>7.4f} {fixed_high['p10_ndcg']:>7.4f} "
         f"{fixed_high['p50_latency']:>9.2f} {fixed_high['p95_latency']:>9.2f} "
         f"{fixed_high['mean_latency']:>9.2f} {'—':>10}"
     )
-    for pct in [5, 10, 20, 30, 50]:
-        result = simulate_adaptive(cheap, high, pct)
-        print(
-            f"  {'adaptive: bottom '+str(pct)+'% by margin':<28} "
-            f"{result['mean_ndcg']:>7.4f} {result['p10_ndcg']:>7.4f} "
-            f"{result['p50_latency']:>9.2f} {result['p95_latency']:>9.2f} "
-            f"{result['mean_latency']:>9.2f} {result['escalated_frac']:>10.1%}"
-        )
+    signals = ["margin", "fde_disagree", "fde_top_rank", "combined"]
+    have_fde = "fde_maxsim_agreement" in next(iter(cheap.values()), {})
+    if not have_fde:
+        signals = ["margin"]
+    for signal in signals:
+        for pct in [10, 20, 30]:
+            result = simulate_adaptive(cheap, high, pct, signal=signal)
+            label = f"adaptive: bottom {pct}% by {signal}"
+            print(
+                f"  {label:<38} "
+                f"{result['mean_ndcg']:>7.4f} {result['p10_ndcg']:>7.4f} "
+                f"{result['p50_latency']:>9.2f} {result['p95_latency']:>9.2f} "
+                f"{result['mean_latency']:>9.2f} {result['escalated_frac']:>10.1%}"
+            )
 
     # Oracle upper bound: escalate only queries where c=1000 actually beat c=250.
     # This is what a perfect predictor would achieve.
@@ -141,7 +171,7 @@ def report_corpus(dataset, levels):
             latencies_oracle.append(c["latency_ms"])
             ndcgs_oracle.append(c["ndcg@10"])
     print(
-        f"  {'oracle (perfect predictor)':<28} "
+        f"  {'oracle (perfect predictor)':<38} "
         f"{float(np.mean(ndcgs_oracle)):>7.4f} {float(np.percentile(ndcgs_oracle, 10)):>7.4f} "
         f"{float(np.percentile(latencies_oracle, 50)):>9.2f} "
         f"{float(np.percentile(latencies_oracle, 95)):>9.2f} "

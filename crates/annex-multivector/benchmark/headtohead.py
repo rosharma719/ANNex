@@ -171,10 +171,38 @@ def bench_annex_multivector(docs, queries, multi_docs, multi_queries, qrels, wor
             run[q.query_id] = [x["id"] for x in matches]
             top_score = float(matches[0]["score"]) if matches else 0.0
             second_score = float(matches[1]["score"]) if len(matches) > 1 else top_score
+            # FDE-vs-MaxSim rank disagreement signals. Each hit carries the
+            # original FDE score (fde_score field). We compute:
+            #  - fde_top_score: FDE score of the #1-by-MaxSim hit
+            #  - fde_top_rank_in_fde: 0-indexed position of the #1-by-MaxSim
+            #    hit when hits are sorted by FDE score descending. High value
+            #    = MaxSim ranked something the FDE stage buried, which is
+            #    exactly the "candidate pool was unstable / borderline" case.
+            #  - fde_maxsim_agreement: fraction of returned hits whose FDE
+            #    rank and MaxSim rank differ by <= 3 (a robust "did the two
+            #    stages agree on the head" score).
+            fde_scores = [float(m.get("fde_score", 0.0)) for m in matches]
+            if len(matches) > 1:
+                # positions sorted by FDE score descending
+                fde_order = sorted(range(len(matches)), key=lambda i: -fde_scores[i])
+                # 0-indexed rank of the #1-by-MaxSim hit inside that ordering
+                fde_top_rank = fde_order.index(0)
+                # per-hit rank differences
+                fde_rank_by_pos = {p: r for r, p in enumerate(fde_order)}
+                agree = sum(
+                    1 for i in range(len(matches)) if abs(fde_rank_by_pos[i] - i) <= 3
+                )
+                agreement = agree / len(matches)
+            else:
+                fde_top_rank = 0
+                agreement = 1.0
             extras[q.query_id] = {
                 "top_score": top_score,
                 "top_minus_second": top_score - second_score,
                 "returned": len(matches),
+                "fde_top_score": fde_scores[0] if fde_scores else 0.0,
+                "fde_top_rank_in_fde": fde_top_rank,
+                "fde_maxsim_agreement": agreement,
             }
     finally:
         server.terminate()

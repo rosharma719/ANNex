@@ -80,6 +80,12 @@ def build_features(rows, quantile: bool = False, quantile_label: bool = False):
         top = r.get("top_score", 0.0)
         margin = r.get("top_minus_second", 0.0)
         returned = r.get("returned", 0)
+        # FDE-vs-MaxSim rank disagreement features (present only if the sweep
+        # was collected with fde_score instrumentation on the engine). We
+        # emit them as zeros when missing so the feature vector stays a
+        # consistent shape and older sweep matrices still parse.
+        fde_top_rank = r.get("fde_top_rank_in_fde", 0)
+        fde_agreement = r.get("fde_maxsim_agreement", 1.0)
         features = [
             top,
             margin,
@@ -87,6 +93,11 @@ def build_features(rows, quantile: bool = False, quantile_label: bool = False):
             math.log(max(top, 1e-6)),
             math.log(max(margin, 1e-6)),
             returned,
+            fde_top_rank,
+            fde_agreement,
+            # Interaction: low margin AND high FDE disagreement is the "hard
+            # AND unstable" case, which is where the oracle escalates.
+            margin * (1.0 - fde_agreement),
         ]
         xs.append(features)
         ys.append(r.get("ndcg@10", 0.0))

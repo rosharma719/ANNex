@@ -88,6 +88,13 @@ struct Manifest {
 pub struct Hit {
     pub id: String,
     pub score: f32,
+    /// FDE score this hit had before the compressed-MaxSim rescore. Exposed
+    /// so callers can compute per-query FDE-vs-MaxSim rank disagreement —
+    /// a signal for the confidence-output / adaptive-escalation primitive.
+    /// Skipped from JSON when the underlying approximate list didn't carry
+    /// FDE scores (e.g. HNSW-backend candidate gen returned raw distances).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fde_score: Option<f32>,
     pub metadata: Value,
 }
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -785,11 +792,12 @@ impl MultiVectorIndex {
         let hits: Vec<Hit> = scored
             .into_iter()
             .map(|(idx, score)| {
-                let id = &approximate_slice[idx].0;
+                let (id, fde) = &approximate_slice[idx];
                 let record = &s.documents[id];
                 Hit {
                     id: id.clone(),
                     score,
+                    fde_score: Some(*fde),
                     metadata: record.metadata.clone(),
                 }
             })

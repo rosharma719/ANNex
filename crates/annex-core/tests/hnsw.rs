@@ -902,3 +902,148 @@ fn concurrent_insert_and_query_returns_only_live_ids() {
     // All 32 seeds + 400 concurrent writes should have landed.
     assert_eq!(index.len(), 32 + 400);
 }
+
+/// Extended-duration stress: 3 writers + 4 readers + 1 deleter, sustained for
+/// a fixed wall-clock window. Verifies the concurrency invariants under a
+/// heavier mix than the smoke test — writers append, deleter marks random
+/// ids dead, readers query throughout. Contract:
+///   1. `len()` is monotonically non-decreasing (only writers add nodes;
+///      deletion via `mark_deleted` does not remove them).
+///   2. No search result contains an id we never inserted (would indicate
+///      a RESERVED node leaked into query output, or a torn read on
+///      the ids array).
+///   3. No panics, no data races (deferred to Miri / TSan for detection;
+///      this test just checks nothing observable breaks).
+#[test]
+fn concurrent_stress_writers_deleter_readers_hold_invariants() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AOrd};
+    use std::time::{Duration, Instant};
+
+    const DIM: usize = 16;
+    const RUNTIME: Duration = Duration::from_millis(1500);
+    let index = Arc::new(HNSWIndex::new(DistanceMetric::Cosine, 8, 50, 4, DIM));
+
+    // Seed so search has some content from the first tick.
+    for i in 0u64..32 {
+        let v: Vec<f32> = (0..DIM)
+            .map(|d| if d == (i as usize % DIM) { 1.0 } else { 0.0 })
+            .collect();
+        index.insert(i, v).unwrap();
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    // Bounds ids inserted so readers can validate results with a simple
+    // upper bound. Each writer takes a disjoint 100_000-id slice.
+    let inserted_max = Arc::new(AtomicU64::new(32));
+
+    let mut writers = Vec::new();
+    for w in 0u64..3 {
+        let idx = Arc::clone(&index);
+        let stop_flag = Arc::clone(&stop);
+        let max = Arc::clone(&inserted_max);
+        writers.push(std::thread::spawn(move || {
+            let base = 32 + w * 100_000;
+            let mut i = 0u64;
+            while !stop_flag.load(AOrd::Relaxed) {
+                let id = base + i;
+                let v: Vec<f32> = (0..DIM)
+                    .map(|d| if d == (id as usize % DIM) { 1.0 } else { 0.5 })
+                    .collect();
+                idx.insert(id, v).unwrap();
+                // fetch_max returns the PRIOR value, which another writer
+                // may have already bumped past our id — that's fine, we
+                // just want the shared cell to reflect at least our id.
+                max.fetch_max(id, AOrd::Relaxed);
+                i += 1;
+                if i > 5000 {
+                    break;
+                }
+            }
+        }));
+    }
+
+    let mut readers = Vec::new();
+    let mut last_len = index.len();
+    for r in 0..4 {
+        let idx = Arc::clone(&index);
+        let stop_flag = Arc::clone(&stop);
+        let max = Arc::clone(&inserted_max);
+        readers.push(std::thread::spawn(move || {
+            let query: Vec<f32> = (0..DIM).map(|d| if d == r % DIM { 1.0 } else { 0.0 }).collect();
+            while !stop_flag.load(AOrd::Relaxed) {
+                let results = idx.search(&query, 10).unwrap();
+                let upper = max.load(AOrd::Acquire);
+                for hit in &results {
+                    assert!(
+                        hit.id <= upper,
+                        "reader saw id {} beyond upper bound {} — possible RESERVED leak or torn ids read",
+                        hit.id,
+                        upper,
+                    );
+                }
+            }
+        }));
+    }
+
+    let deleter = {
+        let idx = Arc::clone(&index);
+        let stop_flag = Arc::clone(&stop);
+        let max = Arc::clone(&inserted_max);
+        std::thread::spawn(move || {
+            let mut victim = 0u64;
+            while !stop_flag.load(AOrd::Relaxed) {
+                let cap = max.load(AOrd::Acquire).max(32);
+                victim = (victim.wrapping_add(7) % cap).max(1);
+                idx.mark_deleted(victim);
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        })
+    };
+
+    // Run for the fixed wall-clock window. Monotonicity check happens after
+    // stop — while running, len() may not be an atomic snapshot of the
+    // instant we call it.
+    let start = Instant::now();
+    while start.elapsed() < RUNTIME {
+        let current = index.len();
+        assert!(
+            current >= last_len,
+            "len() went backwards: {} -> {}",
+            last_len,
+            current,
+        );
+        last_len = current;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    stop.store(true, AOrd::Release);
+    for w in writers {
+        w.join().unwrap();
+    }
+    for r in readers {
+        r.join().unwrap();
+    }
+    deleter.join().unwrap();
+
+    // Final invariants: len grew from 32, and reading it after all writers
+    // joined is consistent with what mark_deleted (which doesn't remove
+    // slots) allows.
+    let final_len = index.len();
+    assert!(
+        final_len > 32,
+        "no writes visible after stress: final_len={final_len}"
+    );
+    // Final search must still return valid results.
+    let query: Vec<f32> = (0..DIM).map(|d| if d == 0 { 1.0 } else { 0.0 }).collect();
+    let final_results = index.search(&query, 10).unwrap();
+    assert!(!final_results.is_empty());
+    let upper = inserted_max.load(AOrd::Acquire);
+    for hit in &final_results {
+        assert!(
+            hit.id <= upper,
+            "final search returned unknown id {}",
+            hit.id
+        );
+    }
+}

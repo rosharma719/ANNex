@@ -57,6 +57,13 @@ struct QueryRequest {
     probes: Option<usize>,
     candidate_backend: Option<String>,
     ef_search: Option<usize>,
+    /// When true, the response includes a `stats` object with per-query
+    /// timing, candidate counts, and FDE-vs-MaxSim rank-agreement signals.
+    /// The primitive under EXPLAIN SEARCH — surface the "why" of a query
+    /// alongside the "what", so downstream tuning, SLO enforcement, and
+    /// confidence output all have data to consume.
+    #[serde(default)]
+    explain: bool,
 }
 #[derive(Deserialize)]
 struct CandidateRequest {
@@ -148,6 +155,8 @@ async fn query(
     State(index): State<Arc<MultiVectorIndex>>,
     Json(body): Json<QueryRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    let explain = body.explain;
+    let t0 = std::time::Instant::now();
     let matches = match body.candidate_backend.as_deref() {
         Some("hnsw") => match body.rerank_candidates {
             Some(rerank_candidates) => index.query_with_fde_ann_and_pruning(
@@ -187,7 +196,58 @@ async fn query(
             ))));
         }
     };
-    Ok(Json(json!({"matches": matches})))
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if !explain {
+        return Ok(Json(json!({"matches": matches})));
+    }
+
+    // ── EXPLAIN block: cheap derived stats from the returned matches ──
+    // Everything below is computed server-side so callers don't have to
+    // duplicate the logic (see benchmark/headtohead.py for the reference
+    // implementation). Kept close to the primitive: no model inference,
+    // no calibration lookup — just what falls out of the hit list.
+    let top_score = matches.first().map(|h| h.score).unwrap_or(0.0);
+    let second_score = matches.get(1).map(|h| h.score).unwrap_or(top_score);
+    let (fde_top_score, fde_top_rank_in_fde, fde_agreement) = {
+        let fde_scores: Vec<f32> = matches.iter().map(|h| h.fde_score.unwrap_or(0.0)).collect();
+        if matches.len() > 1 {
+            let mut fde_order: Vec<usize> = (0..matches.len()).collect();
+            fde_order.sort_by(|&a, &b| fde_scores[b].total_cmp(&fde_scores[a]));
+            let fde_top_rank = fde_order.iter().position(|&i| i == 0).unwrap_or(0);
+            let mut fde_rank_by_pos = vec![0usize; matches.len()];
+            for (rank, &pos) in fde_order.iter().enumerate() {
+                fde_rank_by_pos[pos] = rank;
+            }
+            let agree = fde_rank_by_pos
+                .iter()
+                .enumerate()
+                .filter(|(i, r)| r.abs_diff(*i) <= 3)
+                .count();
+            (
+                fde_scores.first().copied().unwrap_or(0.0),
+                fde_top_rank,
+                agree as f32 / matches.len() as f32,
+            )
+        } else {
+            (fde_scores.first().copied().unwrap_or(0.0), 0usize, 1.0f32)
+        }
+    };
+
+    Ok(Json(json!({
+        "matches": matches,
+        "stats": {
+            "elapsed_ms": elapsed_ms,
+            "matches_returned": matches.len(),
+            "top_k_requested": body.top_k,
+            "candidates_requested": body.candidates,
+            "candidate_backend": body.candidate_backend,
+            "top_score": top_score,
+            "top_minus_second": top_score - second_score,
+            "fde_top_score": fde_top_score,
+            "fde_top_rank_in_fde": fde_top_rank_in_fde,
+            "fde_maxsim_agreement": fde_agreement,
+        }
+    })))
 }
 async fn train(
     State(index): State<Arc<MultiVectorIndex>>,

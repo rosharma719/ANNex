@@ -1,0 +1,6 @@
+# Python venv used by the BEIR harness
+.venv/
+# Embedding + dataset caches (large .npy files, content-addressed by manifest)
+benchmark/cache/
+# Per-run index outputs
+benchmark/results/

@@ -10,9 +10,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Cross-platform build/test. macos-14 runners are Apple Silicon (aarch64),
+  # so this is the only path that actually exercises the NEON kernels in
+  # annex-multivector — Linux ubuntu-latest runners are x86_64 and take
+  # the scalar fallback path.
   check:
-    name: Build & test
-    runs-on: ubuntu-latest
+    name: Build & test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
     steps:
       - uses: actions/checkout@v4
 
@@ -38,13 +46,33 @@ jobs:
       - name: clippy
         # Pre-existing warnings are tracked but not yet gating; this catches
         # newly introduced clippy errors and default-deny lints.
-        run: cargo clippy --all-targets
+        run: cargo clippy --workspace --all-targets
 
       - name: build
-        run: cargo build --all-targets
+        run: cargo build --workspace --all-targets
 
       - name: test
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-targets
 
       - name: doc
-        run: cargo doc --no-deps
+        run: cargo doc --workspace --no-deps
+
+  # Compile-only check on the criterion benches so a broken bench file
+  # doesn't slip in unnoticed. Actual perf runs happen locally / on
+  # dedicated hardware — GitHub runners aren't stable enough for
+  # microsecond-scale timing.
+  bench-compile:
+    name: Bench compile
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-bench-${{ hashFiles('**/Cargo.lock') }}
+      - name: cargo bench --no-run
+        run: cargo bench --workspace --no-run

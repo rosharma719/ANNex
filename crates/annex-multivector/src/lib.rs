@@ -8,4 +8,4 @@ mod storage;
 pub use engine::{
     CandidateHit, Hit, IndexConfig, IndexError, IndexStats, MultiVectorIndex, UpsertDocument,
 };
-pub use fde::maxsim;
+pub use fde::{maxsim, maxsim_flat};

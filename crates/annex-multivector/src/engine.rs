@@ -77,12 +77,48 @@ struct DocumentRecord {
     tokens: usize,
     compressed_bytes: u64,
 }
+/// Persisted manifest header. `format_version` lets us evolve the on-disk
+/// layout later without silently accepting mismatched files. `generation`
+/// is bumped on every mutation and lets any derived structure (HNSW-over-
+/// FDE in particular) prove it was built against the current document set.
+///
+/// Format changes: bump FORMAT_VERSION and add a From<oldManifest> path.
+const FORMAT_VERSION: u32 = 1;
+
 #[derive(Deserialize, Serialize)]
 struct Manifest {
+    #[serde(default = "current_format_version")]
+    format_version: u32,
+    #[serde(default)]
+    generation: u64,
     config: IndexConfig,
     codebook: Vec<Vector>,
     residual_codebook: Vec<f32>,
     documents: HashMap<String, DocumentRecord>,
+}
+
+fn current_format_version() -> u32 {
+    FORMAT_VERSION
+}
+
+/// Verifies the sidecar sha256 against the manifest bytes we just read.
+/// The sidecar is optional (older indexes were written without one), so we
+/// only enforce when the file exists — new writes always produce it, so the
+/// enforcement window strengthens over time.
+fn verify_manifest_checksum(manifest_bytes: &[u8], sidecar_path: &Path) -> Result<(), IndexError> {
+    if !sidecar_path.exists() {
+        return Ok(());
+    }
+    let expected = fs::read_to_string(sidecar_path)?;
+    let expected = expected.trim();
+    let actual = blake3::hash(manifest_bytes);
+    if actual.to_hex().as_str() != expected {
+        return Err(IndexError::Invalid(format!(
+            "manifest.sha256 does not match manifest.json — index may be corrupt or torn: expected={expected}, actual={}",
+            actual.to_hex(),
+        )));
+    }
+    Ok(())
 }
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Hit {
@@ -134,12 +170,23 @@ pub enum IndexError {
     Json(#[from] serde_json::Error),
 }
 struct State {
+    /// Monotonic mutation counter. Bumped by any code path that changes
+    /// documents, codebook, or residual codebook. Persisted in the
+    /// manifest so a restart resumes with the right value. Any
+    /// derived structure (fde_ann_generation) records the value at
+    /// build time and refuses to be trusted after `generation` moves.
+    generation: u64,
     codebook: Vec<Vector>,
     residual_codebook: Vec<f32>,
     documents: HashMap<String, DocumentRecord>,
     postings: Vec<HashSet<String>>,
     fde_ann: Option<Arc<HNSWIndex>>,
     fde_ann_ids: Vec<String>,
+    /// Which `generation` the current `fde_ann` was built at. Query paths
+    /// that dispatch to the HNSW backend refuse if this doesn't match
+    /// `generation` — protects against a caller who forgot to rebuild
+    /// after a batch of writes.
+    fde_ann_generation: u64,
 }
 pub struct MultiVectorIndex {
     root: PathBuf,
@@ -168,17 +215,25 @@ impl MultiVectorIndex {
         let root = path.as_ref().to_owned();
         fs::create_dir_all(&root)?;
         let path = root.join("manifest.json");
-        let (codebook, residual_codebook, documents) = if path.exists() {
-            let m: Manifest = serde_json::from_slice(&fs::read(path)?)?;
+        let (generation, codebook, residual_codebook, documents) = if path.exists() {
+            let bytes = fs::read(&path)?;
+            verify_manifest_checksum(&bytes, &root.join("manifest.sha256"))?;
+            let m: Manifest = serde_json::from_slice(&bytes)?;
+            if m.format_version != FORMAT_VERSION {
+                return Err(IndexError::Invalid(format!(
+                    "manifest format_version={} unsupported (this build expects {})",
+                    m.format_version, FORMAT_VERSION,
+                )));
+            }
             if m.config != config {
                 return Err(IndexError::Config {
                     actual: m.config,
                     requested: config,
                 });
             }
-            (m.codebook, m.residual_codebook, m.documents)
+            (m.generation, m.codebook, m.residual_codebook, m.documents)
         } else {
-            (vec![], vec![], HashMap::new())
+            (0, vec![], vec![], HashMap::new())
         };
         let mut postings = vec![HashSet::new(); codebook.len()];
         for (id, d) in &documents {
@@ -197,12 +252,14 @@ impl MultiVectorIndex {
             fde_store: FixedVectorStore::new(root.join("fde"))?,
             objects: CompressedVectorStore::new(root.join("objects"))?,
             state: RwLock::new(State {
+                generation,
                 codebook,
                 residual_codebook,
                 documents,
                 postings,
                 fde_ann: None,
                 fde_ann_ids: Vec::new(),
+                fde_ann_generation: 0,
             }),
             root,
             config,
@@ -222,15 +279,22 @@ impl MultiVectorIndex {
         }
     }
     fn persist(&self, s: &State) -> Result<(), IndexError> {
-        atomic_write(
-            &self.root.join("manifest.json"),
-            &serde_json::to_vec(&Manifest {
-                config: self.config.clone(),
-                codebook: s.codebook.clone(),
-                residual_codebook: s.residual_codebook.clone(),
-                documents: s.documents.clone(),
-            })?,
-        )?;
+        let bytes = serde_json::to_vec(&Manifest {
+            format_version: FORMAT_VERSION,
+            generation: s.generation,
+            config: self.config.clone(),
+            codebook: s.codebook.clone(),
+            residual_codebook: s.residual_codebook.clone(),
+            documents: s.documents.clone(),
+        })?;
+        // Sidecar sha256 file so torn / partial reads or bit-flipped storage
+        // are caught on next open() rather than silently propagating stale
+        // documents into query results. atomic_write below already ensures
+        // the primary file is either the old or the new version (never
+        // half of each); the checksum guards against corruption at rest.
+        let sum = blake3::hash(&bytes);
+        atomic_write(&self.root.join("manifest.sha256"), sum.to_hex().as_bytes())?;
+        atomic_write(&self.root.join("manifest.json"), &bytes)?;
         Ok(())
     }
     /// Train PLAID's coarse k-means codebook. Must happen before ingestion.
@@ -285,6 +349,7 @@ impl MultiVectorIndex {
         s.residual_codebook =
             train_scalar_codebook(&residuals, 1usize << self.config.residual_bits, 12);
         s.postings = vec![HashSet::new(); s.codebook.len()];
+        s.generation = s.generation.wrapping_add(1);
         self.persist(&s)
     }
     pub fn upsert(
@@ -356,14 +421,23 @@ impl MultiVectorIndex {
                 },
             );
         }
+        s.generation = s.generation.wrapping_add(1);
         self.persist(&s)
     }
     pub fn delete(&self, id: &str) -> Result<bool, IndexError> {
         let mut s = self.state.write().unwrap();
+        // Any prior FDE-over-HNSW index still contains this doc's node.
+        // Without invalidation, query_with_fde_ann would keep returning
+        // the deleted doc through the stale ANN graph. Match upsert_batch
+        // and drop the derived structure — callers rebuild on next need.
+        s.fde_ann = None;
+        s.fde_ann_ids.clear();
+        s.fde_ann_generation = 0;
         if let Some(d) = s.documents.remove(id) {
             for c in d.unique_centroids {
                 s.postings[c as usize].remove(id);
             }
+            s.generation = s.generation.wrapping_add(1);
             self.persist(&s)?;
             Ok(true)
         } else {
@@ -555,10 +629,21 @@ impl MultiVectorIndex {
                 IndexError::Invalid(format!("HNSW par_insert_batch failed: {error}"))
             })?;
         }
+        let built_generation = s.generation;
         drop(s);
         let mut s = self.state.write().unwrap();
+        // Race check: if a writer bumped `generation` after we started
+        // building, the HNSW is already stale. Discard the work and let
+        // the caller retry rather than serve stale results silently.
+        if s.generation != built_generation {
+            return Err(IndexError::Invalid(format!(
+                "index generation moved during HNSW build ({} -> {}); retry",
+                built_generation, s.generation,
+            )));
+        }
         s.fde_ann = Some(Arc::new(hnsw));
         s.fde_ann_ids = ids;
+        s.fde_ann_generation = built_generation;
         Ok(s.fde_ann_ids.len())
     }
     pub fn query_with_fde_ann(
@@ -591,6 +676,16 @@ impl MultiVectorIndex {
         let ann = s.fde_ann.as_ref().ok_or_else(|| {
             IndexError::Invalid("FDE ANN is not built; call /v1/fde/index".into())
         })?;
+        // Generation guard: any mutation since build() invalidated fde_ann,
+        // so this check should only fail if some code path forgot to clear
+        // it. Making the check explicit here means we fail loudly instead
+        // of returning stale / deleted docs through the ANN path.
+        if s.fde_ann_generation != s.generation {
+            return Err(IndexError::Invalid(format!(
+                "FDE ANN is stale: built at generation {}, current {}; rebuild",
+                s.fde_ann_generation, s.generation,
+            )));
+        }
         let options = SearchRuntimeOptions {
             ef_search: Some(ef_search.max(count)),
             ..SearchRuntimeOptions::default()

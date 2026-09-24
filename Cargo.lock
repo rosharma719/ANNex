@@ -52,6 +52,7 @@ dependencies = [
  "blake3",
  "bytemuck",
  "clap",
+ "criterion",
  "memmap2",
  "rayon",
  "serde",

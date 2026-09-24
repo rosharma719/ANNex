@@ -214,8 +214,21 @@ def bench_annex_multivector(docs, queries, multi_docs, multi_queries, qrels, wor
     return scores
 
 
-def bench_qdrant(docs, queries, multi_docs, multi_queries, qrels):
-    """Qdrant with native multi-vector (MAX_SIM comparator, in-process)."""
+def bench_qdrant(docs, queries, multi_docs, multi_queries, qrels, server_url=None):
+    """Qdrant with native multi-vector (MAX_SIM comparator).
+
+    If `server_url` is provided (e.g. http://127.0.0.1:6333), talks to a real
+    running Qdrant Server — the production configuration a user would deploy.
+    That's the honest comparator per BENCHMARK_POLICY.md.
+
+    If `server_url` is None, falls back to the qdrant-client local (":memory:")
+    mode. That mode reuses much of the Rust core in-process but is NOT a
+    substitute for the server on the wire: no protocol serialisation, no
+    connection pooling, no rocksdb payload store, no WAL, no snapshot layer.
+    We keep the fallback path so anyone can run this benchmark without
+    Docker, but the result should be labelled 'qdrant-client local' — never
+    just 'Qdrant'. See BENCHMARK_POLICY.md.
+    """
     from qdrant_client import QdrantClient
     from qdrant_client.models import (
         Distance,
@@ -225,7 +238,15 @@ def bench_qdrant(docs, queries, multi_docs, multi_queries, qrels):
         VectorParams,
     )
 
-    client = QdrantClient(":memory:")
+    if server_url is None:
+        client = QdrantClient(":memory:")
+    else:
+        client = QdrantClient(url=server_url)
+        # Drop any prior collection with the same name so runs are idempotent.
+        try:
+            client.delete_collection(collection_name="mv")
+        except Exception:
+            pass
     dim = int(multi_docs[0].shape[1])
     client.create_collection(
         collection_name="mv",
@@ -347,7 +368,17 @@ def main():
     p.add_argument("--limit-queries", type=int, default=100)
     p.add_argument("--sampling", choices=["prefix", "qrels"], default="prefix")
     p.add_argument("--sample-seed", type=int, default=13)
-    p.add_argument("--engines", default="annex,qdrant,lancedb")
+    p.add_argument(
+        "--engines",
+        default="annex,qdrant_local,lancedb",
+        help="comma-separated: annex, qdrant_local, qdrant_server, lancedb",
+    )
+    p.add_argument(
+        "--qdrant-server",
+        default=None,
+        help="URL of a running Qdrant Server (e.g. http://127.0.0.1:6333). "
+        "Start one with: docker run -p 6333:6333 qdrant/qdrant:latest",
+    )
     p.add_argument("--annex-candidates", type=int, default=250)
     p.add_argument("--annex-sweep", default="", help="comma-separated candidate counts for annex Pareto sweep")
     args = p.parse_args()
@@ -385,9 +416,23 @@ def main():
             results["systems"][key] = bench_annex_multivector(
                 docs, queries, multi_docs, multi_queries, qrels, workspace_root, candidates=cand
             )
-    if "qdrant" in engines:
-        print("== qdrant ==")
-        results["systems"]["qdrant"] = bench_qdrant(docs, queries, multi_docs, multi_queries, qrels)
+    if "qdrant_local" in engines or "qdrant" in engines:
+        # "qdrant" kept as an alias for back-compat; explicit new name is
+        # 'qdrant_local' so the label makes the mode obvious in matrices.
+        print("== qdrant_client_local (:memory: — NOT the production server) ==")
+        results["systems"]["qdrant_client_local"] = bench_qdrant(
+            docs, queries, multi_docs, multi_queries, qrels, server_url=None,
+        )
+    if "qdrant_server" in engines:
+        if not args.qdrant_server:
+            raise SystemExit(
+                "--qdrant-server URL required for qdrant_server engine. "
+                "Start with: docker run -p 6333:6333 qdrant/qdrant:latest"
+            )
+        print(f"== qdrant_server ({args.qdrant_server}) ==")
+        results["systems"]["qdrant_server"] = bench_qdrant(
+            docs, queries, multi_docs, multi_queries, qrels, server_url=args.qdrant_server,
+        )
     if "lancedb" in engines:
         print("== lancedb ==")
         results["systems"]["lancedb"] = bench_lancedb(docs, queries, multi_docs, multi_queries, qrels)

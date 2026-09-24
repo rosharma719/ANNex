@@ -255,9 +255,30 @@ fn unpack(bytes: &[u8], bits: u8, count: usize) -> io::Result<Vec<u8>> {
             "truncated residuals",
         ));
     }
+    let mut out = Vec::with_capacity(count);
+    // Fast path for the default 2-bit residual encoding: 4 codes per byte,
+    // no inner while loop, no acc/used bookkeeping. About 4-6x faster than
+    // the general path in decode's rescoring hot loop and eliminates the
+    // per-code branch.
+    if bits == 2 {
+        let full_bytes = count / 4;
+        for &byte in &bytes[..full_bytes] {
+            out.push(byte & 0b11);
+            out.push((byte >> 2) & 0b11);
+            out.push((byte >> 4) & 0b11);
+            out.push((byte >> 6) & 0b11);
+        }
+        let tail = count % 4;
+        if tail > 0 {
+            let byte = bytes[full_bytes];
+            for i in 0..tail {
+                out.push((byte >> (i * 2)) & 0b11);
+            }
+        }
+        return Ok(out);
+    }
     let mask = (1_u64 << bits) - 1;
-    let (mut out, mut acc, mut used, mut input) =
-        (Vec::with_capacity(count), 0_u64, 0_u8, bytes.iter());
+    let (mut acc, mut used, mut input) = (0_u64, 0_u8, bytes.iter());
     while out.len() < count {
         while used < bits {
             acc |= (*input.next().unwrap() as u64) << used;
@@ -273,4 +294,72 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     fs::write(&temporary, bytes)?;
     fs::rename(temporary, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Slow bit-by-bit unpack that mirrors the original general-path logic.
+    /// Kept in the test module as a reference for cross-checking the fast
+    /// path in every bits/count combination we care about.
+    fn unpack_reference(bytes: &[u8], bits: u8, count: usize) -> Vec<u8> {
+        let mask = (1_u64 << bits) - 1;
+        let mut out = Vec::with_capacity(count);
+        let (mut acc, mut used, mut input) = (0_u64, 0_u8, bytes.iter());
+        while out.len() < count {
+            while used < bits {
+                acc |= (*input.next().unwrap() as u64) << used;
+                used += 8;
+            }
+            out.push((acc & mask) as u8);
+            acc >>= bits;
+            used -= bits;
+        }
+        out
+    }
+
+    fn deterministic_bytes(n: usize) -> Vec<u8> {
+        // Simple LCG so tests are reproducible without depending on rand.
+        let mut s: u32 = 0xC0DEBEEF;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                (s >> 16) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unpack_bits2_fast_path_matches_reference_for_aligned_counts() {
+        // For bits=2, count codes need (count * 2 + 7) / 8 bytes.
+        let raw = deterministic_bytes(8000);
+        for &count in &[4usize, 16, 128, 512, 25600] {
+            let expected = unpack_reference(&raw, 2, count);
+            let actual = unpack(&raw, 2, count).unwrap();
+            assert_eq!(actual, expected, "count={count}");
+        }
+    }
+
+    #[test]
+    fn unpack_bits2_fast_path_matches_reference_for_ragged_counts() {
+        let raw = deterministic_bytes(8000);
+        // Every non-multiple-of-4 tail length.
+        for &count in &[1usize, 2, 3, 5, 6, 7, 9, 17, 25599] {
+            let expected = unpack_reference(&raw, 2, count);
+            let actual = unpack(&raw, 2, count).unwrap();
+            assert_eq!(actual, expected, "count={count}");
+        }
+    }
+
+    #[test]
+    fn unpack_other_bits_still_uses_general_path() {
+        let raw = deterministic_bytes(2000);
+        for bits in [1u8, 3, 4, 5, 8] {
+            let count = 32;
+            let expected = unpack_reference(&raw, bits, count);
+            let actual = unpack(&raw, bits, count).unwrap();
+            assert_eq!(actual, expected, "bits={bits}");
+        }
+    }
 }

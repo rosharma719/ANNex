@@ -375,7 +375,11 @@ impl MultiVectorIndex {
             return Err(IndexError::Invalid("top_k must be positive".into()));
         }
         let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
-        let approximate = self.exact_fde_scores(&normalized)?;
+        // Rescore only ever reads the top `count` — mirror the same cap here
+        // so exact_fde_scores can partial-sort instead of fully sorting the
+        // 10K+ pool it just scored.
+        let cap = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
+        let approximate = self.exact_fde_scores_capped(&normalized, Some(cap))?;
         let s = self.state.read().unwrap();
         self.rescore(&s, &normalized, approximate, top_k, candidates)
     }
@@ -391,7 +395,7 @@ impl MultiVectorIndex {
         self.validate(vectors)?;
         check_pruning_shape(top_k, candidates, rerank_candidates)?;
         let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
-        let approximate = self.exact_fde_scores(&normalized)?;
+        let approximate = self.exact_fde_scores_capped(&normalized, Some(candidates))?;
         let s = self.state.read().unwrap();
         self.prune_and_rescore(
             &s,
@@ -444,6 +448,19 @@ impl MultiVectorIndex {
         self.rescore(s, normalized, pruned, top_k, Some(rerank_candidates))
     }
     fn exact_fde_scores(&self, normalized: &[Vector]) -> Result<Vec<(String, f32)>, IndexError> {
+        self.exact_fde_scores_capped(normalized, None)
+    }
+
+    /// FDE exhaustive scan, optionally returning only the top `cap` results.
+    /// When capped, partitions the top-cap with `select_nth_unstable_by`
+    /// (O(n) expected) then fully sorts only the surviving prefix
+    /// (O(cap log cap)), instead of paying O(n log n) to sort a 10K+
+    /// candidate pool whose tail is discarded by rescore anyway.
+    fn exact_fde_scores_capped(
+        &self,
+        normalized: &[Vector],
+        cap: Option<usize>,
+    ) -> Result<Vec<(String, f32)>, IndexError> {
         let query_fde = self.fde.encode_query(normalized);
         let s = self.state.read().unwrap();
         let mapped_fdes = self.fde_store.map()?;
@@ -462,7 +479,19 @@ impl MultiVectorIndex {
             })
             .collect();
         let mut approximate = approximate_results?;
-        approximate.par_sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let n = approximate.len();
+        let by_desc =
+            |a: &(String, f32), b: &(String, f32)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
+        match cap {
+            Some(k) if k < n => {
+                approximate.select_nth_unstable_by(k, by_desc);
+                approximate.truncate(k);
+                approximate.par_sort_unstable_by(by_desc);
+            }
+            _ => {
+                approximate.par_sort_unstable_by(by_desc);
+            }
+        }
         Ok(approximate)
     }
     /// Return exact FDE candidates before compressed MaxSim reranking.

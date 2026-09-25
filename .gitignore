@@ -1,3 +1,6 @@
+/target/
+**/__pycache__/
+
 # Orphan benchmark output dir when scripts are run from workspace root
 # instead of crates/annex-multivector. Real benchmark cache lives under
 # crates/annex-multivector/benchmark/.

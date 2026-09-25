@@ -112,7 +112,7 @@ fn two_fifty_six() -> usize {
     256
 }
 fn default_candidate_backend() -> String {
-    "auto".into()
+    "muvera".into()
 }
 
 struct ApiError(IndexError);
@@ -160,8 +160,17 @@ async fn query(
 ) -> Result<Json<Value>, ApiError> {
     let explain = body.explain;
     let t0 = std::time::Instant::now();
-    let matches = match body.candidate_backend.as_deref() {
-        Some("hnsw") => match body.rerank_candidates {
+    // Existing clients used these knobs with the implicit MUVERA backend.
+    // Requests without those legacy knobs opt into automatic dispatch.
+    let backend = body.candidate_backend.as_deref().unwrap_or_else(|| {
+        if body.probes.is_some() || body.rerank_candidates.is_some() {
+            "muvera"
+        } else {
+            "auto"
+        }
+    });
+    let matches = match backend {
+        "hnsw" => match body.rerank_candidates {
             Some(rerank_candidates) => index.query_with_fde_ann_and_pruning(
                 &body.vectors,
                 body.top_k,
@@ -178,11 +187,12 @@ async fn query(
         },
         // "auto" is the production default: HNSW when built + fresh,
         // exact FDE otherwise. Callers pin behavior with "hnsw" or "muvera".
-        None | Some("auto") => {
+        "auto" => {
             if body.probes.is_some() || body.rerank_candidates.is_some() {
                 return Err(ApiError(IndexError::Invalid(
                     "auto backend does not accept probes/rerank_candidates; \
-                     specify candidate_backend=muvera or hnsw explicitly".into(),
+                     specify candidate_backend=muvera or hnsw explicitly"
+                        .into(),
                 )));
             }
             index.query_auto(
@@ -192,7 +202,7 @@ async fn query(
                 body.ef_search.unwrap_or(256),
             )?
         }
-        Some("muvera") => match (body.probes, body.rerank_candidates) {
+        "muvera" => match (body.probes, body.rerank_candidates) {
             (None, Some(rerank_candidates)) => index.query_with_centroid_pruning(
                 &body.vectors,
                 body.top_k,
@@ -209,7 +219,7 @@ async fn query(
                 )));
             }
         },
-        Some(other) => {
+        other => {
             return Err(ApiError(IndexError::Invalid(format!(
                 "unknown candidate backend: {other}"
             ))));
@@ -357,4 +367,103 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, Arc<MultiVectorIndex>) {
+        let directory = tempfile::tempdir().unwrap();
+        let config = IndexConfig {
+            dimension: 2,
+            centroids: 2,
+            residual_bits: 2,
+            probes: 2,
+            fde_repetitions: 2,
+            fde_ksim: 2,
+            fde_projected: 2,
+        };
+        let index = Arc::new(MultiVectorIndex::open(directory.path(), config).unwrap());
+        index
+            .train(
+                &[vec![1., 0.], vec![0., 1.], vec![-1., 0.], vec![0., -1.]],
+                2,
+            )
+            .unwrap();
+        index.upsert("a", vec![vec![1., 0.]], json!({})).unwrap();
+        index.upsert("b", vec![vec![0., 1.]], json!({})).unwrap();
+        (directory, index)
+    }
+
+    async fn query_value(index: &Arc<MultiVectorIndex>, body: Value) -> Value {
+        query(
+            State(Arc::clone(index)),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("query failed: {}", error.0))
+        .0
+    }
+
+    #[tokio::test]
+    async fn debug_candidates_default_to_exact_without_graph() {
+        let (_directory, index) = fixture();
+        let body: CandidateRequest = serde_json::from_value(json!({
+            "vectors": [[1., 0.]], "count": 2,
+        }))
+        .unwrap();
+        assert_eq!(body.candidate_backend, "muvera");
+        let expected = index
+            .exact_fde_candidates(&body.vectors, body.count)
+            .unwrap();
+        let actual = candidates(State(index), Json(body))
+            .await
+            .unwrap_or_else(|error| panic!("candidate request failed: {}", error.0));
+        assert_eq!(actual.0, json!({"candidates": expected}));
+    }
+
+    #[tokio::test]
+    async fn omitted_backend_preserves_probe_and_pruning_requests() {
+        let (_directory, index) = fixture();
+        index.build_fde_ann(4, 16).unwrap();
+        for knob in ["probes", "rerank_candidates"] {
+            let mut body = json!({
+                "vectors": [[1., 0.]], "top_k": 1, "candidates": 2,
+            });
+            body[knob] = json!(2);
+            let implicit = query_value(&index, body.clone()).await;
+            body["candidate_backend"] = json!("muvera");
+            let explicit = query_value(&index, body.clone()).await;
+            assert_eq!(implicit, explicit);
+            assert_eq!(implicit["matches"][0]["id"], "a");
+
+            body["candidate_backend"] = json!("auto");
+            let error = query(
+                State(Arc::clone(&index)),
+                Json(serde_json::from_value(body).unwrap()),
+            )
+            .await
+            .err()
+            .expect("explicit auto must reject legacy backend knobs");
+            assert!(matches!(error.0, IndexError::Invalid(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_backend_accepts_queries_before_and_after_graph_build() {
+        let (_directory, index) = fixture();
+        for built in [false, true] {
+            if built {
+                index.build_fde_ann(4, 16).unwrap();
+            }
+            let mut body = json!({
+                "vectors": [[1., 0.]], "top_k": 1, "candidates": 2,
+            });
+            let implicit = query_value(&index, body.clone()).await;
+            body["candidate_backend"] = json!("auto");
+            assert_eq!(implicit, query_value(&index, body).await);
+            assert_eq!(implicit["matches"][0]["id"], "a");
+        }
+    }
 }

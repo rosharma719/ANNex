@@ -6,6 +6,7 @@ pub struct FdeEncoder {
     ksim: usize,
     projected: usize,
     repetitions: Vec<Repetition>,
+    encoding_version: u32,
 }
 struct Repetition {
     hash_planes: Vec<Vector>,
@@ -19,6 +20,17 @@ impl FdeEncoder {
         repetitions: usize,
         seed: u64,
     ) -> Self {
+        Self::with_version(dimension, ksim, projected, repetitions, seed, 2)
+    }
+    pub fn with_version(
+        dimension: usize,
+        ksim: usize,
+        projected: usize,
+        repetitions: usize,
+        seed: u64,
+        version: u32,
+    ) -> Self {
+        assert!(matches!(version, 1 | 2), "unsupported FDE encoding version");
         let mut rng = SplitMix64(seed);
         let repetitions = (0..repetitions)
             .map(|_| {
@@ -40,7 +52,11 @@ impl FdeEncoder {
             ksim,
             projected,
             repetitions,
+            encoding_version: version,
         }
+    }
+    pub fn encoding_version(&self) -> u32 {
+        self.encoding_version
     }
     pub fn output_dimension(&self) -> usize {
         (1usize << self.ksim) * self.projected * self.repetitions.len()
@@ -64,9 +80,26 @@ impl FdeEncoder {
                     *target += value;
                 }
             }
-            if document {
-                // Paper-faithful fill: fill every empty bucket from the
-                // *raw* sums of its Hamming-nearest occupied bucket, THEN
+            if document && self.encoding_version == 1 {
+                // Preserve the original one-pass encoding for persisted v1
+                // indexes, including its second division when the source
+                // bucket has already been averaged.
+                for bucket in 0..buckets {
+                    if counts[bucket] > 0 {
+                        for x in &mut sums[bucket] {
+                            *x /= counts[bucket] as f32;
+                        }
+                    } else if let Some(nearest) = nearest_occupied(bucket, &counts) {
+                        sums[bucket] = sums[nearest]
+                            .iter()
+                            .map(|x| x / counts[nearest] as f32)
+                            .collect();
+                    }
+                }
+            } else if document {
+                // Fill every empty bucket with the average of its
+                // Hamming-nearest occupied bucket. This selects a bucket
+                // average, not an individual token. Copy from raw sums, THEN
                 // normalize the originally-occupied buckets. Doing it in a
                 // single pass silently double-divides whenever the nearest
                 // occupied bucket comes earlier in iteration order — its
@@ -142,35 +175,43 @@ mod tests {
         );
     }
 
-    // Ordering regression: a document that fills only some buckets must
-    // encode the same regardless of which bucket ID is empty. Before the
-    // two-pass fix, an empty bucket whose nearest occupied bucket had a
-    // lower index got the average divided by count twice.
+    // Two tokens in the same bucket expose the legacy second division.
     #[test]
-    fn empty_bucket_fill_is_order_independent() {
-        // A single document token → occupies exactly one bucket; every
-        // other bucket is filled from that one. All filled slots should
-        // hold the same average (which for a single token equals the
-        // token itself, times projection).
+    fn corrected_empty_bucket_fill_preserves_average_and_versions_legacy_behavior() {
         let e = FdeEncoder::new(4, 3, 2, 1, 7);
-        let doc = vec![vec![1., 0.5, -0.5, 1.]];
+        let legacy = FdeEncoder::with_version(4, 3, 2, 1, 7, 1);
+        let token = vec![1., 0.5, -0.5, 1.];
+        let occupied = hash(&token, &e.repetitions[0].hash_planes);
+        assert_eq!(occupied, 1); // Empty buckets occur both before and after it.
+        let doc = vec![token.clone(), token.clone()];
         let encoded = e.encode_document(&doc);
-        // Encoded is [buckets × projected], stride = 2. Every bucket that
-        // was filled should produce identical projected values (all copy
-        // from the same source bucket). Before the fix, the "later" empty
-        // buckets get a scaled-down copy.
+        let legacy_encoded = legacy.encode_document(&doc);
+        let expected: Vec<_> = e.repetitions[0]
+            .projection
+            .iter()
+            .map(|plane| dot(&token, plane))
+            .collect();
         let stride = 2;
         let buckets = 1 << 3;
+        assert_eq!(e.encoding_version(), 2);
+        assert_eq!(legacy.encoding_version(), 1);
         assert_eq!(encoded.len(), buckets * stride);
-        let first = &encoded[0..stride];
-        for bucket in 1..buckets {
-            let slice = &encoded[bucket * stride..(bucket + 1) * stride];
-            for (a, b) in first.iter().zip(slice) {
+        for bucket in 0..buckets {
+            for (slot, expected) in expected.iter().enumerate() {
+                let actual = encoded[bucket * stride + slot];
                 assert!(
-                    (a - b).abs() < 1e-5,
-                    "bucket {bucket} slot differs from bucket 0: {a} vs {b}"
+                    (actual - expected).abs() < 1e-5,
+                    "bucket {bucket} differs from the occupied average"
                 );
+                let legacy_expected = if bucket > occupied {
+                    expected / 2.0
+                } else {
+                    *expected
+                };
+                assert!((legacy_encoded[bucket * stride + slot] - legacy_expected).abs() < 1e-5);
             }
         }
+        assert_ne!(encoded, legacy_encoded);
+        assert_eq!(e.encode_query(&doc), legacy.encode_query(&doc));
     }
 }

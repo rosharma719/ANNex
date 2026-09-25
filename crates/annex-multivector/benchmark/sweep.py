@@ -23,7 +23,8 @@ from run import colbert_encode, http, score
 def report_for(queries, vectors, qrels, base, backend, candidates, probes, ef_search, documents, rerank_candidates):
     run, latency, per_query = {}, [], []
     for query, vector in zip(queries, vectors):
-        body = {"vectors": np.asarray(vector).tolist(), "top_k": 100, "candidates": candidates}
+        body = {"vectors": np.asarray(vector).tolist(), "top_k": 100, "candidates": candidates,
+                "candidate_backend": "muvera"}
         if rerank_candidates is not None:
             body["rerank_candidates"] = rerank_candidates
         if backend == "centroid":

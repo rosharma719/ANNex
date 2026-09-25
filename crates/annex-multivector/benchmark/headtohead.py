@@ -174,6 +174,7 @@ def bench_annex_multivector(docs, queries, multi_docs, multi_queries, qrels, wor
                 "vectors": np.asarray(v).tolist(),
                 "top_k": 100,
                 "candidates": candidates,
+                "candidate_backend": "muvera",
             })
             times.append(time.perf_counter() - t0)
             qids.append(q.query_id)

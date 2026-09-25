@@ -3,6 +3,11 @@ use crate::storage::FAIL_COMMIT;
 use serde_json::json;
 use std::process::Command;
 
+/// Hook point for tests that need to inject failures between the ANN build
+/// completing and its state being published under the write lock. No-op in
+/// normal test runs; override at call site when needed.
+pub(super) fn before_ann_publish() {}
+
 fn config() -> IndexConfig {
     IndexConfig {
         dimension: 3,

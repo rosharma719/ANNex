@@ -120,6 +120,8 @@ struct Manifest {
     format_version: u32,
     #[serde(default)]
     generation: u64,
+    #[serde(default = "legacy_fde_encoding_version")]
+    fde_encoding_version: u32,
     config: IndexConfig,
     codebook: Vec<Vector>,
     residual_codebook: Vec<f32>,
@@ -128,14 +130,15 @@ struct Manifest {
     segments: Option<SegmentBoundaries>,
 }
 
+fn legacy_fde_encoding_version() -> u32 { 1 }
+
 fn current_format_version() -> u32 {
     1 // legacy manifests omitted this field
 }
 
 /// Verifies the legacy BLAKE3 sidecar (historically misnamed sha256).
 /// The sidecar is optional (older indexes were written without one), so we
-/// only enforce when the file exists — new writes always produce it, so the
-/// enforcement window strengthens over time.
+/// only enforce when the file exists. New commits use a self-contained envelope.
 fn verify_manifest_checksum(manifest_bytes: &[u8], sidecar_path: &Path) -> Result<(), IndexError> {
     if !sidecar_path.exists() {
         return Ok(());
@@ -186,6 +189,10 @@ pub struct IndexStats {
     pub trained: bool,
     pub fde_dimension: usize,
     pub fde_ann_nodes: usize,
+    pub fde_ann_base_nodes: usize,
+    pub fde_ann_delta_documents: usize,
+    pub fde_ann_tombstones: usize,
+    pub fde_encoding_version: u32,
 }
 #[derive(Debug, Error)]
 pub enum IndexError {
@@ -205,25 +212,31 @@ pub enum IndexError {
     )]
     CommitUncertain(io::Error),
 }
+/// Immutable graph and dense external-ID mapping, shared by staged generations.
+struct FdeAnnBase {
+    index: HNSWIndex,
+    ids: Vec<String>,
+    by_id: HashMap<String, u64>,
+}
+
+#[derive(Clone)]
+struct FdeAnn {
+    base: Arc<FdeAnnBase>,
+    // Updated IDs are scanned exactly from the append-only FDE store; a
+    // rebuild folds them into a new graph without duplicating vectors in RAM.
+    delta: HashSet<String>,
+    tombstones: HashSet<u64>,
+    generation: u64,
+}
+
 #[derive(Clone)]
 struct State {
-    /// Monotonic mutation counter. Bumped by any code path that changes
-    /// documents, codebook, or residual codebook. Persisted in the
-    /// manifest so a restart resumes with the right value. Any
-    /// derived structure (fde_ann_generation) records the value at
-    /// build time and refuses to be trusted after `generation` moves.
     generation: u64,
     codebook: Vec<Vector>,
     residual_codebook: Vec<f32>,
     documents: HashMap<String, DocumentRecord>,
     postings: Vec<HashSet<String>>,
-    fde_ann: Option<Arc<HNSWIndex>>,
-    fde_ann_ids: Vec<String>,
-    /// Which `generation` the current `fde_ann` was built at. Query paths
-    /// that dispatch to the HNSW backend refuse if this doesn't match
-    /// `generation` — protects against a caller who forgot to rebuild
-    /// after a batch of writes.
-    fde_ann_generation: u64,
+    fde_ann: Option<FdeAnn>,
 }
 pub struct MultiVectorIndex {
     root: PathBuf,
@@ -283,7 +296,7 @@ impl MultiVectorIndex {
             IndexError::Invalid(format!("index already open or cannot lock directory: {e}"))
         })?;
         let manifest_path = root.join("manifest.json");
-        let (generation, codebook, residual_codebook, mut documents, segments, checksummed) =
+        let (generation, fde_encoding_version, codebook, residual_codebook, mut documents, segments, checksummed) =
             if manifest_path.exists() {
                 let bytes = fs::read(&manifest_path)?;
                 let header: Value = serde_json::from_slice(&bytes)?;
@@ -317,6 +330,7 @@ impl MultiVectorIndex {
                 }
                 (
                     m.generation,
+                    m.fde_encoding_version,
                     m.codebook,
                     m.residual_codebook,
                     m.documents,
@@ -327,6 +341,7 @@ impl MultiVectorIndex {
                 // Without a committed manifest all segment bytes are uncommitted.
                 (
                     0,
+                    2,
                     vec![],
                     vec![],
                     HashMap::new(),
@@ -334,6 +349,9 @@ impl MultiVectorIndex {
                     false,
                 )
             };
+        if !matches!(fde_encoding_version, 1 | 2) {
+            return Err(IndexError::Invalid(format!("unsupported FDE encoding version {fde_encoding_version}")));
+        }
         validate_codebooks(
             &config,
             &codebook,
@@ -440,13 +458,17 @@ impl MultiVectorIndex {
             }
         }
         Ok(Self {
-            fde: FdeEncoder::new(
-                config.dimension,
-                config.fde_ksim,
-                config.fde_projected,
-                config.fde_repetitions,
-                0x4d55_5645_5241,
-            ),
+            fde: if fde_encoding_version == 2 {
+                FdeEncoder::new(
+                    config.dimension, config.fde_ksim, config.fde_projected,
+                    config.fde_repetitions, 0x4d55_5645_5241,
+                )
+            } else {
+                FdeEncoder::with_version(
+                    config.dimension, config.fde_ksim, config.fde_projected,
+                    config.fde_repetitions, 0x4d55_5645_5241, fde_encoding_version,
+                )
+            },
             fde_store,
             objects,
             durability,
@@ -458,8 +480,6 @@ impl MultiVectorIndex {
                 documents,
                 postings,
                 fde_ann: None,
-                fde_ann_ids: Vec::new(),
-                fde_ann_generation: 0,
             }),
             root,
             config,
@@ -488,6 +508,7 @@ impl MultiVectorIndex {
         let manifest = serde_json::to_string(&Manifest {
             format_version: FORMAT_VERSION,
             generation: s.generation,
+            fde_encoding_version: self.fde.encoding_version(),
             config: self.config.clone(),
             codebook: s.codebook.clone(),
             residual_codebook: s.residual_codebook.clone(),
@@ -522,14 +543,19 @@ impl MultiVectorIndex {
             .generation
             .checked_add(1)
             .ok_or_else(|| IndexError::Invalid("generation exhausted".into()))?;
-        next.fde_ann = None;
-        next.fde_ann_ids.clear();
-        next.fde_ann_generation = 0;
+        // Every derived change is staged before persistence, then published
+        // together with its documents, including a post-rename uncertain commit.
+        if let Some(ann) = next.fde_ann.as_mut() {
+            ann.generation = next.generation;
+        }
         let result = self.persist(&next);
         if result.is_ok() || matches!(result, Err(IndexError::CommitUncertain(_))) {
             *current = next;
         }
         result
+    }
+    fn invalidate_fde_ann(next: &mut State) {
+        next.fde_ann = None;
     }
     /// Train PLAID's coarse k-means codebook. Must happen before ingestion.
     pub fn train(&self, samples: &[Vector], iterations: usize) -> Result<(), IndexError> {
@@ -584,6 +610,8 @@ impl MultiVectorIndex {
         next.residual_codebook =
             train_scalar_codebook(&residuals, 1usize << self.config.residual_bits, 12);
         next.postings = vec![HashSet::new(); next.codebook.len()];
+        // Retraining an empty collection resets its derived graph/overlay.
+        Self::invalidate_fde_ann(&mut next);
         self.commit(&mut s, next)
     }
     pub fn upsert(
@@ -653,6 +681,12 @@ impl MultiVectorIndex {
             for &c in &unique_centroids {
                 next.postings[c as usize].insert(id.clone());
             }
+            if let Some(ann) = next.fde_ann.as_mut() {
+                if let Some(&point_id) = ann.base.by_id.get(&id) {
+                    ann.tombstones.insert(point_id);
+                }
+                ann.delta.insert(id.clone());
+            }
             next.documents.insert(
                 id,
                 DocumentRecord {
@@ -678,6 +712,12 @@ impl MultiVectorIndex {
         for c in d.unique_centroids {
             next.postings[c as usize].remove(id);
         }
+        if let Some(ann) = next.fde_ann.as_mut() {
+            if let Some(&point_id) = ann.base.by_id.get(id) {
+                ann.tombstones.insert(point_id);
+            }
+            ann.delta.remove(id);
+        }
         self.commit(&mut s, next)?;
         Ok(true)
     }
@@ -701,16 +741,14 @@ impl MultiVectorIndex {
         let approximate = self.exact_fde_scores_capped(&s, &normalized, Some(cap))?;
         self.rescore(&s, &normalized, approximate, top_k, candidates)
     }
-    /// True when an FDE-HNSW graph is built and matches the current write
-    /// generation. Query paths that opt into auto dispatch consult this
-    /// before choosing HNSW over the exact FDE scan.
+    /// Whether the base plus mutable overlay covers the current generation.
     pub fn hnsw_ready(&self) -> bool {
         let s = self.state.read().unwrap();
-        s.fde_ann.is_some() && s.fde_ann_generation == s.generation
+        s.fde_ann.as_ref().is_some_and(|ann| ann.generation == s.generation)
     }
-    /// Production default: use FDE-HNSW when it's built and fresh, otherwise
-    /// fall through to the exact FDE scan. Exact remains available as the
-    /// oracle via `query()` and `exact_fde_candidates()`.
+
+    /// Use a fresh FDE-HNSW base plus exact delta when available; otherwise
+    /// use exact FDE. Selection and rescoring share one generation read guard.
     pub fn query_auto(
         &self,
         vectors: &[Vector],
@@ -718,11 +756,26 @@ impl MultiVectorIndex {
         candidates: Option<usize>,
         ef_search: usize,
     ) -> Result<Vec<Hit>, IndexError> {
-        if self.hnsw_ready() {
-            self.query_with_fde_ann(vectors, top_k, candidates, ef_search)
-        } else {
-            self.query(vectors, top_k, candidates)
+        self.query_auto_with_backend(vectors, top_k, candidates, ef_search).map(|(hits, _)| hits)
+    }
+
+    /// Return the actual backend used under the same snapshot as the results.
+    pub fn query_auto_with_backend(
+        &self, vectors: &[Vector], top_k: usize, candidates: Option<usize>, ef_search: usize,
+    ) -> Result<(Vec<Hit>, &'static str), IndexError> {
+        self.validate(vectors)?;
+        if top_k == 0 || ef_search == 0 {
+            return Err(IndexError::Invalid("top_k and ef_search must be positive".into()));
         }
+        let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
+        let count = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
+        let s = self.state.read().unwrap();
+        let (approximate, backend) = if s.fde_ann.as_ref().is_some_and(|ann| ann.generation == s.generation) {
+            (self.ann_fde_scores(&s, &self.fde.encode_query(&normalized), count, ef_search)?, "hnsw")
+        } else {
+            (self.exact_fde_scores_capped(&s, &normalized, Some(count))?, "muvera")
+        };
+        Ok((self.rescore(&s, &normalized, approximate, top_k, candidates)?, backend))
     }
     /// Generate broad FDE candidates, prune with centroid-only MaxSim, then
     /// decode residuals only for the surviving documents.
@@ -900,29 +953,32 @@ impl MultiVectorIndex {
                 IndexError::Invalid(format!("HNSW par_insert_batch failed: {error}"))
             })?;
         }
-        // SQ8 screening: −43–50% latency at equivalent recall on annex-core's
-        // reference benches. reorder_rcm permutes internal node indices for
-        // cache locality but preserves the external PointId → node mapping,
-        // so `fde_ann_ids[point.id]` remains correct.
+        // Reorder only. SQ8 screening currently supports Cosine, whereas
+        // FDE uses Dot; allocating codes here would add cost without benefit.
         if !ids.is_empty() {
-            hnsw.enable_sq8_screening();
+            hnsw.reorder_rcm();
         }
         let built_generation = s.generation;
         drop(s);
+        commit_boundary("ann_built_before_publish")?;
+        #[cfg(test)]
+        transaction_tests::before_ann_publish();
         let mut s = self.state.write().unwrap();
-        // Race check: if a writer bumped `generation` after we started
-        // building, the HNSW is already stale. Discard the work and let
-        // the caller retry rather than serve stale results silently.
         if s.generation != built_generation {
             return Err(IndexError::Invalid(format!(
                 "index generation moved during HNSW build ({} -> {}); retry",
                 built_generation, s.generation,
             )));
         }
-        s.fde_ann = Some(Arc::new(hnsw));
-        s.fde_ann_ids = ids;
-        s.fde_ann_generation = built_generation;
-        Ok(s.fde_ann_ids.len())
+        let count = ids.len();
+        let by_id = ids.iter().enumerate().map(|(idx, id)| (id.clone(), idx as u64)).collect();
+        s.fde_ann = Some(FdeAnn {
+            base: Arc::new(FdeAnnBase { index: hnsw, ids, by_id }),
+            delta: HashSet::new(),
+            tombstones: HashSet::new(),
+            generation: built_generation,
+        });
+        Ok(count)
     }
     pub fn query_with_fde_ann(
         &self,
@@ -945,47 +1001,49 @@ impl MultiVectorIndex {
         self.rescore(&s, &normalized, approximate, top_k, candidates)
     }
     fn ann_fde_scores(
-        &self,
-        s: &State,
-        query_fde: &Vector,
-        count: usize,
-        ef_search: usize,
+        &self, s: &State, query_fde: &Vector, count: usize, ef_search: usize,
     ) -> Result<Vec<(String, f32)>, IndexError> {
         let ann = s.fde_ann.as_ref().ok_or_else(|| {
             IndexError::Invalid("FDE ANN is not built; call /v1/fde/index".into())
         })?;
-        // Generation guard: any mutation since build() invalidated fde_ann,
-        // so this check should only fail if some code path forgot to clear
-        // it. Making the check explicit here means we fail loudly instead
-        // of returning stale / deleted docs through the ANN path.
-        if s.fde_ann_generation != s.generation {
-            return Err(IndexError::Invalid(format!(
-                "FDE ANN is stale: built at generation {}, current {}; rebuild",
-                s.fde_ann_generation, s.generation,
-            )));
+        if ann.generation != s.generation {
+            return Err(IndexError::Invalid("FDE ANN generation is stale; rebuild".into()));
         }
-        let options = SearchRuntimeOptions {
-            ef_search: Some(ef_search.max(count)),
-            // Use the SQ8 codes built by enable_sq8_screening() to reject
-            // clearly-worse L0 neighbors before touching their f32 vectors.
-            // Full-precision rescore still runs on survivors, so recall at a
-            // fixed ef_search stays within noise on the reference benches.
-            sq8_screen: Some(true),
-            ..SearchRuntimeOptions::default()
-        };
-        let points = ann
-            .search_with_options(query_fde, count, &options)
-            .map_err(|error| IndexError::Invalid(format!("HNSW search failed: {error}")))?;
-        points
-            .into_iter()
-            .map(|point| {
-                let id = s
-                    .fde_ann_ids
-                    .get(point.id as usize)
+        let mut scores = Vec::new();
+        if ann.base.ids.len() > ann.tombstones.len() {
+            // Account for masked base hits before asking the graph for candidates.
+            let base_count = count.saturating_add(ann.tombstones.len()).min(ann.base.ids.len());
+            let options = SearchRuntimeOptions {
+                ef_search: Some(ef_search.max(base_count)),
+                ..SearchRuntimeOptions::default()
+            };
+            let points = ann.base.index.search_with_options(query_fde, base_count, &options)
+                .map_err(|error| IndexError::Invalid(format!("HNSW search failed: {error}")))?;
+            for point in points {
+                if ann.tombstones.contains(&point.id) { continue; }
+                let id = ann.base.ids.get(point.id as usize)
                     .ok_or_else(|| IndexError::Invalid("invalid HNSW point id".into()))?;
-                Ok((id.clone(), -point.sort_key))
-            })
-            .collect::<Result<Vec<_>, IndexError>>()
+                if !s.documents.contains_key(id) || ann.delta.contains(id) {
+                    return Err(IndexError::Invalid("FDE ANN overlay is inconsistent; rebuild".into()));
+                }
+                scores.push((id.clone(), -point.sort_key));
+            }
+        }
+        if !ann.delta.is_empty() {
+            let mapped = self.fde_store.map()?;
+            for id in &ann.delta {
+                let record = s.documents.get(id).ok_or_else(|| IndexError::Invalid("missing delta document".into()))?;
+                let vector = FixedVectorStore::get(&mapped, record.fde_location, self.fde.output_dimension())?;
+                scores.push((id.clone(), dot(query_fde, vector)));
+            }
+        }
+        let by_score = |a: &(String, f32), b: &(String, f32)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
+        if scores.len() > count {
+            scores.select_nth_unstable_by(count, by_score);
+            scores.truncate(count);
+        }
+        scores.sort_unstable_by(by_score);
+        Ok(scores)
     }
     /// Return HNSW FDE candidates before compressed MaxSim reranking.
     pub fn ann_fde_candidates(
@@ -1196,7 +1254,11 @@ impl MultiVectorIndex {
             residual_bits: self.config.residual_bits,
             trained: !s.codebook.is_empty(),
             fde_dimension: self.fde.output_dimension(),
-            fde_ann_nodes: s.fde_ann_ids.len(),
+            fde_ann_nodes: s.fde_ann.as_ref().map_or(0, |ann| ann.base.ids.len() - ann.tombstones.len() + ann.delta.len()),
+            fde_ann_base_nodes: s.fde_ann.as_ref().map_or(0, |ann| ann.base.ids.len()),
+            fde_ann_delta_documents: s.fde_ann.as_ref().map_or(0, |ann| ann.delta.len()),
+            fde_ann_tombstones: s.fde_ann.as_ref().map_or(0, |ann| ann.tombstones.len()),
+            fde_encoding_version: self.fde.encoding_version(),
         }
     }
     /// Diagnostic score over caller-provided vectors; used to verify scorer parity.
@@ -1304,7 +1366,7 @@ fn centroid_prune(
         .collect();
     let mut scored: Vec<_> = candidates
         .into_par_iter()
-        .map(|(id, _)| {
+        .map(|(id, fde_score)| {
             let document = &s.documents[&id];
             let score = interaction
                 .iter()
@@ -1316,12 +1378,12 @@ fn centroid_prune(
                         .fold(f32::NEG_INFINITY, f32::max)
                 })
                 .sum::<f32>();
-            (id, score)
+            (id, fde_score, score)
         })
         .collect();
-    scored.par_sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    scored.par_sort_unstable_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
     scored.truncate(survivors);
-    scored
+    scored.into_iter().map(|(id, fde_score, _)| (id, fde_score)).collect()
 }
 fn nearest(vector: &Vector, centroids: &[Vector]) -> usize {
     centroids

@@ -86,7 +86,7 @@ def main():
         overlaps, exact_relevant, ann_relevant = [], [], []
         for query, vector in zip(queries, vectors):
             vector = np.asarray(vector).tolist()
-            request = {"vectors": vector, "count": args.candidates}
+            request = {"vectors": vector, "count": args.candidates, "candidate_backend": "muvera"}
             exact = http(base, "/v1/debug/candidates", request)["candidates"]
             ann = http(
                 base,
@@ -101,8 +101,8 @@ def main():
             ann_relevant.append(len(ann_ids & relevant) / len(relevant))
 
             configurations = {
-                "exhaustive": {"vectors": vector, "top_k": 100, "candidates": stats["documents"]},
-                "exact_fde": {"vectors": vector, "top_k": 100, "candidates": args.candidates},
+                "exhaustive": {"vectors": vector, "top_k": 100, "candidates": stats["documents"], "candidate_backend": "muvera"},
+                "exact_fde": {"vectors": vector, "top_k": 100, "candidates": args.candidates, "candidate_backend": "muvera"},
                 "hnsw": {"vectors": vector, "top_k": 100, "candidates": args.candidates, "candidate_backend": "hnsw", "ef_search": args.ef_search},
             }
             for name, body in configurations.items():

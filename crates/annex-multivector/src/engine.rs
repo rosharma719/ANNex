@@ -1,7 +1,10 @@
 use crate::{
     fde::{Vector, dot, maxsim_flat, normalize},
     muvera::FdeEncoder,
-    storage::{CompressedVectorStore, FixedVectorStore, ObjectLocation, atomic_write},
+    storage::{
+        CompressedVectorStore, FixedVectorStore, ObjectLocation, atomic_write, commit_boundary,
+        record_bytes, verify_record,
+    },
 };
 use annex::{
     utils::types::DistanceMetric,
@@ -13,7 +16,8 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet},
-    fs, io,
+    fs::{self, File, OpenOptions},
+    io,
     path::{Path, PathBuf},
     sync::RwLock,
 };
@@ -83,7 +87,32 @@ struct DocumentRecord {
 /// FDE in particular) prove it was built against the current document set.
 ///
 /// Format changes: bump FORMAT_VERSION and add a From<oldManifest> path.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+
+/// Fsync is the default: acknowledge only after segment data, the manifest,
+/// and its directory entry are synced. Buffered retains atomic visibility,
+/// but does not promise power-loss durability. There is no background flusher.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    #[default]
+    Fsync,
+    Buffered,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+struct SegmentBoundaries {
+    objects: u64,
+    fde: u64,
+}
+
+/// Digest and exact manifest bytes are replaced in ONE rename, eliminating
+/// the torn sidecar/manifest pair in format 1. The digest is BLAKE3, not SHA256.
+#[derive(Deserialize, Serialize)]
+struct ManifestEnvelope {
+    format_version: u32,
+    checksum_blake3: String,
+    manifest: String,
+}
 
 #[derive(Deserialize, Serialize)]
 struct Manifest {
@@ -95,13 +124,15 @@ struct Manifest {
     codebook: Vec<Vector>,
     residual_codebook: Vec<f32>,
     documents: HashMap<String, DocumentRecord>,
+    #[serde(default)]
+    segments: Option<SegmentBoundaries>,
 }
 
 fn current_format_version() -> u32 {
-    FORMAT_VERSION
+    1 // legacy manifests omitted this field
 }
 
-/// Verifies the sidecar sha256 against the manifest bytes we just read.
+/// Verifies the legacy BLAKE3 sidecar (historically misnamed sha256).
 /// The sidecar is optional (older indexes were written without one), so we
 /// only enforce when the file exists — new writes always produce it, so the
 /// enforcement window strengthens over time.
@@ -147,6 +178,7 @@ pub struct UpsertDocument {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct IndexStats {
     pub documents: usize,
+    pub generation: u64,
     pub token_vectors: usize,
     pub compressed_bytes: u64,
     pub centroids: usize,
@@ -168,7 +200,12 @@ pub enum IndexError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(
+        "generation published, but durable commit is uncertain; reopen or retry idempotently: {0}"
+    )]
+    CommitUncertain(io::Error),
 }
+#[derive(Clone)]
 struct State {
     /// Monotonic mutation counter. Bumped by any code path that changes
     /// documents, codebook, or residual codebook. Persisted in the
@@ -195,10 +232,21 @@ pub struct MultiVectorIndex {
     fde: FdeEncoder,
     fde_store: FixedVectorStore,
     state: RwLock<State>,
+    durability: Durability,
+    // One process/handle owns append offsets and manifest publication at a time.
+    _directory_lock: File,
 }
 
 impl MultiVectorIndex {
     pub fn open(path: impl AsRef<Path>, config: IndexConfig) -> Result<Self, IndexError> {
+        Self::open_with_durability(path, config, Durability::Fsync)
+    }
+
+    pub fn open_with_durability(
+        path: impl AsRef<Path>,
+        config: IndexConfig,
+        durability: Durability,
+    ) -> Result<Self, IndexError> {
         if config.dimension == 0
             || config.centroids == 0
             || config.probes == 0
@@ -212,29 +260,179 @@ impl MultiVectorIndex {
                 "dimension, centroids, probes, and residual_bits (1..=8) must be valid".into(),
             ));
         }
+        validate_config_size(&config)?;
         let root = path.as_ref().to_owned();
+        let mut created_parents = Vec::new();
+        let mut missing = root.as_path();
+        while !missing.exists() {
+            let parent = missing
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            created_parents.push(parent.to_owned());
+            missing = parent;
+        }
         fs::create_dir_all(&root)?;
-        let path = root.join("manifest.json");
-        let (generation, codebook, residual_codebook, documents) = if path.exists() {
-            let bytes = fs::read(&path)?;
-            verify_manifest_checksum(&bytes, &root.join("manifest.sha256"))?;
-            let m: Manifest = serde_json::from_slice(&bytes)?;
-            if m.format_version != FORMAT_VERSION {
-                return Err(IndexError::Invalid(format!(
-                    "manifest format_version={} unsupported (this build expects {})",
-                    m.format_version, FORMAT_VERSION,
-                )));
+        let directory_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join("index.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&directory_lock).map_err(|e| {
+            IndexError::Invalid(format!("index already open or cannot lock directory: {e}"))
+        })?;
+        let manifest_path = root.join("manifest.json");
+        let (generation, codebook, residual_codebook, mut documents, segments, checksummed) =
+            if manifest_path.exists() {
+                let bytes = fs::read(&manifest_path)?;
+                let header: Value = serde_json::from_slice(&bytes)?;
+                let (m, checksummed): (Manifest, bool) = if header.get("manifest").is_some() {
+                    let envelope: ManifestEnvelope = serde_json::from_slice(&bytes)?;
+                    if envelope.format_version != FORMAT_VERSION
+                        || blake3::hash(envelope.manifest.as_bytes()).to_hex().as_str()
+                            != envelope.checksum_blake3
+                    {
+                        return Err(IndexError::Invalid(
+                            "manifest checksum or envelope version mismatch".into(),
+                        ));
+                    }
+                    (serde_json::from_str(&envelope.manifest)?, true)
+                } else {
+                    verify_manifest_checksum(&bytes, &root.join("manifest.sha256"))?;
+                    (serde_json::from_slice(&bytes)?, false)
+                };
+                if m.format_version != if checksummed { FORMAT_VERSION } else { 1 }
+                    || (checksummed && m.segments.is_none())
+                {
+                    return Err(IndexError::Invalid(
+                        "unsupported manifest version or missing committed boundaries".into(),
+                    ));
+                }
+                if m.config != config {
+                    return Err(IndexError::Config {
+                        actual: m.config,
+                        requested: config,
+                    });
+                }
+                (
+                    m.generation,
+                    m.codebook,
+                    m.residual_codebook,
+                    m.documents,
+                    m.segments,
+                    checksummed,
+                )
+            } else {
+                // Without a committed manifest all segment bytes are uncommitted.
+                (
+                    0,
+                    vec![],
+                    vec![],
+                    HashMap::new(),
+                    Some(SegmentBoundaries { objects: 0, fde: 0 }),
+                    false,
+                )
+            };
+        validate_codebooks(
+            &config,
+            &codebook,
+            &residual_codebook,
+            !documents.is_empty(),
+        )?;
+        let objects = CompressedVectorStore::new(root.join("objects"))?;
+        let fde_store = FixedVectorStore::new(root.join("fde"))?;
+        if !manifest_path.exists() && (objects.len()? != 0 || fde_store.len()? != 0) {
+            return Err(IndexError::Invalid(
+                "missing manifest for non-empty segments".into(),
+            ));
+        }
+        let boundaries = segments.unwrap_or(SegmentBoundaries {
+            objects: objects.len()?,
+            fde: fde_store.len()?,
+        });
+        if objects.len()? < boundaries.objects || fde_store.len()? < boundaries.fde {
+            return Err(IndexError::Invalid(
+                "segment shorter than committed boundary".into(),
+            ));
+        }
+        if !documents.is_empty() {
+            let objects_map = objects.map()?;
+            let fde_map = fde_store.map()?;
+            let object_bytes = objects_map
+                .get(
+                    ..usize::try_from(boundaries.objects)
+                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?,
+                )
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+            let fde_bytes = fde_map
+                .get(
+                    ..usize::try_from(boundaries.fde)
+                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?,
+                )
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+            let fde_dimension =
+                (1usize << config.fde_ksim) * config.fde_projected * config.fde_repetitions;
+            for d in documents.values_mut() {
+                verify_record(object_bytes, d.location, checksummed)?;
+                verify_record(fde_bytes, d.fde_location, checksummed)?;
+                let decoded = CompressedVectorStore::decode(
+                    object_bytes,
+                    d.location,
+                    &codebook,
+                    &residual_codebook,
+                )?;
+                if decoded.dimension != config.dimension
+                    || d.tokens == 0
+                    || decoded.values.len() / config.dimension != d.tokens
+                    || d.centroid_ids.len() != d.tokens
+                    || d.compressed_bytes != d.location.length
+                    || d.centroid_ids.iter().any(|&c| c as usize >= codebook.len())
+                    || decoded.values.iter().any(|v| !v.is_finite())
+                {
+                    return Err(IndexError::Invalid(
+                        "invalid document shape or centroid IDs".into(),
+                    ));
+                }
+                let bytes = record_bytes(object_bytes, d.location)?;
+                let stored_ids = bytes[16..16 + d.tokens * 4]
+                    .chunks_exact(4)
+                    .map(|v| u32::from_le_bytes(v.try_into().unwrap()));
+                if !stored_ids.eq(d.centroid_ids.iter().copied()) {
+                    return Err(IndexError::Invalid(
+                        "manifest/record centroid mismatch".into(),
+                    ));
+                }
+                let mut unique = d.centroid_ids.clone();
+                unique.sort_unstable();
+                unique.dedup();
+                if unique != d.unique_centroids {
+                    return Err(IndexError::Invalid("invalid document posting list".into()));
+                }
+                if FixedVectorStore::get(fde_bytes, d.fde_location, fde_dimension)?
+                    .iter()
+                    .any(|v| !v.is_finite())
+                {
+                    return Err(IndexError::Invalid("non-finite FDE record".into()));
+                }
+                // Upgrade legacy records in memory; the next commit writes their digests.
+                d.location.checksum =
+                    Some(*blake3::hash(record_bytes(object_bytes, d.location)?).as_bytes());
+                d.fde_location.checksum =
+                    Some(*blake3::hash(record_bytes(fde_bytes, d.fde_location)?).as_bytes());
             }
-            if m.config != config {
-                return Err(IndexError::Config {
-                    actual: m.config,
-                    requested: config,
-                });
+        }
+        // No mappings survive this point: discard only the uncommitted tail.
+        objects.recover(boundaries.objects)?;
+        fde_store.recover(boundaries.fde)?;
+        if durability == Durability::Fsync {
+            File::open(root.join("objects"))?.sync_all()?;
+            File::open(root.join("fde"))?.sync_all()?;
+            File::open(&root)?.sync_all()?;
+            for parent in created_parents {
+                File::open(parent)?.sync_all()?;
             }
-            (m.generation, m.codebook, m.residual_codebook, m.documents)
-        } else {
-            (0, vec![], vec![], HashMap::new())
-        };
+        }
         let mut postings = vec![HashSet::new(); codebook.len()];
         for (id, d) in &documents {
             for &c in &d.centroid_ids {
@@ -249,8 +447,10 @@ impl MultiVectorIndex {
                 config.fde_repetitions,
                 0x4d55_5645_5241,
             ),
-            fde_store: FixedVectorStore::new(root.join("fde"))?,
-            objects: CompressedVectorStore::new(root.join("objects"))?,
+            fde_store,
+            objects,
+            durability,
+            _directory_lock: directory_lock,
             state: RwLock::new(State {
                 generation,
                 codebook,
@@ -279,23 +479,57 @@ impl MultiVectorIndex {
         }
     }
     fn persist(&self, s: &State) -> Result<(), IndexError> {
-        let bytes = serde_json::to_vec(&Manifest {
+        if self.durability == Durability::Fsync {
+            self.objects.sync()?;
+            commit_boundary("objects_synced")?;
+            self.fde_store.sync()?;
+            commit_boundary("fde_synced")?;
+        }
+        let manifest = serde_json::to_string(&Manifest {
             format_version: FORMAT_VERSION,
             generation: s.generation,
             config: self.config.clone(),
             codebook: s.codebook.clone(),
             residual_codebook: s.residual_codebook.clone(),
             documents: s.documents.clone(),
+            segments: Some(SegmentBoundaries {
+                objects: self.objects.len()?,
+                fde: self.fde_store.len()?,
+            }),
         })?;
-        // Sidecar sha256 file so torn / partial reads or bit-flipped storage
-        // are caught on next open() rather than silently propagating stale
-        // documents into query results. atomic_write below already ensures
-        // the primary file is either the old or the new version (never
-        // half of each); the checksum guards against corruption at rest.
-        let sum = blake3::hash(&bytes);
-        atomic_write(&self.root.join("manifest.sha256"), sum.to_hex().as_bytes())?;
-        atomic_write(&self.root.join("manifest.json"), &bytes)?;
-        Ok(())
+        let envelope = ManifestEnvelope {
+            format_version: FORMAT_VERSION,
+            checksum_blake3: blake3::hash(manifest.as_bytes()).to_hex().to_string(),
+            manifest,
+        };
+        let bytes = serde_json::to_vec(&envelope)?;
+        atomic_write(
+            &self.root.join("manifest.json"),
+            &bytes,
+            self.durability == Durability::Fsync,
+        )
+        .map_err(|e| {
+            if e.published {
+                IndexError::CommitUncertain(e.source)
+            } else {
+                IndexError::Io(e.source)
+            }
+        })
+    }
+
+    fn commit(&self, current: &mut State, mut next: State) -> Result<(), IndexError> {
+        next.generation = current
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| IndexError::Invalid("generation exhausted".into()))?;
+        next.fde_ann = None;
+        next.fde_ann_ids.clear();
+        next.fde_ann_generation = 0;
+        let result = self.persist(&next);
+        if result.is_ok() || matches!(result, Err(IndexError::CommitUncertain(_))) {
+            *current = next;
+        }
+        result
     }
     /// Train PLAID's coarse k-means codebook. Must happen before ingestion.
     pub fn train(&self, samples: &[Vector], iterations: usize) -> Result<(), IndexError> {
@@ -334,11 +568,12 @@ impl MultiVectorIndex {
                 }
             }
         }
-        s.codebook = centers;
+        let mut next = s.clone();
+        next.codebook = centers;
         let residuals: Vec<f32> = samples
             .iter()
             .flat_map(|vector| {
-                let center = &s.codebook[nearest(vector, &s.codebook)];
+                let center = &next.codebook[nearest(vector, &next.codebook)];
                 vector
                     .iter()
                     .zip(center)
@@ -346,11 +581,10 @@ impl MultiVectorIndex {
                     .collect::<Vec<_>>()
             })
             .collect();
-        s.residual_codebook =
+        next.residual_codebook =
             train_scalar_codebook(&residuals, 1usize << self.config.residual_bits, 12);
-        s.postings = vec![HashSet::new(); s.codebook.len()];
-        s.generation = s.generation.wrapping_add(1);
-        self.persist(&s)
+        next.postings = vec![HashSet::new(); next.codebook.len()];
+        self.commit(&mut s, next)
     }
     pub fn upsert(
         &self,
@@ -364,24 +598,33 @@ impl MultiVectorIndex {
             metadata,
         }])
     }
-    /// Ingest a batch while writing the persistent manifest only once.
+    /// Atomically replace the whole batch. Duplicate IDs use the last value.
+    /// Empty batches are no-ops. On a pre-publication error no document,
+    /// posting, generation, or existing ANN changes; unreachable bytes may
+    /// remain in the append-only segments until recovery/compaction.
     pub fn upsert_batch(&self, batch: Vec<UpsertDocument>) -> Result<(), IndexError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
         for document in &batch {
             self.validate(&document.vectors)?;
         }
         let mut s = self.state.write().unwrap();
-        s.fde_ann = None;
-        s.fde_ann_ids.clear();
         if s.codebook.is_empty() {
             return Err(IndexError::Invalid(
                 "index is untrained; call train first".into(),
             ));
         }
+        let mut next = s.clone();
         for document in batch {
             let id = document.id;
-            if let Some(old_ids) = s.documents.get(&id).map(|old| old.unique_centroids.clone()) {
+            if let Some(old_ids) = next
+                .documents
+                .get(&id)
+                .map(|old| old.unique_centroids.clone())
+            {
                 for c in old_ids {
-                    s.postings[c as usize].remove(&id);
+                    next.postings[c as usize].remove(&id);
                 }
             }
             let vectors: Vec<_> = document
@@ -391,7 +634,7 @@ impl MultiVectorIndex {
                 .collect();
             let ids: Vec<u32> = vectors
                 .iter()
-                .map(|v| nearest(v, &s.codebook) as u32)
+                .map(|v| nearest(v, &next.codebook) as u32)
                 .collect();
             let mut unique_centroids = ids.clone();
             unique_centroids.sort_unstable();
@@ -399,16 +642,18 @@ impl MultiVectorIndex {
             let (location, size) = self.objects.put(
                 &vectors,
                 &ids,
-                &s.codebook,
-                &s.residual_codebook,
+                &next.codebook,
+                &next.residual_codebook,
                 self.config.residual_bits,
             )?;
+            commit_boundary("object_appended")?;
             let fde = self.fde.encode_document(&vectors);
             let fde_location = self.fde_store.put(&fde)?;
+            commit_boundary("fde_appended")?;
             for &c in &unique_centroids {
-                s.postings[c as usize].insert(id.clone());
+                next.postings[c as usize].insert(id.clone());
             }
-            s.documents.insert(
+            next.documents.insert(
                 id,
                 DocumentRecord {
                     centroid_ids: ids,
@@ -421,28 +666,20 @@ impl MultiVectorIndex {
                 },
             );
         }
-        s.generation = s.generation.wrapping_add(1);
-        self.persist(&s)
+        self.commit(&mut s, next)
     }
     pub fn delete(&self, id: &str) -> Result<bool, IndexError> {
         let mut s = self.state.write().unwrap();
-        // Any prior FDE-over-HNSW index still contains this doc's node.
-        // Without invalidation, query_with_fde_ann would keep returning
-        // the deleted doc through the stale ANN graph. Match upsert_batch
-        // and drop the derived structure — callers rebuild on next need.
-        s.fde_ann = None;
-        s.fde_ann_ids.clear();
-        s.fde_ann_generation = 0;
-        if let Some(d) = s.documents.remove(id) {
-            for c in d.unique_centroids {
-                s.postings[c as usize].remove(id);
-            }
-            s.generation = s.generation.wrapping_add(1);
-            self.persist(&s)?;
-            Ok(true)
-        } else {
-            Ok(false)
+        if !s.documents.contains_key(id) {
+            return Ok(false);
         }
+        let mut next = s.clone();
+        let d = next.documents.remove(id).unwrap();
+        for c in d.unique_centroids {
+            next.postings[c as usize].remove(id);
+        }
+        self.commit(&mut s, next)?;
+        Ok(true)
     }
     /// PLAID centroid interaction -> inverted-list candidate generation -> residual MaxSim.
     pub fn query(
@@ -460,8 +697,8 @@ impl MultiVectorIndex {
         // so exact_fde_scores can partial-sort instead of fully sorting the
         // 10K+ pool it just scored.
         let cap = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
-        let approximate = self.exact_fde_scores_capped(&normalized, Some(cap))?;
         let s = self.state.read().unwrap();
+        let approximate = self.exact_fde_scores_capped(&s, &normalized, Some(cap))?;
         self.rescore(&s, &normalized, approximate, top_k, candidates)
     }
     /// Generate broad FDE candidates, prune with centroid-only MaxSim, then
@@ -476,8 +713,8 @@ impl MultiVectorIndex {
         self.validate(vectors)?;
         check_pruning_shape(top_k, candidates, rerank_candidates)?;
         let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
-        let approximate = self.exact_fde_scores_capped(&normalized, Some(candidates))?;
         let s = self.state.read().unwrap();
+        let approximate = self.exact_fde_scores_capped(&s, &normalized, Some(candidates))?;
         self.prune_and_rescore(
             &s,
             &normalized,
@@ -529,7 +766,8 @@ impl MultiVectorIndex {
         self.rescore(s, normalized, pruned, top_k, Some(rerank_candidates))
     }
     fn exact_fde_scores(&self, normalized: &[Vector]) -> Result<Vec<(String, f32)>, IndexError> {
-        self.exact_fde_scores_capped(normalized, None)
+        let s = self.state.read().unwrap();
+        self.exact_fde_scores_capped(&s, normalized, None)
     }
 
     /// FDE exhaustive scan, optionally returning only the top `cap` results.
@@ -539,11 +777,14 @@ impl MultiVectorIndex {
     /// candidate pool whose tail is discarded by rescore anyway.
     fn exact_fde_scores_capped(
         &self,
+        s: &State,
         normalized: &[Vector],
         cap: Option<usize>,
     ) -> Result<Vec<(String, f32)>, IndexError> {
+        if s.documents.is_empty() {
+            return Ok(Vec::new());
+        }
         let query_fde = self.fde.encode_query(normalized);
-        let s = self.state.read().unwrap();
         let mapped_fdes = self.fde_store.map()?;
         let fde_dimension = self.fde.output_dimension();
         let approximate_results: Result<Vec<_>, io::Error> = s
@@ -604,7 +845,11 @@ impl MultiVectorIndex {
         }
         let s = self.state.read().unwrap();
         let dimension = self.fde.output_dimension();
-        let mapped = self.fde_store.map()?;
+        let mapped = if s.documents.is_empty() {
+            None
+        } else {
+            Some(self.fde_store.map()?)
+        };
         let mut ids: Vec<_> = s.documents.keys().cloned().collect();
         ids.sort();
         let hnsw = HNSWIndex::new(DistanceMetric::Dot, m, ef_construct, 16, dimension);
@@ -619,9 +864,12 @@ impl MultiVectorIndex {
                 .iter()
                 .enumerate()
                 .map(|(offset, id)| {
-                    let vector =
-                        FixedVectorStore::get(&mapped, s.documents[id].fde_location, dimension)?
-                            .to_vec();
+                    let vector = FixedVectorStore::get(
+                        mapped.as_deref().unwrap(),
+                        s.documents[id].fde_location,
+                        dimension,
+                    )?
+                    .to_vec();
                     Ok::<_, IndexError>(((base + offset) as u64, vector))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -786,6 +1034,9 @@ impl MultiVectorIndex {
         top_k: usize,
         candidates: Option<usize>,
     ) -> Result<Vec<Hit>, IndexError> {
+        if approximate.is_empty() {
+            return Ok(Vec::new());
+        }
         let count = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
         let mapped = self.objects.map()?;
         // Per-stage timing accumulators, gated by MULTIVECTOR_TIMING. Cached
@@ -903,6 +1154,7 @@ impl MultiVectorIndex {
         let s = self.state.read().unwrap();
         IndexStats {
             documents: s.documents.len(),
+            generation: s.generation,
             token_vectors: s.documents.values().map(|d| d.tokens).sum(),
             compressed_bytes: s.documents.values().map(|d| d.compressed_bytes).sum(),
             centroids: s.codebook.len(),
@@ -943,6 +1195,54 @@ impl MultiVectorIndex {
         )?;
         Ok(maxsim_flat(&query, &document.values, document.dimension))
     }
+}
+
+fn validate_config_size(c: &IndexConfig) -> Result<(), IndexError> {
+    // Upper bound on any individual encoder/codebook workspace (64 MiB f32).
+    const MAX_VALUES: usize = 16 * 1024 * 1024;
+    let bounded = |n: Option<usize>| n.is_some_and(|n| n <= MAX_VALUES);
+    let buckets = 1usize << c.fde_ksim;
+    if c.centroids > u32::MAX as usize
+        || !bounded(c.dimension.checked_mul(c.centroids))
+        || !bounded(
+            buckets
+                .checked_mul(c.fde_projected)
+                .and_then(|n| n.checked_mul(c.fde_repetitions)),
+        )
+        || !bounded(
+            c.fde_projected
+                .checked_add(c.fde_ksim)
+                .and_then(|n| n.checked_mul(c.dimension))
+                .and_then(|n| n.checked_mul(c.fde_repetitions)),
+        )
+        || !bounded(buckets.checked_mul(c.dimension))
+    {
+        return Err(IndexError::Invalid(
+            "configuration exceeds checked 64 MiB workspace limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_codebooks(
+    c: &IndexConfig,
+    centers: &[Vector],
+    residuals: &[f32],
+    has_docs: bool,
+) -> Result<(), IndexError> {
+    if centers.is_empty() && residuals.is_empty() && !has_docs {
+        return Ok(());
+    }
+    if centers.len() != c.centroids
+        || residuals.len() != 1usize << c.residual_bits
+        || centers
+            .iter()
+            .any(|v| v.len() != c.dimension || v.iter().any(|x| !x.is_finite()))
+        || residuals.iter().any(|x| !x.is_finite())
+    {
+        return Err(IndexError::Invalid("invalid persisted codebook".into()));
+    }
+    Ok(())
 }
 
 fn check_pruning_shape(
@@ -1027,3 +1327,7 @@ fn train_scalar_codebook(values: &[f32], levels: usize, iterations: usize) -> Ve
     centers.sort_unstable_by(|a, b| a.total_cmp(b));
     centers
 }
+
+#[cfg(test)]
+#[path = "transaction_tests.rs"]
+mod transaction_tests;

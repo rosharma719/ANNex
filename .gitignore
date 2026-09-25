@@ -1,14 +1,4 @@
-/target
-# All datasets
-data/
-# Local logs
-logs/
-.DS_Store
-__pycache__/
-*.log
-*.pyc
-*.pyo
-# Scratch investigation artifacts — never commit
-experiments/
-# SDD workspace (git-ignored scratch for subagent-driven dev)
-.superpowers/
+# Orphan benchmark output dir when scripts are run from workspace root
+# instead of crates/annex-multivector. Real benchmark cache lives under
+# crates/annex-multivector/benchmark/.
+/benchmark/

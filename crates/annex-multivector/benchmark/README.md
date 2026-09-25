@@ -213,3 +213,69 @@ Two operational notes from these runs:
   `candidate_backend: "hnsw"` together with `rerank_candidates` and the same
   broad-fetch → centroid-prune → residual-rerank pipeline runs, sourcing broad
   candidates from the FDE ANN graph instead of the exact FDE scan.
+
+
+## Development versus held-out evaluation
+
+`sweep.py` and `headtohead.py` default to `--partition dev`. They deterministically
+split the evaluable query IDs into equal-sized (±1) disjoint halves using
+`--split-seed` (default 20260924). Document selection happens once before splitting,
+so both partitions see the same corpus. Every retained query keeps all qrels
+provided by the chosen slice. Existing `--sampling prefix` still produces a
+**diagnostic subset** and can drop out-of-corpus judgments; use `--sampling qrels`
+(or a complete corpus) to preserve all positive judgments for selected queries.
+The split does not retroactively make previously inspected queries untouched.
+
+1. Tune candidate/efSearch grids with `--partition dev`.
+2. Choose one operating point and run the same command with
+   `--partition dev --freeze-config /path/to/operating-point.json`.
+   This writes an immutable artifact and exits **before evaluation**.
+3. Run that one point with
+   `--partition test --frozen-config /path/to/operating-point.json`.
+   Grids, changed parameters, changed document/query text or qrels, changed split,
+   changed source, or changed recorded dependencies are rejected before querying.
+
+For example, from the workspace root (use your existing benchmark Python env):
+
+```sh
+python crates/annex-multivector/benchmark/sweep.py \
+  --index /absolute/path/to/index --dataset beir/nfcorpus/test \
+  --sampling qrels --backend hnsw --candidate-grid 100 250 500 \
+  --ef-search-grid 128 256 --hnsw-ef-construct 256 --partition dev
+
+# After choosing an operating point on dev:
+python crates/annex-multivector/benchmark/sweep.py \
+  --index /absolute/path/to/index --dataset beir/nfcorpus/test \
+  --sampling qrels --backend hnsw --candidates 250 --ef-search 256 \
+  --hnsw-ef-construct 256 --partition dev --freeze-config /tmp/nfcorpus-point.json
+
+python crates/annex-multivector/benchmark/sweep.py \
+  --index /absolute/path/to/index --dataset beir/nfcorpus/test \
+  --sampling qrels --backend hnsw --candidates 250 --ef-search 256 \
+  --hnsw-ef-construct 256 --partition test --frozen-config /tmp/nfcorpus-point.json
+```
+
+`--hnsw-ef-construct` is independent of the efSearch grid, so changing the grid no
+longer silently changes the graph build. Sweep artifacts also bind the persisted
+index manifest digest. Full existing query embedding caches are reused, then
+filtered to the chosen partition. `--partition exploratory` evaluates the whole
+slice and is always labeled development exploration; it cannot create a freeze.
+
+Reports contain query IDs, the split and content digest, exact settings, source
+and dependency fingerprints, and durability mode. Sweep reports retain every
+query's ranking, latency, and error (failed queries score zero and remain in the
+denominator). Head-to-head requires a new output directory for each evaluated
+run so earlier matrices are not overwritten. `--durability fsync` is the default;
+`buffered` must be explicitly chosen and is recorded. Frozen artifacts are
+reproducibility records, not tamper-proof proofs or evidence of an untouched set.
+
+Real Qdrant Server runs must use a pinned image and `--qdrant-server URL`;
+the server's reported version is bound into the head-to-head frozen artifact.
+This protocol change does **not** supply new Qdrant measurements or implement the
+MUVERA→ColBERT comparator. Those are still required before competitive claims.
+
+Protocol tests require only Python's standard library:
+
+```sh
+python -m unittest discover -s crates/annex-multivector/benchmark -p 'test_protocol*.py'
+```

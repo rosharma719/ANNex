@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use multivector::{IndexConfig, IndexError, MultiVectorIndex, UpsertDocument};
+use multivector::{Durability, IndexConfig, IndexError, MultiVectorIndex, UpsertDocument};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -32,6 +32,9 @@ struct Args {
     fde_ksim: usize,
     #[arg(long, default_value_t = 8)]
     fde_projected: usize,
+    /// Fsync acknowledges durable commits; buffered only promises atomic visibility.
+    #[arg(long, default_value = "fsync", value_parser = ["fsync", "buffered"])]
+    durability: String,
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
 }
@@ -308,7 +311,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fde_ksim: args.fde_ksim,
         fde_projected: args.fde_projected,
     };
-    let index = Arc::new(MultiVectorIndex::open(args.path, config)?);
+    let durability = if args.durability == "fsync" {
+        Durability::Fsync
+    } else {
+        Durability::Buffered
+    };
+    let index = Arc::new(MultiVectorIndex::open_with_durability(
+        args.path, config, durability,
+    )?);
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/v1/stats", get(stats))

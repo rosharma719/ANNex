@@ -1,0 +1,17 @@
+name: Retrieval correctness stress
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+jobs:
+  state-machine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANNEX_ORACLE_SEEDS: '128'
+      ANNEX_ORACLE_STEPS: '512'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Mutation, restart, crash, and scalar-oracle properties
+        run: cargo test -p annex-multivector --lib transaction_tests -- --nocapture

@@ -40,6 +40,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Benchmark protocol tests
+        run: python3 -m unittest discover -s crates/annex-multivector/benchmark -p 'test_protocol*.py'
+
       - name: rustfmt
         run: cargo fmt --all -- --check
 

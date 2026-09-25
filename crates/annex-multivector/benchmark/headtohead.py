@@ -17,9 +17,17 @@ import json
 import math
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
+
+# Make sibling modules (protocol, data, embeddings, ...) importable regardless
+# of how this file is loaded — direct script, `python -m benchmark.headtohead`,
+# or `importlib.util.spec_from_file_location` from a test harness. Without
+# this, the bare `from protocol import ...` below only resolves in script
+# mode from the benchmark/ working directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
 
@@ -27,6 +35,7 @@ from colbert_config import MODEL_ID as COLBERT_MODEL_ID, cache_config
 from data import load_slice, write_slice_manifest
 from embeddings import cached_ragged
 from env import load_env
+from protocol import add_protocol_arguments, prepare_protocol, source_digest, environment_settings
 
 
 def evaluate(qrels, run, k=10):
@@ -97,7 +106,7 @@ def http(base, route, body=None):
         return json.load(response)
 
 
-def bench_annex_multivector(docs, queries, multi_docs, multi_queries, qrels, workspace_root, candidates=250):
+def bench_annex_multivector(docs, queries, multi_docs, multi_queries, qrels, workspace_root, candidates=250, durability="fsync"):
     """Run against our own annex-multivector server (same path as benchmark/run.py)."""
     bin_path = workspace_root / "target/release/annex-multivector"
     plaid_path = Path("/tmp/headtohead-plaid")
@@ -110,6 +119,7 @@ def bench_annex_multivector(docs, queries, multi_docs, multi_queries, qrels, wor
             "--centroids", "256",
             "--probes", "8",
             "--path", str(plaid_path),
+            "--durability", durability,
             "--listen", "127.0.0.1:18090",
         ],
         stdout=subprocess.DEVNULL,
@@ -377,16 +387,48 @@ def main():
         "--qdrant-server",
         default=None,
         help="URL of a running Qdrant Server (e.g. http://127.0.0.1:6333). "
-        "Start one with: docker run -p 6333:6333 qdrant/qdrant:latest",
+        "Use a pinned Qdrant image; server version is recorded in the frozen configuration.",
     )
     p.add_argument("--annex-candidates", type=int, default=250)
     p.add_argument("--annex-sweep", default="", help="comma-separated candidate counts for annex Pareto sweep")
+    p.add_argument("--durability", choices=["fsync", "buffered"], default="fsync")
+    add_protocol_arguments(p)
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
 
     docs, queries, qrels = load_slice(
         args.dataset, args.limit_docs, args.limit_queries, args.sampling, args.sample_seed
     )
+    workspace_root = Path(__file__).resolve().parents[3]
+    engines = sorted(set(args.engines.split(",")))
+    if set(engines) - {"annex", "qdrant", "qdrant_local", "qdrant_server", "lancedb"}:
+        p.error("unknown benchmark engine")
+    sweep = [int(x) for x in args.annex_sweep.split(",") if x] or [args.annex_candidates]
+    if any(n <= 0 for n in sweep):
+        p.error("candidate counts must be positive")
+    all_queries = queries
+    settings = {
+        "environment": environment_settings(),
+        "harness": "headtohead", "source_sha256": source_digest(workspace_root),
+        "engines": engines, "annex_candidates": sweep, "durability": args.durability,
+        "annex": {"centroids": 256, "residual_bits": 2, "probes": 8,
+                  "fde_repetitions": 20, "fde_ksim": 4, "fde_projected": 8,
+                  "train_iterations": 20, "train_seed": 13},
+        "model": COLBERT_MODEL_ID, "top_k": 100,
+        "query_encoding": cache_config("query"), "document_encoding": cache_config("document"),
+    }
+    if "qdrant_server" in engines:
+        if not args.qdrant_server:
+            p.error("--qdrant-server URL required for qdrant_server engine")
+        settings["qdrant_server_info"] = http(args.qdrant_server.rstrip("/"), "/")
+    queries, qrels, protocol = prepare_protocol(
+        args, docs, queries, qrels, settings, operating_points=len(sweep),
+    )
+    if args.freeze_config:
+        print(f"Frozen operating point: {args.freeze_config}")
+        return
+    if (args.output / "matrix.json").exists() or (args.output / "slice.json").exists():
+        p.error("output already contains a run; use a new output directory to retain prior results")
     write_slice_manifest(args.output / "slice.json", args.dataset, args.sampling, args.sample_seed, docs, queries)
 
     texts = [(getattr(d, "title", "") + " " + d.text).strip() for d in docs]
@@ -396,25 +438,28 @@ def main():
         lambda: (_ for _ in ()).throw(RuntimeError("cache miss for docs")),
         False, cache_config("document"),
     )
-    query_texts = [q.text for q in queries]
+    query_texts = [q.text for q in all_queries]
     multi_queries, _ = cached_ragged(
         args.cache_dir, COLBERT_MODEL_ID, "query",
-        [q.query_id for q in queries], query_texts,
+        [q.query_id for q in all_queries], query_texts,
         lambda: (_ for _ in ()).throw(RuntimeError("cache miss for queries")),
         False, cache_config("query"),
     )
 
-    workspace_root = Path(__file__).resolve().parents[3]
-    engines = args.engines.split(",")
-    results = {"dataset": args.dataset, "documents": len(docs), "queries": len(qrels), "systems": {}}
+    if len(multi_docs) != len(docs) or len(multi_queries) != len(all_queries):
+        raise ValueError("embedding cache length does not match document/query IDs")
+    selected_ids = {q.query_id for q in queries}
+    multi_queries = [v for q, v in zip(all_queries, multi_queries) if q.query_id in selected_ids]
+    results = {"protocol": protocol, "dataset": args.dataset, "documents": len(docs), "queries": len(qrels), "systems": {}}
 
     if "annex" in engines:
-        sweep = [int(x) for x in args.annex_sweep.split(",") if x] or [args.annex_candidates]
+        subprocess.run(["cargo", "build", "--release", "-p", "annex-multivector", "--bin", "annex-multivector"],
+                       cwd=workspace_root, check=True)
         for cand in sweep:
             key = f"annex_multivector_c{cand}" if len(sweep) > 1 else "annex_multivector"
             print(f"== {key} ==")
             results["systems"][key] = bench_annex_multivector(
-                docs, queries, multi_docs, multi_queries, qrels, workspace_root, candidates=cand
+                docs, queries, multi_docs, multi_queries, qrels, workspace_root, candidates=cand, durability=args.durability
             )
     if "qdrant_local" in engines or "qdrant" in engines:
         # "qdrant" kept as an alias for back-compat; explicit new name is
@@ -427,7 +472,7 @@ def main():
         if not args.qdrant_server:
             raise SystemExit(
                 "--qdrant-server URL required for qdrant_server engine. "
-                "Start with: docker run -p 6333:6333 qdrant/qdrant:latest"
+                "Use a pinned Qdrant image and provide its URL."
             )
         print(f"== qdrant_server ({args.qdrant_server}) ==")
         results["systems"]["qdrant_server"] = bench_qdrant(

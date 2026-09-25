@@ -194,10 +194,8 @@ fn delete_after_hnsw_never_returns_stale_docs() {
     );
 }
 
-/// Manifest checksum enforcement. If the on-disk manifest is corrupted
-/// (bit-flipped, truncated, whatever) and the sidecar checksum was
-/// written by a prior clean shutdown, open() must reject the load rather
-/// than silently returning stale/torn state.
+/// Corrupt committed manifest envelopes must be rejected rather than
+/// silently returning stale/torn state. Legacy sidecars are tested separately.
 #[test]
 fn manifest_checksum_rejects_corruption() {
     let directory = tempfile::tempdir().unwrap();
@@ -227,9 +225,8 @@ fn manifest_checksum_rejects_corruption() {
         Ok(_) => panic!("open() accepted a corrupted manifest"),
         Err(err) => err,
     };
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("manifest.sha256 does not match manifest.json") || msg.contains("expected"),
-        "open() should have rejected the corrupted manifest but returned: {msg}"
-    );
+    assert!(matches!(
+        err,
+        multivector::IndexError::Invalid(_) | multivector::IndexError::Json(_)
+    ));
 }

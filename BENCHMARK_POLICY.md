@@ -162,3 +162,14 @@ on a real benchmark). The pattern to follow:
 Nothing kills a benchmark reputation faster than pretending a wrong
 number was never published. The right move is always to acknowledge
 and correct.
+
+
+## Enforced operating-point protocol
+
+The sweep and head-to-head CLIs now default to a deterministic development
+partition. Test runs require a previously frozen single operating point and
+matching content/settings/source fingerprints. See
+[the benchmark CLI protocol](crates/annex-multivector/benchmark/README.md#development-versus-held-out-evaluation).
+This guard prevents accidental sweeps on held-out IDs; it cannot establish that
+an operator has never inspected those IDs. Existing published exploratory
+artifacts retain their original status and are not relabeled as held-out results.

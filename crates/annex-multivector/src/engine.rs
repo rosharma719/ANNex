@@ -701,6 +701,29 @@ impl MultiVectorIndex {
         let approximate = self.exact_fde_scores_capped(&s, &normalized, Some(cap))?;
         self.rescore(&s, &normalized, approximate, top_k, candidates)
     }
+    /// True when an FDE-HNSW graph is built and matches the current write
+    /// generation. Query paths that opt into auto dispatch consult this
+    /// before choosing HNSW over the exact FDE scan.
+    pub fn hnsw_ready(&self) -> bool {
+        let s = self.state.read().unwrap();
+        s.fde_ann.is_some() && s.fde_ann_generation == s.generation
+    }
+    /// Production default: use FDE-HNSW when it's built and fresh, otherwise
+    /// fall through to the exact FDE scan. Exact remains available as the
+    /// oracle via `query()` and `exact_fde_candidates()`.
+    pub fn query_auto(
+        &self,
+        vectors: &[Vector],
+        top_k: usize,
+        candidates: Option<usize>,
+        ef_search: usize,
+    ) -> Result<Vec<Hit>, IndexError> {
+        if self.hnsw_ready() {
+            self.query_with_fde_ann(vectors, top_k, candidates, ef_search)
+        } else {
+            self.query(vectors, top_k, candidates)
+        }
+    }
     /// Generate broad FDE candidates, prune with centroid-only MaxSim, then
     /// decode residuals only for the surviving documents.
     pub fn query_with_centroid_pruning(
@@ -852,7 +875,7 @@ impl MultiVectorIndex {
         };
         let mut ids: Vec<_> = s.documents.keys().cloned().collect();
         ids.sort();
-        let hnsw = HNSWIndex::new(DistanceMetric::Dot, m, ef_construct, 16, dimension);
+        let mut hnsw = HNSWIndex::new(DistanceMetric::Dot, m, ef_construct, 16, dimension);
         // Build in chunks so peak memory stays bounded regardless of corpus
         // size (each chunk holds only its own decoded vectors). Each chunk is
         // handed to par_insert_batch, which uses annex-core's concurrent
@@ -876,6 +899,13 @@ impl MultiVectorIndex {
             hnsw.par_insert_batch(&entries).map_err(|error| {
                 IndexError::Invalid(format!("HNSW par_insert_batch failed: {error}"))
             })?;
+        }
+        // SQ8 screening: −43–50% latency at equivalent recall on annex-core's
+        // reference benches. reorder_rcm permutes internal node indices for
+        // cache locality but preserves the external PointId → node mapping,
+        // so `fde_ann_ids[point.id]` remains correct.
+        if !ids.is_empty() {
+            hnsw.enable_sq8_screening();
         }
         let built_generation = s.generation;
         drop(s);
@@ -936,6 +966,11 @@ impl MultiVectorIndex {
         }
         let options = SearchRuntimeOptions {
             ef_search: Some(ef_search.max(count)),
+            // Use the SQ8 codes built by enable_sq8_screening() to reject
+            // clearly-worse L0 neighbors before touching their f32 vectors.
+            // Full-precision rescore still runs on survivors, so recall at a
+            // fixed ef_search stays within noise on the reference benches.
+            sq8_screen: Some(true),
             ..SearchRuntimeOptions::default()
         };
         let points = ann

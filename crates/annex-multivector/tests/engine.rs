@@ -230,3 +230,55 @@ fn manifest_checksum_rejects_corruption() {
         multivector::IndexError::Invalid(_) | multivector::IndexError::Json(_)
     ));
 }
+
+// Auto backend picks HNSW after it's built + stays fresh, falls through to
+// exact before build and after a mutation invalidates fde_ann_generation.
+#[test]
+fn query_auto_dispatches_to_hnsw_when_fresh_and_falls_back_otherwise() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = IndexConfig {
+        dimension: 3,
+        centroids: 2,
+        residual_bits: 2,
+        probes: 2,
+        fde_repetitions: 8,
+        fde_ksim: 2,
+        fde_projected: 2,
+    };
+    let index = MultiVectorIndex::open(directory.path(), config).unwrap();
+    index
+        .train(
+            &[
+                vec![1., 0., 0.],
+                vec![0., 1., 0.],
+                vec![0., 0., 1.],
+                vec![0., 0.1, 0.9],
+            ],
+            5,
+        )
+        .unwrap();
+    index
+        .upsert("code", vec![vec![1., 0., 0.]], json!({}))
+        .unwrap();
+    index
+        .upsert("prose", vec![vec![0., 0., 1.]], json!({}))
+        .unwrap();
+
+    assert!(!index.hnsw_ready());
+    let hits = index.query_auto(&[vec![1., 0., 0.]], 1, None, 16).unwrap();
+    assert_eq!(hits[0].id, "code");
+
+    index.build_fde_ann(4, 16).unwrap();
+    assert!(index.hnsw_ready());
+    let hits = index.query_auto(&[vec![1., 0., 0.]], 1, None, 16).unwrap();
+    assert_eq!(hits[0].id, "code");
+
+    // A subsequent upsert bumps `generation`, invalidating fde_ann. Auto
+    // must silently fall back to exact — the query still succeeds.
+    index
+        .upsert("more", vec![vec![0., 1., 0.]], json!({}))
+        .unwrap();
+    assert!(!index.hnsw_ready());
+    let hits = index.query_auto(&[vec![1., 0., 0.]], 1, None, 16).unwrap();
+    assert_eq!(hits[0].id, "code");
+}

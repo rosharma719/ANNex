@@ -112,7 +112,7 @@ fn two_fifty_six() -> usize {
     256
 }
 fn default_candidate_backend() -> String {
-    "muvera".into()
+    "auto".into()
 }
 
 struct ApiError(IndexError);
@@ -176,7 +176,23 @@ async fn query(
                 body.ef_search.unwrap_or(256),
             )?,
         },
-        Some("muvera") | None => match (body.probes, body.rerank_candidates) {
+        // "auto" is the production default: HNSW when built + fresh,
+        // exact FDE otherwise. Callers pin behavior with "hnsw" or "muvera".
+        None | Some("auto") => {
+            if body.probes.is_some() || body.rerank_candidates.is_some() {
+                return Err(ApiError(IndexError::Invalid(
+                    "auto backend does not accept probes/rerank_candidates; \
+                     specify candidate_backend=muvera or hnsw explicitly".into(),
+                )));
+            }
+            index.query_auto(
+                &body.vectors,
+                body.top_k,
+                body.candidates,
+                body.ef_search.unwrap_or(256),
+            )?
+        }
+        Some("muvera") => match (body.probes, body.rerank_candidates) {
             (None, Some(rerank_candidates)) => index.query_with_centroid_pruning(
                 &body.vectors,
                 body.top_k,

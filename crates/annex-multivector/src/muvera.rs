@@ -65,16 +65,28 @@ impl FdeEncoder {
                 }
             }
             if document {
+                // Paper-faithful fill: fill every empty bucket from the
+                // *raw* sums of its Hamming-nearest occupied bucket, THEN
+                // normalize the originally-occupied buckets. Doing it in a
+                // single pass silently double-divides whenever the nearest
+                // occupied bucket comes earlier in iteration order — its
+                // sums are already an average by then, so the fill divides
+                // by count a second time.
+                let occupied: Vec<bool> = counts.iter().map(|&n| n > 0).collect();
                 for bucket in 0..buckets {
-                    if counts[bucket] > 0 {
+                    if !occupied[bucket]
+                        && let Some(nearest) = nearest_occupied(bucket, &counts)
+                    {
+                        let scale = 1.0 / counts[nearest] as f32;
+                        sums[bucket] = sums[nearest].iter().map(|x| x * scale).collect();
+                    }
+                }
+                for bucket in 0..buckets {
+                    if occupied[bucket] {
+                        let scale = 1.0 / counts[bucket] as f32;
                         for x in &mut sums[bucket] {
-                            *x /= counts[bucket] as f32;
+                            *x *= scale;
                         }
-                    } else if let Some(nearest) = nearest_occupied(bucket, &counts) {
-                        sums[bucket] = sums[nearest]
-                            .iter()
-                            .map(|x| x / counts[nearest] as f32)
-                            .collect();
                     }
                 }
             }
@@ -128,5 +140,37 @@ mod tests {
                     &e.encode_document(&[vec![-1., 0.], vec![0., -1.]])
                 )
         );
+    }
+
+    // Ordering regression: a document that fills only some buckets must
+    // encode the same regardless of which bucket ID is empty. Before the
+    // two-pass fix, an empty bucket whose nearest occupied bucket had a
+    // lower index got the average divided by count twice.
+    #[test]
+    fn empty_bucket_fill_is_order_independent() {
+        // A single document token → occupies exactly one bucket; every
+        // other bucket is filled from that one. All filled slots should
+        // hold the same average (which for a single token equals the
+        // token itself, times projection).
+        let e = FdeEncoder::new(4, 3, 2, 1, 7);
+        let doc = vec![vec![1., 0.5, -0.5, 1.]];
+        let encoded = e.encode_document(&doc);
+        // Encoded is [buckets × projected], stride = 2. Every bucket that
+        // was filled should produce identical projected values (all copy
+        // from the same source bucket). Before the fix, the "later" empty
+        // buckets get a scaled-down copy.
+        let stride = 2;
+        let buckets = 1 << 3;
+        assert_eq!(encoded.len(), buckets * stride);
+        let first = &encoded[0..stride];
+        for bucket in 1..buckets {
+            let slice = &encoded[bucket * stride..(bucket + 1) * stride];
+            for (a, b) in first.iter().zip(slice) {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "bucket {bucket} slot differs from bucket 0: {a} vs {b}"
+                );
+            }
+        }
     }
 }

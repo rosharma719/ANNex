@@ -107,11 +107,11 @@ impl FdeEncoder {
                 // by count a second time.
                 let occupied: Vec<bool> = counts.iter().map(|&n| n > 0).collect();
                 for bucket in 0..buckets {
-                    if !occupied[bucket]
-                        && let Some(nearest) = nearest_occupied(bucket, &counts)
-                    {
-                        let scale = 1.0 / counts[nearest] as f32;
-                        sums[bucket] = sums[nearest].iter().map(|x| x * scale).collect();
+                    if !occupied[bucket] {
+                        if let Some(nearest) = nearest_occupied(bucket, &counts) {
+                            let scale = 1.0 / counts[nearest] as f32;
+                            sums[bucket] = sums[nearest].iter().map(|x| x * scale).collect();
+                        }
                     }
                 }
                 for bucket in 0..buckets {

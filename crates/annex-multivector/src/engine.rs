@@ -130,7 +130,9 @@ struct Manifest {
     segments: Option<SegmentBoundaries>,
 }
 
-fn legacy_fde_encoding_version() -> u32 { 1 }
+fn legacy_fde_encoding_version() -> u32 {
+    1
+}
 
 fn current_format_version() -> u32 {
     1 // legacy manifests omitted this field
@@ -161,8 +163,7 @@ pub struct Hit {
     /// FDE score this hit had before the compressed-MaxSim rescore. Exposed
     /// so callers can compute per-query FDE-vs-MaxSim rank disagreement —
     /// a signal for the confidence-output / adaptive-escalation primitive.
-    /// Skipped from JSON when the underlying approximate list didn't carry
-    /// FDE scores (e.g. HNSW-backend candidate gen returned raw distances).
+    /// Skipped from JSON for centroid-only probing, which has no FDE stage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fde_score: Option<f32>,
     pub metadata: Value,
@@ -296,61 +297,70 @@ impl MultiVectorIndex {
             IndexError::Invalid(format!("index already open or cannot lock directory: {e}"))
         })?;
         let manifest_path = root.join("manifest.json");
-        let (generation, fde_encoding_version, codebook, residual_codebook, mut documents, segments, checksummed) =
-            if manifest_path.exists() {
-                let bytes = fs::read(&manifest_path)?;
-                let header: Value = serde_json::from_slice(&bytes)?;
-                let (m, checksummed): (Manifest, bool) = if header.get("manifest").is_some() {
-                    let envelope: ManifestEnvelope = serde_json::from_slice(&bytes)?;
-                    if envelope.format_version != FORMAT_VERSION
-                        || blake3::hash(envelope.manifest.as_bytes()).to_hex().as_str()
-                            != envelope.checksum_blake3
-                    {
-                        return Err(IndexError::Invalid(
-                            "manifest checksum or envelope version mismatch".into(),
-                        ));
-                    }
-                    (serde_json::from_str(&envelope.manifest)?, true)
-                } else {
-                    verify_manifest_checksum(&bytes, &root.join("manifest.sha256"))?;
-                    (serde_json::from_slice(&bytes)?, false)
-                };
-                if m.format_version != if checksummed { FORMAT_VERSION } else { 1 }
-                    || (checksummed && m.segments.is_none())
+        let (
+            generation,
+            fde_encoding_version,
+            codebook,
+            residual_codebook,
+            mut documents,
+            segments,
+            checksummed,
+        ) = if manifest_path.exists() {
+            let bytes = fs::read(&manifest_path)?;
+            let header: Value = serde_json::from_slice(&bytes)?;
+            let (m, checksummed): (Manifest, bool) = if header.get("manifest").is_some() {
+                let envelope: ManifestEnvelope = serde_json::from_slice(&bytes)?;
+                if envelope.format_version != FORMAT_VERSION
+                    || blake3::hash(envelope.manifest.as_bytes()).to_hex().as_str()
+                        != envelope.checksum_blake3
                 {
                     return Err(IndexError::Invalid(
-                        "unsupported manifest version or missing committed boundaries".into(),
+                        "manifest checksum or envelope version mismatch".into(),
                     ));
                 }
-                if m.config != config {
-                    return Err(IndexError::Config {
-                        actual: m.config,
-                        requested: config,
-                    });
-                }
-                (
-                    m.generation,
-                    m.fde_encoding_version,
-                    m.codebook,
-                    m.residual_codebook,
-                    m.documents,
-                    m.segments,
-                    checksummed,
-                )
+                (serde_json::from_str(&envelope.manifest)?, true)
             } else {
-                // Without a committed manifest all segment bytes are uncommitted.
-                (
-                    0,
-                    2,
-                    vec![],
-                    vec![],
-                    HashMap::new(),
-                    Some(SegmentBoundaries { objects: 0, fde: 0 }),
-                    false,
-                )
+                verify_manifest_checksum(&bytes, &root.join("manifest.sha256"))?;
+                (serde_json::from_slice(&bytes)?, false)
             };
+            if m.format_version != if checksummed { FORMAT_VERSION } else { 1 }
+                || (checksummed && m.segments.is_none())
+            {
+                return Err(IndexError::Invalid(
+                    "unsupported manifest version or missing committed boundaries".into(),
+                ));
+            }
+            if m.config != config {
+                return Err(IndexError::Config {
+                    actual: m.config,
+                    requested: config,
+                });
+            }
+            (
+                m.generation,
+                m.fde_encoding_version,
+                m.codebook,
+                m.residual_codebook,
+                m.documents,
+                m.segments,
+                checksummed,
+            )
+        } else {
+            // Without a committed manifest all segment bytes are uncommitted.
+            (
+                0,
+                2,
+                vec![],
+                vec![],
+                HashMap::new(),
+                Some(SegmentBoundaries { objects: 0, fde: 0 }),
+                false,
+            )
+        };
         if !matches!(fde_encoding_version, 1 | 2) {
-            return Err(IndexError::Invalid(format!("unsupported FDE encoding version {fde_encoding_version}")));
+            return Err(IndexError::Invalid(format!(
+                "unsupported FDE encoding version {fde_encoding_version}"
+            )));
         }
         validate_codebooks(
             &config,
@@ -460,13 +470,20 @@ impl MultiVectorIndex {
         Ok(Self {
             fde: if fde_encoding_version == 2 {
                 FdeEncoder::new(
-                    config.dimension, config.fde_ksim, config.fde_projected,
-                    config.fde_repetitions, 0x4d55_5645_5241,
+                    config.dimension,
+                    config.fde_ksim,
+                    config.fde_projected,
+                    config.fde_repetitions,
+                    0x4d55_5645_5241,
                 )
             } else {
                 FdeEncoder::with_version(
-                    config.dimension, config.fde_ksim, config.fde_projected,
-                    config.fde_repetitions, 0x4d55_5645_5241, fde_encoding_version,
+                    config.dimension,
+                    config.fde_ksim,
+                    config.fde_projected,
+                    config.fde_repetitions,
+                    0x4d55_5645_5241,
+                    fde_encoding_version,
                 )
             },
             fde_store,
@@ -744,7 +761,9 @@ impl MultiVectorIndex {
     /// Whether the base plus mutable overlay covers the current generation.
     pub fn hnsw_ready(&self) -> bool {
         let s = self.state.read().unwrap();
-        s.fde_ann.as_ref().is_some_and(|ann| ann.generation == s.generation)
+        s.fde_ann
+            .as_ref()
+            .is_some_and(|ann| ann.generation == s.generation)
     }
 
     /// Use a fresh FDE-HNSW base plus exact delta when available; otherwise
@@ -756,26 +775,46 @@ impl MultiVectorIndex {
         candidates: Option<usize>,
         ef_search: usize,
     ) -> Result<Vec<Hit>, IndexError> {
-        self.query_auto_with_backend(vectors, top_k, candidates, ef_search).map(|(hits, _)| hits)
+        self.query_auto_with_backend(vectors, top_k, candidates, ef_search)
+            .map(|(hits, _)| hits)
     }
 
     /// Return the actual backend used under the same snapshot as the results.
     pub fn query_auto_with_backend(
-        &self, vectors: &[Vector], top_k: usize, candidates: Option<usize>, ef_search: usize,
+        &self,
+        vectors: &[Vector],
+        top_k: usize,
+        candidates: Option<usize>,
+        ef_search: usize,
     ) -> Result<(Vec<Hit>, &'static str), IndexError> {
         self.validate(vectors)?;
         if top_k == 0 || ef_search == 0 {
-            return Err(IndexError::Invalid("top_k and ef_search must be positive".into()));
+            return Err(IndexError::Invalid(
+                "top_k and ef_search must be positive".into(),
+            ));
         }
         let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
         let count = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
         let s = self.state.read().unwrap();
-        let (approximate, backend) = if s.fde_ann.as_ref().is_some_and(|ann| ann.generation == s.generation) {
-            (self.ann_fde_scores(&s, &self.fde.encode_query(&normalized), count, ef_search)?, "hnsw")
+        let (approximate, backend) = if s
+            .fde_ann
+            .as_ref()
+            .is_some_and(|ann| ann.generation == s.generation)
+        {
+            (
+                self.ann_fde_scores(&s, &self.fde.encode_query(&normalized), count, ef_search)?,
+                "hnsw",
+            )
         } else {
-            (self.exact_fde_scores_capped(&s, &normalized, Some(count))?, "muvera")
+            (
+                self.exact_fde_scores_capped(&s, &normalized, Some(count))?,
+                "muvera",
+            )
         };
-        Ok((self.rescore(&s, &normalized, approximate, top_k, candidates)?, backend))
+        Ok((
+            self.rescore(&s, &normalized, approximate, top_k, candidates)?,
+            backend,
+        ))
     }
     /// Generate broad FDE candidates, prune with centroid-only MaxSim, then
     /// decode residuals only for the surviving documents.
@@ -928,11 +967,11 @@ impl MultiVectorIndex {
         };
         let mut ids: Vec<_> = s.documents.keys().cloned().collect();
         ids.sort();
-        // Use Cosine metric so the FDE-HNSW HNSW can use the SQ8 screen fast
-        // path (which requires unit vectors). FDE outputs are L2-normalized
-        // before insertion and query, making Cosine and Dot identical in rank
-        // order while unlocking the −43–50% latency SQ8 NEON sdot screen.
-        let mut hnsw = HNSWIndex::new(DistanceMetric::Cosine, m, ef_construct, 16, dimension);
+        let mut hnsw = HNSWIndex::new(DistanceMetric::Dot, m, ef_construct, 16, dimension);
+        // Build in chunks so peak memory stays bounded regardless of corpus
+        // size (each chunk holds only its own decoded vectors). Each chunk is
+        // handed to par_insert_batch, which uses annex-core's concurrent
+        // &self insert path to parallelise linking across threads.
         const CHUNK: usize = 4096;
         for (chunk_idx, chunk_ids) in ids.chunks(CHUNK).enumerate() {
             let base = chunk_idx * CHUNK;
@@ -940,24 +979,23 @@ impl MultiVectorIndex {
                 .iter()
                 .enumerate()
                 .map(|(offset, id)| {
-                    let raw = FixedVectorStore::get(
+                    let vector = FixedVectorStore::get(
                         mapped.as_deref().unwrap(),
                         s.documents[id].fde_location,
                         dimension,
                     )?
                     .to_vec();
-                    Ok::<_, IndexError>(((base + offset) as u64, normalize(&raw)))
+                    Ok::<_, IndexError>(((base + offset) as u64, vector))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             hnsw.par_insert_batch(&entries).map_err(|error| {
                 IndexError::Invalid(format!("HNSW par_insert_batch failed: {error}"))
             })?;
         }
-        // RCM reorder + SQ8 quantization. The graph is now Cosine-metric on
-        // normalized FDE vectors, so enable_sq8_screening() activates the
-        // full NEON sdot screen path (−43–50% BFS latency).
+        // Reorder only. SQ8 screening currently supports Cosine, whereas
+        // FDE uses Dot; allocating codes here would add cost without benefit.
         if !ids.is_empty() {
-            hnsw.enable_sq8_screening();
+            hnsw.reorder_rcm();
         }
         let built_generation = s.generation;
         drop(s);
@@ -972,9 +1010,17 @@ impl MultiVectorIndex {
             )));
         }
         let count = ids.len();
-        let by_id = ids.iter().enumerate().map(|(idx, id)| (id.clone(), idx as u64)).collect();
+        let by_id = ids
+            .iter()
+            .enumerate()
+            .map(|(idx, id)| (id.clone(), idx as u64))
+            .collect();
         s.fde_ann = Some(FdeAnn {
-            base: Arc::new(FdeAnnBase { index: hnsw, ids, by_id }),
+            base: Arc::new(FdeAnnBase {
+                index: hnsw,
+                ids,
+                by_id,
+            }),
             delta: HashSet::new(),
             tombstones: HashSet::new(),
             generation: built_generation,
@@ -1002,60 +1048,69 @@ impl MultiVectorIndex {
         self.rescore(&s, &normalized, approximate, top_k, candidates)
     }
     fn ann_fde_scores(
-        &self, s: &State, query_fde: &Vector, count: usize, ef_search: usize,
+        &self,
+        s: &State,
+        query_fde: &Vector,
+        count: usize,
+        ef_search: usize,
     ) -> Result<Vec<(String, f32)>, IndexError> {
         let ann = s.fde_ann.as_ref().ok_or_else(|| {
             IndexError::Invalid("FDE ANN is not built; call /v1/fde/index".into())
         })?;
         if ann.generation != s.generation {
-            return Err(IndexError::Invalid("FDE ANN generation is stale; rebuild".into()));
+            return Err(IndexError::Invalid(
+                "FDE ANN generation is stale; rebuild".into(),
+            ));
         }
-        // Normalize the query FDE once. The base HNSW is Cosine-metric and
-        // was built on normalized FDE vectors; the delta exact-scan uses
-        // dot(norm_q, norm_v) = cosine — same rank order, comparable scores.
-        let norm_query = normalize(query_fde);
-        let has_base_or_delta = ann.base.ids.len() > ann.tombstones.len() || !ann.delta.is_empty();
-        let need_fde_map = has_base_or_delta;
-        let mapped = if need_fde_map { Some(self.fde_store.map()?) } else { None };
-        let dim = self.fde.output_dimension();
         let mut scores = Vec::new();
         if ann.base.ids.len() > ann.tombstones.len() {
             // Account for masked base hits before asking the graph for candidates.
-            let base_count = count.saturating_add(ann.tombstones.len()).min(ann.base.ids.len());
+            let base_count = count
+                .saturating_add(ann.tombstones.len())
+                .min(ann.base.ids.len());
             let options = SearchRuntimeOptions {
                 ef_search: Some(ef_search.max(base_count)),
-                // SQ8 NEON sdot screen: active now that the graph is Cosine-
-                // metric and stored vectors are unit-norm. −43–50% BFS latency
-                // at equivalent recall per annex-core reference benches.
-                sq8_screen: Some(true),
                 ..SearchRuntimeOptions::default()
             };
-            let points = ann.base.index.search_with_options(&norm_query, base_count, &options)
+            let points = ann
+                .base
+                .index
+                .search_with_options(query_fde, base_count, &options)
                 .map_err(|error| IndexError::Invalid(format!("HNSW search failed: {error}")))?;
             for point in points {
-                if ann.tombstones.contains(&point.id) { continue; }
-                let id = ann.base.ids.get(point.id as usize)
+                if ann.tombstones.contains(&point.id) {
+                    continue;
+                }
+                let id = ann
+                    .base
+                    .ids
+                    .get(point.id as usize)
                     .ok_or_else(|| IndexError::Invalid("invalid HNSW point id".into()))?;
                 if !s.documents.contains_key(id) || ann.delta.contains(id) {
-                    return Err(IndexError::Invalid("FDE ANN overlay is inconsistent; rebuild".into()));
+                    return Err(IndexError::Invalid(
+                        "FDE ANN overlay is inconsistent; rebuild".into(),
+                    ));
                 }
-                // Return the raw dot product (same scale as exact_fde_scores)
-                // so downstream callers see consistent FDE scores regardless
-                // of whether the candidate came from the HNSW base or delta.
-                let doc = &s.documents[id];
-                let raw = FixedVectorStore::get(mapped.as_deref().unwrap(), doc.fde_location, dim)?;
-                scores.push((id.clone(), dot(query_fde, raw)));
+                scores.push((id.clone(), -point.sort_key));
             }
         }
         if !ann.delta.is_empty() {
-            let mapped = mapped.as_deref().unwrap();
+            let mapped = self.fde_store.map()?;
             for id in &ann.delta {
-                let record = s.documents.get(id).ok_or_else(|| IndexError::Invalid("missing delta document".into()))?;
-                let raw = FixedVectorStore::get(mapped, record.fde_location, dim)?;
-                scores.push((id.clone(), dot(query_fde, raw)));
+                let record = s
+                    .documents
+                    .get(id)
+                    .ok_or_else(|| IndexError::Invalid("missing delta document".into()))?;
+                let vector = FixedVectorStore::get(
+                    &mapped,
+                    record.fde_location,
+                    self.fde.output_dimension(),
+                )?;
+                scores.push((id.clone(), dot(query_fde, vector)));
             }
         }
-        let by_score = |a: &(String, f32), b: &(String, f32)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
+        let by_score =
+            |a: &(String, f32), b: &(String, f32)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
         if scores.len() > count {
             scores.select_nth_unstable_by(count, by_score);
             scores.truncate(count);
@@ -1135,7 +1190,11 @@ impl MultiVectorIndex {
             })
             .collect();
         approx.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        self.rescore(&s, &normalized, approx, top_k, candidates)
+        let mut hits = self.rescore(&s, &normalized, approx, top_k, candidates)?;
+        for hit in &mut hits {
+            hit.fde_score = None;
+        }
+        Ok(hits)
     }
     fn rescore(
         &self,
@@ -1272,7 +1331,9 @@ impl MultiVectorIndex {
             residual_bits: self.config.residual_bits,
             trained: !s.codebook.is_empty(),
             fde_dimension: self.fde.output_dimension(),
-            fde_ann_nodes: s.fde_ann.as_ref().map_or(0, |ann| ann.base.ids.len() - ann.tombstones.len() + ann.delta.len()),
+            fde_ann_nodes: s.fde_ann.as_ref().map_or(0, |ann| {
+                ann.base.ids.len() - ann.tombstones.len() + ann.delta.len()
+            }),
             fde_ann_base_nodes: s.fde_ann.as_ref().map_or(0, |ann| ann.base.ids.len()),
             fde_ann_delta_documents: s.fde_ann.as_ref().map_or(0, |ann| ann.delta.len()),
             fde_ann_tombstones: s.fde_ann.as_ref().map_or(0, |ann| ann.tombstones.len()),
@@ -1401,7 +1462,10 @@ fn centroid_prune(
         .collect();
     scored.par_sort_unstable_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
     scored.truncate(survivors);
-    scored.into_iter().map(|(id, fde_score, _)| (id, fde_score)).collect()
+    scored
+        .into_iter()
+        .map(|(id, fde_score, _)| (id, fde_score))
+        .collect()
 }
 fn nearest(vector: &Vector, centroids: &[Vector]) -> usize {
     centroids

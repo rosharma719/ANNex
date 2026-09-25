@@ -3,10 +3,17 @@ use crate::storage::FAIL_COMMIT;
 use serde_json::json;
 use std::process::Command;
 
-/// Hook point for tests that need to inject failures between the ANN build
-/// completing and its state being published under the write lock. No-op in
-/// normal test runs; override at call site when needed.
-pub(super) fn before_ann_publish() {}
+thread_local! {
+    static ANN_BUILD_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn before_ann_publish() {
+    let hook = ANN_BUILD_HOOK.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 fn config() -> IndexConfig {
     IndexConfig {
@@ -153,6 +160,7 @@ fn postrename_error_publishes_generation_and_reports_uncertainty() {
     for stage in ["manifest_renamed", "directory_synced"] {
         let dir = tempfile::tempdir().unwrap();
         let index = baseline(dir.path());
+        index.build_fde_ann(4, 16).unwrap();
         let before = index.stats().generation;
         FAIL_COMMIT.with(|f| f.set(Some((stage, 1))));
         assert!(matches!(
@@ -160,12 +168,163 @@ fn postrename_error_publishes_generation_and_reports_uncertainty() {
             Err(IndexError::CommitUncertain(_))
         ));
         assert_eq!(index.stats().generation, before + 1);
+        assert!(index.hnsw_ready());
+        assert_eq!(index.stats().fde_ann_delta_documents, 2);
+        assert_eq!(index.stats().fde_ann_tombstones, 1);
         let expected = versions(&index);
+        let mut ann_versions: Vec<_> = index
+            .query_auto(&[vec![1., 0., 0.]], 10, Some(10), 16)
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.id, hit.metadata))
+            .collect();
+        ann_versions.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(ann_versions, expected);
         drop(index);
         let restored = MultiVectorIndex::open(dir.path(), config()).unwrap();
         assert_eq!(versions(&restored), expected);
         assert_eq!(restored.stats().generation, before + 1);
     }
+}
+
+#[test]
+fn postrename_delete_updates_the_ann_overlay() {
+    for stage in ["manifest_renamed", "directory_synced"] {
+        let dir = tempfile::tempdir().unwrap();
+        let index = baseline(dir.path());
+        index.build_fde_ann(4, 16).unwrap();
+        // Cover deletion of a base document and an overwritten delta document.
+        index.upsert_batch(vec![doc("b", 1)]).unwrap();
+        for id in ["a", "b"] {
+            FAIL_COMMIT.with(|fault| fault.set(Some((stage, 1))));
+            assert!(matches!(
+                index.delete(id),
+                Err(IndexError::CommitUncertain(_))
+            ));
+            assert!(index.hnsw_ready());
+            let hits = index
+                .query_auto(&[vec![1., 0., 0.]], 10, Some(10), 16)
+                .unwrap();
+            assert_eq!(hits.len(), index.stats().documents);
+            assert!(hits.iter().all(|hit| hit.id != id));
+        }
+        drop(index);
+        let restored = MultiVectorIndex::open(dir.path(), config()).unwrap();
+        assert!(versions(&restored).is_empty());
+    }
+}
+
+#[test]
+fn failed_or_racing_ann_build_preserves_the_current_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = Arc::new(baseline(dir.path()));
+    index.build_fde_ann(4, 16).unwrap();
+    let base = Arc::clone(&index.state.read().unwrap().fde_ann.as_ref().unwrap().base);
+    FAIL_COMMIT.with(|fault| fault.set(Some(("ann_built_before_publish", 1))));
+    assert!(index.build_fde_ann(4, 16).is_err());
+    let writer = index.clone();
+    ANN_BUILD_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            writer.delete("a").unwrap();
+            writer.upsert_batch(vec![doc("b", 1), doc("c", 1)]).unwrap();
+        }))
+    });
+    assert!(
+        matches!(index.build_fde_ann(4, 16), Err(IndexError::Invalid(message))
+        if message.contains("generation moved"))
+    );
+    assert!(index.hnsw_ready());
+    assert!(Arc::ptr_eq(
+        &base,
+        &index.state.read().unwrap().fde_ann.as_ref().unwrap().base
+    ));
+    let hits = index
+        .query_auto(&[vec![1., 0., 0.]], 10, Some(10), 16)
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.id != "a" && hit.metadata == json!(1))
+    );
+    index.build_fde_ann(4, 16).unwrap();
+    assert_eq!(index.stats().fde_ann_delta_documents, 0);
+    assert_eq!(index.stats().fde_ann_tombstones, 0);
+}
+
+#[test]
+fn fde_encoding_version_survives_legacy_reopen_and_future_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut index = MultiVectorIndex::open(dir.path(), config()).unwrap();
+    assert_eq!(index.stats().fde_encoding_version, 2);
+    index.fde = FdeEncoder::with_version(3, 2, 2, 2, 0x4d55_5645_5241, 1);
+    train(&index);
+    let tokens = vec![vec![1., 2., 0.5]; 3];
+    index.upsert("legacy", tokens.clone(), json!(0)).unwrap();
+    let query = vec![vec![1., 0., 0.]];
+    let expected = index.exact_fde_candidates(&query, 1).unwrap()[0].score;
+    let normalized: Vec<_> = tokens.iter().map(|v| normalize(v)).collect();
+    let legacy_bytes = index.fde.encode_document(&normalized);
+    let current = FdeEncoder::new(3, 2, 2, 2, 0x4d55_5645_5241);
+    assert_ne!(legacy_bytes, current.encode_document(&normalized));
+    drop(index);
+    // Real pre-versioned manifests had no FDE version field.
+    let path = dir.path().join("manifest.json");
+    let mut envelope: ManifestEnvelope = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut payload: Value = serde_json::from_str(&envelope.manifest).unwrap();
+    payload
+        .as_object_mut()
+        .unwrap()
+        .remove("fde_encoding_version");
+    envelope.manifest = serde_json::to_string(&payload).unwrap();
+    envelope.checksum_blake3 = blake3::hash(envelope.manifest.as_bytes())
+        .to_hex()
+        .to_string();
+    fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+    let restored = MultiVectorIndex::open(dir.path(), config()).unwrap();
+    assert_eq!(restored.stats().fde_encoding_version, 1);
+    restored.upsert("new", tokens, json!(1)).unwrap();
+    let hits = restored.exact_fde_candidates(&query, 2).unwrap();
+    assert!(hits.iter().all(|hit| hit.score == expected));
+    let stored = restored.fde_store.map().unwrap();
+    let state = restored.state.read().unwrap();
+    for record in state.documents.values() {
+        assert_eq!(
+            FixedVectorStore::get(&stored, record.fde_location, legacy_bytes.len()).unwrap(),
+            legacy_bytes
+        );
+    }
+    drop(state);
+    drop(stored);
+    drop(restored);
+    let restored = MultiVectorIndex::open(dir.path(), config()).unwrap();
+    assert_eq!(restored.stats().fde_encoding_version, 1);
+    assert_eq!(restored.exact_fde_candidates(&query, 2).unwrap(), hits);
+}
+
+#[test]
+fn ann_candidates_preserve_raw_inner_product_ranking() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = baseline(dir.path());
+    // Valid FDE records with different norms: q.a=2 > q.b=1, but
+    // cosine(q,a)=1/sqrt(2) < cosine(q,b)=1. Rescoring only the cosine
+    // winner cannot recover the lost raw-inner-product winner.
+    let mut a = vec![0.; index.fde.output_dimension()];
+    a[0] = 2.;
+    a[1] = 2.;
+    let mut b = vec![0.; a.len()];
+    b[0] = 1.;
+    {
+        let mut state = index.state.write().unwrap();
+        let mut next = state.clone();
+        next.documents.get_mut("a").unwrap().fde_location = index.fde_store.put(&a).unwrap();
+        next.documents.get_mut("b").unwrap().fde_location = index.fde_store.put(&b).unwrap();
+        index.commit(&mut state, next).unwrap();
+    }
+    index.build_fde_ann(4, 16).unwrap();
+    let state = index.state.read().unwrap();
+    let hits = index.ann_fde_scores(&state, &b, 1, 16).unwrap();
+    assert_eq!(hits, vec![("a".into(), 2.)]);
 }
 
 // Invoked only as a subprocess by crash_at_every_commit_boundary. The environment
@@ -327,7 +486,7 @@ fn checksums_truncation_versions_and_hostile_counts_are_rejected() {
             );
         }
     }
-    for case in 0..5 {
+    for case in 0..6 {
         let dir = tempfile::tempdir().unwrap();
         drop(baseline(dir.path()));
         let path = dir.path().join("manifest.json");
@@ -339,6 +498,7 @@ fn checksums_truncation_versions_and_hostile_counts_are_rejected() {
             1 => payload["documents"]["a"]["location"]["offset"] = json!(u64::MAX),
             2 => payload["documents"]["a"]["centroid_ids"] = json!([u32::MAX]),
             3 => payload["codebook"][0] = json!([1.]),
+            5 => payload["fde_encoding_version"] = json!(999),
             _ => payload["documents"]["a"]["fde_location"]
                 .as_object_mut()
                 .unwrap()

@@ -169,6 +169,7 @@ async fn query(
             "auto"
         }
     });
+    let mut executed_backend = backend;
     let matches = match backend {
         "hnsw" => match body.rerank_candidates {
             Some(rerank_candidates) => index.query_with_fde_ann_and_pruning(
@@ -195,12 +196,14 @@ async fn query(
                         .into(),
                 )));
             }
-            index.query_auto(
+            let (matches, selected) = index.query_auto_with_backend(
                 &body.vectors,
                 body.top_k,
                 body.candidates,
                 body.ef_search.unwrap_or(256),
-            )?
+            )?;
+            executed_backend = selected;
+            matches
         }
         "muvera" => match (body.probes, body.rerank_candidates) {
             (None, Some(rerank_candidates)) => index.query_with_centroid_pruning(
@@ -210,6 +213,7 @@ async fn query(
                 rerank_candidates,
             )?,
             (Some(probes), None) => {
+                executed_backend = "centroid";
                 index.query_with_probes(&body.vectors, body.top_k, body.candidates, probes)?
             }
             (None, None) => index.query(&body.vectors, body.top_k, body.candidates)?,
@@ -235,6 +239,7 @@ async fn query(
     // duplicate the logic (see benchmark/headtohead.py for the reference
     // implementation). Kept close to the primitive: no model inference,
     // no calibration lookup — just what falls out of the hit list.
+    let fde_available = !matches.is_empty() && matches.iter().all(|hit| hit.fde_score.is_some());
     let top_score = matches.first().map(|h| h.score).unwrap_or(0.0);
     let second_score = matches.get(1).map(|h| h.score).unwrap_or(top_score);
     let (fde_top_score, fde_top_rank_in_fde, fde_agreement) = {
@@ -269,12 +274,13 @@ async fn query(
             "matches_returned": matches.len(),
             "top_k_requested": body.top_k,
             "candidates_requested": body.candidates,
-            "candidate_backend": body.candidate_backend,
+            "candidate_backend": executed_backend,
+            "candidate_backend_requested": body.candidate_backend,
             "top_score": top_score,
             "top_minus_second": top_score - second_score,
-            "fde_top_score": fde_top_score,
-            "fde_top_rank_in_fde": fde_top_rank_in_fde,
-            "fde_maxsim_agreement": fde_agreement,
+            "fde_top_score": if fde_available { Some(fde_top_score) } else { None },
+            "fde_top_rank_in_fde": if fde_available { Some(fde_top_rank_in_fde) } else { None },
+            "fde_maxsim_agreement": if fde_available { Some(fde_agreement) } else { None },
         }
     })))
 }
@@ -464,6 +470,38 @@ mod tests {
             body["candidate_backend"] = json!("auto");
             assert_eq!(implicit, query_value(&index, body).await);
             assert_eq!(implicit["matches"][0]["id"], "a");
+        }
+    }
+    #[tokio::test]
+    async fn explain_reports_the_executed_backend() {
+        let (_directory, index) = fixture();
+        for built in [false, true] {
+            if built {
+                index.build_fde_ann(4, 16).unwrap();
+            }
+            let actual = query_value(
+                &index,
+                json!({
+                    "vectors": [[1., 0.]], "top_k": 1, "explain": true,
+                }),
+            )
+            .await;
+            assert_eq!(
+                actual["stats"]["candidate_backend"],
+                if built { "hnsw" } else { "muvera" }
+            );
+            assert!(actual["stats"]["candidate_backend_requested"].is_null());
+        }
+        for (knob, backend) in [("probes", "centroid"), ("rerank_candidates", "muvera")] {
+            let mut body = json!({"vectors": [[1., 0.]], "top_k": 1, "explain": true});
+            body[knob] = json!(2);
+            let actual = query_value(&index, body).await;
+            assert_eq!(actual["stats"]["candidate_backend"], backend);
+            if backend == "centroid" {
+                assert!(actual["matches"][0].get("fde_score").is_none());
+                assert!(actual["stats"]["fde_top_score"].is_null());
+                assert!(actual["stats"]["fde_maxsim_agreement"].is_null());
+            }
         }
     }
 }

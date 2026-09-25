@@ -51,7 +51,7 @@ and query-log benchmarks reproducible. Candidate generation defaults to
 asymmetric MUVERA fixed-dimensional encodings: document buckets store centroids,
 query buckets store sums, and empty document buckets use the nearest occupied
 SimHash bucket. The centroid path remains available for controlled probe sweeps.
-Current FDE search is exact; ANN and product quantization are the next scaling layers.
+FDE candidate search uses raw inner products; it does not normalize document FDEs.
 
 An optional HNSW candidate index can be built over the persisted FDE segment:
 
@@ -61,9 +61,23 @@ curl -X POST localhost:8080/v1/fde/index \
   -d '{"m":16,"ef_construct":256}'
 ```
 
-Then select it per query with `"candidate_backend":"hnsw"` and an optional
-`"ef_search"`. Exact MUVERA FDE search remains the default and acts as the
-recall oracle for ANN evaluation.
+Queries without a backend (or with `"candidate_backend":"auto"`) use this graph
+when available, with exact FDE fallback before a build and after reopening. Pin
+`"candidate_backend":"hnsw"` with optional `"ef_search"` to require ANN, or
+`"candidate_backend":"muvera"` for the exact FDE candidate oracle. Existing
+omitted-backend requests with `probes` or `rerank_candidates` keep their original
+centroid/exact-FDE behavior. `/v1/debug/candidates` defaults to exact FDE.
+
+Writes keep the immutable graph usable through an exact delta and tombstones;
+rebuilding folds them into a new base. Stats expose base/delta/tombstone counts.
+`"explain":true` reports the backend actually executed, separately from the
+requested value. Centroid-only queries omit `fde_score` and report null FDE
+diagnostics; FDE pruning preserves the original FDE score.
+
+See the [durability and compatibility contract](../../docs/multivector-durability.md)
+for atomic writes, recovery, encoding versions, and current scaling limits.
+FDE SQ8 storage and paper-faithful nearest-token empty-bucket fill remain future
+work; the current fill uses a bucket average.
 
 ## Retrieval-quality benchmark
 

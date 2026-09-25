@@ -306,7 +306,11 @@ impl HNSWIndex {
             } else {
                 Vec::new()
             };
-            let allow_early_exit = self.metric != DistanceMetric::Dot && !disable_early_exit();
+            // Sort keys are lower-is-better for every metric, including
+            // -dot for inner product. Standard HNSW reservoir admission and
+            // termination must apply to Dot too; admitting every neighbor
+            // silently turns ANN queries (and builds) into graph-wide scans.
+            let allow_early_exit = !disable_early_exit();
             let patience_limit = if allow_early_exit {
                 opts.early_exit_patience.unwrap_or_else(early_exit_patience)
             } else {
@@ -406,8 +410,7 @@ impl HNSWIndex {
 
                                         let improves_result_set = scratch.result_set.len() < ef
                                             || score_val < worst_score;
-                                        let push_candidate = self.metric == DistanceMetric::Dot
-                                            || improves_result_set;
+                                        let push_candidate = improves_result_set;
 
                                         if push_candidate {
                                             let sp = NodeCandidate {
@@ -442,8 +445,7 @@ impl HNSWIndex {
 
                                     let improves_result_set =
                                         scratch.result_set.len() < ef || score_val < worst_score;
-                                    let push_candidate =
-                                        self.metric == DistanceMetric::Dot || improves_result_set;
+                                    let push_candidate = improves_result_set;
 
                                     if push_candidate {
                                         let sp = NodeCandidate {
@@ -509,8 +511,7 @@ impl HNSWIndex {
                                         };
                                         let improves_result_set = scratch.result_set.len() < ef
                                             || score_val < worst_score;
-                                        let push_candidate = self.metric == DistanceMetric::Dot
-                                            || improves_result_set;
+                                        let push_candidate = improves_result_set;
                                         if push_candidate {
                                             let sp = NodeCandidate {
                                                 idx,
@@ -542,8 +543,7 @@ impl HNSWIndex {
                                     };
                                     let improves_result_set =
                                         scratch.result_set.len() < ef || score_val < worst_score;
-                                    let push_candidate =
-                                        self.metric == DistanceMetric::Dot || improves_result_set;
+                                    let push_candidate = improves_result_set;
                                     if push_candidate {
                                         let sp = NodeCandidate {
                                             idx,
@@ -607,8 +607,7 @@ impl HNSWIndex {
                                         };
                                         let improves_result_set = scratch.result_set.len() < ef
                                             || score_val < worst_score;
-                                        let push_candidate = self.metric == DistanceMetric::Dot
-                                            || improves_result_set;
+                                        let push_candidate = improves_result_set;
                                         if push_candidate {
                                             let sp = NodeCandidate {
                                                 idx,
@@ -645,8 +644,7 @@ impl HNSWIndex {
                                     };
                                     let improves_result_set =
                                         scratch.result_set.len() < ef || score_val < worst_score;
-                                    let push_candidate =
-                                        self.metric == DistanceMetric::Dot || improves_result_set;
+                                    let push_candidate = improves_result_set;
                                     if push_candidate {
                                         let sp = NodeCandidate {
                                             idx,
@@ -739,8 +737,7 @@ impl HNSWIndex {
 
                                             let improves_result_set = scratch.result_set.len() < ef
                                                 || score_val < worst_score;
-                                            let push_candidate = self.metric == DistanceMetric::Dot
-                                                || improves_result_set;
+                                            let push_candidate = improves_result_set;
 
                                             if push_candidate {
                                                 let sp = NodeCandidate {
@@ -797,8 +794,7 @@ impl HNSWIndex {
 
                                         let improves_result_set = scratch.result_set.len() < ef
                                             || score_val < worst_score;
-                                        let push_candidate = self.metric == DistanceMetric::Dot
-                                            || improves_result_set;
+                                        let push_candidate = improves_result_set;
 
                                         if push_candidate {
                                             let sp = NodeCandidate {

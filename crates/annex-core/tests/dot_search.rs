@@ -91,10 +91,18 @@ fn dot_search_respects_ef_and_matches_full_budget_oracle() {
 
 #[test]
 fn dot_search_orders_negative_scores_without_normalizing_vectors() {
-    let mut index = HNSWIndex::new(DistanceMetric::Dot, 8, 32, 16, 2);
+    // This test isolates score ordering from approximate graph connectivity.
+    // Collinear vectors with increasing norms can lose incoming links when
+    // small neighbor lists are pruned; ef=N cannot reach a disconnected node.
+    // Keep the entire 64-point fixture connected and test traversal budgets
+    // independently on the mixed-sign random fixture above.
+    let mut index = HNSWIndex::new(DistanceMetric::Dot, 64, 128, 16, 2);
     index.set_exact_fallback_enabled(false);
     for id in 1..=64 {
         index.insert(id, vec![id as f32, 1.]).unwrap();
+    }
+    for id in 1..=64 {
+        assert!(index.point_degree(id, 0).unwrap() >= 63);
     }
     let options = SearchRuntimeOptions {
         ef_search: Some(64),

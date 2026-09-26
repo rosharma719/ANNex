@@ -2,7 +2,14 @@ pub type Vector = Vec<f32>;
 
 pub fn normalize(vector: &[f32]) -> Vector {
     let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm == 0.0 {
+    if !norm.is_finite() {
+        let norm = vector
+            .iter()
+            .map(|&x| (x as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        vector.iter().map(|&x| (x as f64 / norm) as f32).collect()
+    } else if norm == 0.0 {
         vec![0.0; vector.len()]
     } else {
         vector.iter().map(|x| x / norm).collect()

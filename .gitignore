@@ -12,3 +12,6 @@ __pycache__/
 experiments/
 # SDD workspace (git-ignored scratch for subagent-driven dev)
 .superpowers/
+
+# Orphan benchmark output when scripts run from the workspace root.
+/benchmark/

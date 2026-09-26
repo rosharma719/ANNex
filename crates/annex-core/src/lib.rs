@@ -63,12 +63,14 @@
 pub mod analysis;
 #[doc(hidden)]
 pub mod payload_storage;
+pub mod rerank;
 pub mod segment;
 pub mod utils;
 #[doc(hidden)]
 pub mod vector;
 
 pub use crate::payload_storage::filters::Filter;
+pub use crate::rerank::{group_by_top_n, mmr_select, reciprocal_rank_fusion, weighted_fusion};
 pub use crate::segment::segment::{Segment, SnapshotMetadata};
 pub use crate::segment::{
     SharedSegment, SnapshotConfig, SnapshotterHandle, WalConfig, start_background_snapshots,
@@ -80,3 +82,4 @@ pub use crate::vector::hnsw::arena::{
     ChunkedArray, ChunkedArrayView, VectorArena, VectorArenaView,
 };
 pub use crate::vector::hnsw::{ScoredPoint, SearchRuntimeOptions};
+pub use crate::vector::sparse::{SparseIndex, SparseVector};

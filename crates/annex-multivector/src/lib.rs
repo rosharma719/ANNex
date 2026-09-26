@@ -6,6 +6,7 @@ mod muvera;
 mod storage;
 
 pub use engine::{
-    CandidateHit, Hit, IndexConfig, IndexError, IndexStats, MultiVectorIndex, UpsertDocument,
+    CandidateHit, Durability, Hit, IndexConfig, IndexError, IndexStats, MultiVectorIndex,
+    UpsertDocument,
 };
 pub use fde::{maxsim, maxsim_flat};

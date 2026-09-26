@@ -12,6 +12,8 @@ use std::{
 pub struct ObjectLocation {
     pub offset: u64,
     pub length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<[u8; 32]>,
 }
 pub struct FlatVectors {
     pub values: Vec<f32>,
@@ -38,12 +40,33 @@ impl FixedVectorStore {
     pub fn put(&self, vector: &[f32]) -> io::Result<ObjectLocation> {
         let bytes = bytemuck::cast_slice(vector);
         let mut file = self.writer.lock().unwrap();
-        let offset = file.metadata()?.len();
-        file.write_all(bytes)?;
+        let length = file.metadata()?.len();
+        // A prior failed write can leave a partial f32 in the uncommitted tail.
+        // Keep subsequent referenced records aligned without touching live data.
+        let padding = (4 - length % 4) % 4;
+        file.write_all(&[0; 3][..padding as usize])?;
+        let offset = length
+            .checked_add(padding)
+            .ok_or_else(|| invalid("FDE offset overflow"))?;
+        append_record(&mut file, bytes, "fde_partial_write")?;
         Ok(ObjectLocation {
             offset,
             length: bytes.len() as u64,
+            checksum: Some(*blake3::hash(bytes).as_bytes()),
         })
+    }
+    pub fn len(&self) -> io::Result<u64> {
+        Ok(self.writer.lock().unwrap().metadata()?.len())
+    }
+    pub fn sync(&self) -> io::Result<()> {
+        self.writer.lock().unwrap().sync_all()
+    }
+    pub fn recover(&self, committed: u64) -> io::Result<()> {
+        let file = self.writer.lock().unwrap();
+        if file.metadata()?.len() < committed {
+            return Err(invalid("segment shorter than committed boundary"));
+        }
+        file.set_len(committed)
     }
     pub fn map(&self) -> io::Result<Mmap> {
         let file = File::open(&self.path)?;
@@ -56,17 +79,13 @@ impl FixedVectorStore {
         unsafe { MmapOptions::new().map(&file) }
     }
     pub fn get(mapped: &[u8], location: ObjectLocation, dimension: usize) -> io::Result<&[f32]> {
-        let start = usize::try_from(location.offset).map_err(|_| io::ErrorKind::InvalidData)?;
-        let length = usize::try_from(location.length).map_err(|_| io::ErrorKind::InvalidData)?;
-        if length != dimension * size_of::<f32>() {
+        let bytes = record_bytes(mapped, location)?;
+        if Some(bytes.len()) != dimension.checked_mul(size_of::<f32>()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid FDE length",
             ));
         }
-        let bytes = mapped
-            .get(start..start + length)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid FDE location"))?;
         bytemuck::try_cast_slice(bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "unaligned FDE"))
     }
@@ -100,7 +119,24 @@ impl CompressedVectorStore {
         residual_codebook: &[f32],
         bits: u8,
     ) -> io::Result<(ObjectLocation, u64)> {
-        let dimension = vectors[0].len();
+        let dimension = vectors.first().map_or(0, Vec::len);
+        if dimension == 0
+            || vectors.len() > u32::MAX as usize
+            || dimension > u32::MAX as usize
+            || centroid_ids.len() != vectors.len()
+            || !(1..=8).contains(&bits)
+            || vectors.iter().any(|v| v.len() != dimension)
+            || centroid_ids.iter().any(|&id| {
+                centroids
+                    .get(id as usize)
+                    .is_none_or(|v| v.len() != dimension)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid PLAID input shape",
+            ));
+        }
         if residual_codebook.len() != 1usize << bits {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -135,14 +171,28 @@ impl CompressedVectorStore {
         bytes.extend_from_slice(&packed);
         let mut file = self.writer.lock().unwrap();
         let offset = file.metadata()?.len();
-        file.write_all(&bytes)?;
+        append_record(&mut file, &bytes, "object_partial_write")?;
         Ok((
             ObjectLocation {
                 offset,
                 length: bytes.len() as u64,
+                checksum: Some(*blake3::hash(&bytes).as_bytes()),
             },
             bytes.len() as u64,
         ))
+    }
+    pub fn len(&self) -> io::Result<u64> {
+        Ok(self.writer.lock().unwrap().metadata()?.len())
+    }
+    pub fn sync(&self) -> io::Result<()> {
+        self.writer.lock().unwrap().sync_all()
+    }
+    pub fn recover(&self, committed: u64) -> io::Result<()> {
+        let file = self.writer.lock().unwrap();
+        if file.metadata()?.len() < committed {
+            return Err(invalid("segment shorter than committed boundary"));
+        }
+        file.set_len(committed)
     }
     pub fn map(&self) -> io::Result<Mmap> {
         let file = File::open(&self.path)?;
@@ -181,11 +231,7 @@ impl CompressedVectorStore {
         residual_codebook: &[f32],
         scratch: &mut Vec<f32>,
     ) -> io::Result<usize> {
-        let start = usize::try_from(location.offset).map_err(|_| io::ErrorKind::InvalidData)?;
-        let length = usize::try_from(location.length).map_err(|_| io::ErrorKind::InvalidData)?;
-        let bytes = mapped
-            .get(start..start + length)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid object location"))?;
+        let bytes = record_bytes(mapped, location)?;
         if bytes.len() < 16 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -195,8 +241,21 @@ impl CompressedVectorStore {
         let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
         let dimension = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
         let bits = bytes[8];
-        let ids_end = 16 + count * 4;
-        if bits == 0 || bits > 8 || bytes.len() < ids_end {
+        let ids_end = count
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(16))
+            .ok_or_else(|| invalid("PLAID count overflow"))?;
+        let total = count
+            .checked_mul(dimension)
+            .ok_or_else(|| invalid("PLAID dimensions overflow"))?;
+        if count == 0
+            || dimension == 0
+            || bits == 0
+            || bits > 8
+            || bytes.len() < ids_end
+            || bytes[9..12] != [0; 3]
+            || bytes[12..16] != 1.0f32.to_le_bytes()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid PLAID header",
@@ -206,14 +265,19 @@ impl CompressedVectorStore {
             .chunks_exact(4)
             .map(|x| u32::from_le_bytes(x.try_into().unwrap()) as usize)
             .collect();
-        let codes = unpack(&bytes[ids_end..], bits, count * dimension)?;
+        if ids
+            .iter()
+            .any(|&id| centroids.get(id).is_none_or(|v| v.len() != dimension))
+        {
+            return Err(invalid("unknown centroid or mismatched dimension"));
+        }
+        let codes = unpack(&bytes[ids_end..], bits, total)?;
         if residual_codebook.len() != 1usize << bits {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "residual codebook size mismatch",
             ));
         }
-        let total = count * dimension;
         scratch.clear();
         scratch.reserve(total.saturating_sub(scratch.capacity()));
         for (row, id) in ids.into_iter().enumerate() {
@@ -249,7 +313,12 @@ fn pack(values: &[u8], bits: u8) -> Vec<u8> {
     out
 }
 fn unpack(bytes: &[u8], bits: u8, count: usize) -> io::Result<Vec<u8>> {
-    if bytes.len() * 8 < count * bits as usize {
+    let expected = count
+        .checked_mul(bits as usize)
+        .and_then(|n| n.checked_add(7))
+        .map(|n| n / 8)
+        .ok_or_else(|| invalid("residual count overflow"))?;
+    if bytes.len() != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated residuals",
@@ -290,10 +359,113 @@ fn unpack(bytes: &[u8], bits: u8, count: usize) -> io::Result<Vec<u8>> {
     }
     Ok(out)
 }
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&temporary, bytes)?;
-    fs::rename(temporary, path)
+fn append_record(file: &mut File, bytes: &[u8], _stage: &'static str) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let split = (bytes.len() / 2 + 1).min(bytes.len());
+        file.write_all(&bytes[..split])?;
+        commit_boundary(_stage)?;
+        file.write_all(&bytes[split..])
+    }
+    #[cfg(not(test))]
+    file.write_all(bytes)
+}
+
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+pub fn record_bytes(mapped: &[u8], location: ObjectLocation) -> io::Result<&[u8]> {
+    let start = usize::try_from(location.offset).map_err(|_| invalid("offset overflow"))?;
+    let length = usize::try_from(location.length).map_err(|_| invalid("length overflow"))?;
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| invalid("record range overflow"))?;
+    mapped
+        .get(start..end)
+        .ok_or_else(|| invalid("record outside segment"))
+}
+
+/// Verify once on open, outside the scoring hot path. Legacy records without a
+/// digest still receive structural validation from their decoder.
+pub fn verify_record(mapped: &[u8], location: ObjectLocation, required: bool) -> io::Result<()> {
+    let bytes = record_bytes(mapped, location)?;
+    match location.checksum {
+        Some(expected) if blake3::hash(bytes).as_bytes() != &expected => {
+            Err(invalid("record checksum mismatch"))
+        }
+        None if required => Err(invalid("missing record checksum")),
+        _ => Ok(()),
+    }
+}
+
+/// The caller must publish its staged in-memory state even when a failure
+/// after rename makes durability uncertain. Rolling it back would diverge
+/// from the manifest currently visible to a subsequent opener.
+pub struct CommitError {
+    pub source: io::Error,
+    pub published: bool,
+}
+
+pub fn atomic_write(path: &Path, bytes: &[u8], sync: bool) -> Result<(), CommitError> {
+    let temporary = path.with_extension("pending");
+    let before_publish = || -> io::Result<()> {
+        let mut file = File::create(&temporary)?;
+        append_record(&mut file, bytes, "manifest_partial_write")?;
+        commit_boundary("manifest_written")?;
+        if sync {
+            file.sync_all()?;
+        }
+        commit_boundary("manifest_synced")?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    };
+    before_publish().map_err(|source| CommitError {
+        source,
+        published: false,
+    })?;
+    let after_publish = || -> io::Result<()> {
+        commit_boundary("manifest_renamed")?;
+        if sync {
+            File::open(path.parent().unwrap())?.sync_all()?;
+        }
+        commit_boundary("directory_synced")?;
+        Ok(())
+    };
+    after_publish().map_err(|source| CommitError {
+        source,
+        published: true,
+    })
+}
+
+// Fault injection exists only in test binaries, never in a production build.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_COMMIT: std::cell::Cell<Option<(&'static str, usize)>> = const { std::cell::Cell::new(None) };
+}
+pub(crate) fn commit_boundary(_stage: &'static str) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        if std::env::var("ANNEX_TEST_CRASH_STAGE").as_deref() == Ok(_stage) {
+            // No destructors, rollback, or implicit close/flush.
+            std::process::exit(86);
+        }
+        let fail = FAIL_COMMIT.with(|point| match point.get() {
+            Some((name, remaining)) if name == _stage => {
+                point.set(if remaining > 1 {
+                    Some((name, remaining - 1))
+                } else {
+                    None
+                });
+                remaining <= 1
+            }
+            _ => false,
+        });
+        if fail {
+            return Err(io::Error::other(format!("injected failure: {_stage}")));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -336,7 +508,7 @@ mod tests {
         let raw = deterministic_bytes(8000);
         for &count in &[4usize, 16, 128, 512, 25600] {
             let expected = unpack_reference(&raw, 2, count);
-            let actual = unpack(&raw, 2, count).unwrap();
+            let actual = unpack(&raw[..(count * 2).div_ceil(8)], 2, count).unwrap();
             assert_eq!(actual, expected, "count={count}");
         }
     }
@@ -347,7 +519,7 @@ mod tests {
         // Every non-multiple-of-4 tail length.
         for &count in &[1usize, 2, 3, 5, 6, 7, 9, 17, 25599] {
             let expected = unpack_reference(&raw, 2, count);
-            let actual = unpack(&raw, 2, count).unwrap();
+            let actual = unpack(&raw[..(count * 2).div_ceil(8)], 2, count).unwrap();
             assert_eq!(actual, expected, "count={count}");
         }
     }
@@ -358,8 +530,39 @@ mod tests {
         for bits in [1u8, 3, 4, 5, 8] {
             let count = 32;
             let expected = unpack_reference(&raw, bits, count);
-            let actual = unpack(&raw, bits, count).unwrap();
+            let actual = unpack(&raw[..(count * bits as usize).div_ceil(8)], bits, count).unwrap();
             assert_eq!(actual, expected, "bits={bits}");
         }
+    }
+    #[test]
+    fn corrupt_headers_and_ranges_return_errors_without_panicking() {
+        let centers = vec![vec![0.; 3]];
+        let residuals = vec![0.; 4];
+        for (count, dimension) in [(u32::MAX, 3), (1, u32::MAX), (0, 3), (1, 0), (1, 4)] {
+            let mut bytes = vec![0u8; 21];
+            bytes[..4].copy_from_slice(&count.to_le_bytes());
+            bytes[4..8].copy_from_slice(&dimension.to_le_bytes());
+            bytes[8] = 2;
+            bytes[12..16].copy_from_slice(&1f32.to_le_bytes());
+            let location = ObjectLocation {
+                offset: 0,
+                length: bytes.len() as u64,
+                checksum: None,
+            };
+            assert!(CompressedVectorStore::decode(&bytes, location, &centers, &residuals).is_err());
+        }
+        let location = ObjectLocation {
+            offset: u64::MAX,
+            length: 2,
+            checksum: None,
+        };
+        assert!(FixedVectorStore::get(&[0; 16], location, 1).is_err());
+        assert!(CompressedVectorStore::decode(&[0; 16], location, &centers, &residuals).is_err());
+        let location = ObjectLocation {
+            offset: 0,
+            length: 4,
+            checksum: None,
+        };
+        assert!(FixedVectorStore::get(&[0; 16], location, usize::MAX).is_err());
     }
 }

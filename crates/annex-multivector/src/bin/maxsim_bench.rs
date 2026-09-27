@@ -61,30 +61,32 @@ fn maxsim_flat_scalar(query: &[Vec<f32>], document: &[f32], dimension: usize) ->
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn dot_neon_128(a: *const f32, b: *const f32) -> f32 {
-    use std::arch::aarch64::*;
-    // Four accumulators to hide FMA latency (~4 cycles on M-series).
-    let mut acc0 = vdupq_n_f32(0.0);
-    let mut acc1 = vdupq_n_f32(0.0);
-    let mut acc2 = vdupq_n_f32(0.0);
-    let mut acc3 = vdupq_n_f32(0.0);
-    let mut i = 0usize;
-    while i < 128 {
-        let a0 = vld1q_f32(a.add(i));
-        let a1 = vld1q_f32(a.add(i + 4));
-        let a2 = vld1q_f32(a.add(i + 8));
-        let a3 = vld1q_f32(a.add(i + 12));
-        let b0 = vld1q_f32(b.add(i));
-        let b1 = vld1q_f32(b.add(i + 4));
-        let b2 = vld1q_f32(b.add(i + 8));
-        let b3 = vld1q_f32(b.add(i + 12));
-        acc0 = vfmaq_f32(acc0, a0, b0);
-        acc1 = vfmaq_f32(acc1, a1, b1);
-        acc2 = vfmaq_f32(acc2, a2, b2);
-        acc3 = vfmaq_f32(acc3, a3, b3);
-        i += 16;
+    unsafe {
+        use std::arch::aarch64::*;
+        // Four accumulators to hide FMA latency (~4 cycles on M-series).
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i < 128 {
+            let a0 = vld1q_f32(a.add(i));
+            let a1 = vld1q_f32(a.add(i + 4));
+            let a2 = vld1q_f32(a.add(i + 8));
+            let a3 = vld1q_f32(a.add(i + 12));
+            let b0 = vld1q_f32(b.add(i));
+            let b1 = vld1q_f32(b.add(i + 4));
+            let b2 = vld1q_f32(b.add(i + 8));
+            let b3 = vld1q_f32(b.add(i + 12));
+            acc0 = vfmaq_f32(acc0, a0, b0);
+            acc1 = vfmaq_f32(acc1, a1, b1);
+            acc2 = vfmaq_f32(acc2, a2, b2);
+            acc3 = vfmaq_f32(acc3, a3, b3);
+            i += 16;
+        }
+        let acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        vaddvq_f32(acc)
     }
-    let acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
-    vaddvq_f32(acc)
 }
 
 #[cfg(target_arch = "aarch64")]

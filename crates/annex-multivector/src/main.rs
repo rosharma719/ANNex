@@ -40,6 +40,7 @@ struct Args {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Document {
     id: String,
     vectors: Vec<Vec<f32>>,
@@ -47,10 +48,17 @@ struct Document {
     metadata: Value,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpsertRequest {
     documents: Vec<Document>,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteRequest {
+    id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QueryRequest {
     vectors: Vec<Vec<f32>>,
     #[serde(default = "ten")]
@@ -60,36 +68,34 @@ struct QueryRequest {
     probes: Option<usize>,
     candidate_backend: Option<String>,
     ef_search: Option<usize>,
-    /// When true, the response includes a `stats` object with per-query
-    /// timing, candidate counts, and FDE-vs-MaxSim rank-agreement signals.
-    /// The primitive under EXPLAIN SEARCH — surface the "why" of a query
-    /// alongside the "what", so downstream tuning, SLO enforcement, and
-    /// confidence output all have data to consume.
     #[serde(default)]
     explain: bool,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CandidateRequest {
     vectors: Vec<Vec<f32>>,
     count: usize,
     #[serde(default = "default_candidate_backend")]
     candidate_backend: String,
-    #[serde(default = "two_fifty_six")]
-    ef_search: usize,
+    ef_search: Option<usize>,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TrainRequest {
     vectors: Vec<Vec<f32>>,
     #[serde(default = "twenty")]
     iterations: usize,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScoreRequest {
     query: Vec<Vec<f32>>,
     document: Option<Vec<Vec<f32>>>,
     id: Option<String>,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BuildAnnRequest {
     #[serde(default = "sixteen")]
     m: usize,
@@ -131,6 +137,21 @@ impl From<IndexError> for ApiError {
     }
 }
 
+fn bounded(name: &str, value: usize, max: usize) -> Result<(), ApiError> {
+    if value == 0 || value > max {
+        return Err(IndexError::Invalid(format!("{name} must be between 1 and {max}")).into());
+    }
+    Ok(())
+}
+
+async fn delete(
+    State(index): State<Arc<MultiVectorIndex>>,
+    Json(body): Json<DeleteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    bounded("document id bytes", body.id.len(), 4096)?;
+    Ok(Json(json!({"deleted": index.delete(&body.id)?})))
+}
+
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok", "version": env!("CARGO_PKG_VERSION")}))
 }
@@ -141,6 +162,17 @@ async fn upsert(
     State(index): State<Arc<MultiVectorIndex>>,
     Json(body): Json<UpsertRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    bounded("documents", body.documents.len(), 1024)?;
+    let mut tokens = 0;
+    let mut values = 0;
+    for document in &body.documents {
+        bounded("document id bytes", document.id.len(), 4096)?;
+        bounded("document tokens", document.vectors.len(), 8192)?;
+        tokens += document.vectors.len();
+        values += document.vectors.iter().map(Vec::len).sum::<usize>();
+    }
+    bounded("batch tokens", tokens, 131_072)?;
+    bounded("batch vector values", values, 16_777_216)?;
     let count = body.documents.len();
     index.upsert_batch(
         body.documents
@@ -158,6 +190,18 @@ async fn query(
     State(index): State<Arc<MultiVectorIndex>>,
     Json(body): Json<QueryRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    bounded("query tokens", body.vectors.len(), 1024)?;
+    bounded("top_k", body.top_k, 10_000)?;
+    for (name, value, limit) in [
+        ("candidates", body.candidates, 100_000),
+        ("rerank_candidates", body.rerank_candidates, 100_000),
+        ("probes", body.probes, 4096),
+        ("ef_search", body.ef_search, 65_536),
+    ] {
+        if let Some(value) = value {
+            bounded(name, value, limit)?;
+        }
+    }
     let explain = body.explain;
     let t0 = std::time::Instant::now();
     // Existing clients used these knobs with the implicit MUVERA backend.
@@ -169,6 +213,14 @@ async fn query(
             "auto"
         }
     });
+    if (backend == "hnsw" && body.probes.is_some())
+        || (backend == "muvera" && body.ef_search.is_some())
+    {
+        return Err(IndexError::Invalid(
+            "probes requires muvera; ef_search requires hnsw or auto".into(),
+        )
+        .into());
+    }
     let mut executed_backend = backend;
     let matches = match backend {
         "hnsw" => match body.rerank_candidates {
@@ -234,11 +286,6 @@ async fn query(
         return Ok(Json(json!({"matches": matches})));
     }
 
-    // ── EXPLAIN block: cheap derived stats from the returned matches ──
-    // Everything below is computed server-side so callers don't have to
-    // duplicate the logic (see benchmark/headtohead.py for the reference
-    // implementation). Kept close to the primitive: no model inference,
-    // no calibration lookup — just what falls out of the hit list.
     let fde_available = !matches.is_empty() && matches.iter().all(|hit| hit.fde_score.is_some());
     let top_score = matches.first().map(|h| h.score).unwrap_or(0.0);
     let second_score = matches.get(1).map(|h| h.score).unwrap_or(top_score);
@@ -288,6 +335,13 @@ async fn train(
     State(index): State<Arc<MultiVectorIndex>>,
     Json(body): Json<TrainRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    bounded("training samples", body.vectors.len(), 65_536)?;
+    bounded("training iterations", body.iterations, 100)?;
+    bounded(
+        "training vector values",
+        body.vectors.iter().map(Vec::len).sum(),
+        16_777_216,
+    )?;
     let samples = body.vectors.len();
     index.train(&body.vectors, body.iterations)?;
     Ok(Json(json!({"trained_on": samples})))
@@ -296,6 +350,10 @@ async fn score(
     State(index): State<Arc<MultiVectorIndex>>,
     Json(body): Json<ScoreRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    bounded("query tokens", body.query.len(), 1024)?;
+    if let Some(document) = &body.document {
+        bounded("document tokens", document.len(), 8192)?;
+    }
     let score = match (body.document, body.id) {
         (Some(document), None) => index.score_uncompressed(&body.query, &document)?,
         (None, Some(id)) => index.score_compressed(&body.query, &id)?,
@@ -319,9 +377,19 @@ async fn candidates(
     State(index): State<Arc<MultiVectorIndex>>,
     Json(body): Json<CandidateRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    bounded("query tokens", body.vectors.len(), 1024)?;
+    bounded("count", body.count, 100_000)?;
+    if let Some(ef_search) = body.ef_search {
+        bounded("ef_search", ef_search, 65_536)?;
+        if body.candidate_backend != "hnsw" {
+            return Err(IndexError::Invalid("ef_search requires hnsw".into()).into());
+        }
+    }
     let candidates = match body.candidate_backend.as_str() {
         "muvera" => index.exact_fde_candidates(&body.vectors, body.count)?,
-        "hnsw" => index.ann_fde_candidates(&body.vectors, body.count, body.ef_search)?,
+        "hnsw" => {
+            index.ann_fde_candidates(&body.vectors, body.count, body.ef_search.unwrap_or(256))?
+        }
         other => {
             return Err(ApiError(IndexError::Invalid(format!(
                 "unknown candidate backend: {other}"
@@ -359,6 +427,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/debug/candidates", post(candidates))
         .route("/v1/fde/index", post(build_ann))
         .route("/v1/vectors/upsert", post(upsert))
+        .route("/v1/vectors/delete", post(delete))
         .route("/v1/query", post(query))
         // ColBERT batches are legitimately large: 100 documents can contain
         // millions of JSON floats. Keep the limit explicit and configurable at
@@ -450,8 +519,7 @@ mod tests {
                 Json(serde_json::from_value(body).unwrap()),
             )
             .await
-            .err()
-            .expect("explicit auto must reject legacy backend knobs");
+            .expect_err("explicit auto must reject legacy backend knobs");
             assert!(matches!(error.0, IndexError::Invalid(_)));
         }
     }

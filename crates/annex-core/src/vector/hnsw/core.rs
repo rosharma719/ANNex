@@ -1080,25 +1080,6 @@ impl HNSWIndex {
         self.node_state
             .with(idx, |s| s.store(NODE_LIVE, Ordering::Release));
     }
-
-    /// Legacy synchronous variant retained for the offline (`&mut self`) build
-    /// paths that still assume single-threaded insertion. Reservers under the
-    /// same alloc mutex, publishes LIVE immediately, and returns the idx.
-    pub(crate) fn register_node(
-        &mut self,
-        point_id: PointId,
-        vector: Vector,
-        level: usize,
-    ) -> usize {
-        let idx = self.alloc_node(point_id, vector, level).unwrap_or_else(|| {
-            self.alloc
-                .lock()
-                .expect("alloc mutex poisoned")
-                .point_to_idx[&point_id]
-        });
-        self.publish_live(idx);
-        idx
-    }
 }
 
 impl HNSWIndex {

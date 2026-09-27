@@ -1,14 +1,4 @@
-//! Criterion micro-benchmarks for the annex-multivector kernels.
-//!
-//! Establishes reproducible perf baselines so future kernel edits either
-//! ratchet the numbers up or fail loudly. Complements the ad-hoc
-//! `src/bin/maxsim_bench.rs` which prints a one-shot number.
-//!
-//! Run with:
-//!     cargo bench -p annex-multivector --bench kernels
-//!
-//! To gate CI on no regression, add `--save-baseline main` on the ref run
-//! and `--baseline main` on PR runs.
+//! Kernel measurements; commands and reporting rules: docs/benchmarks.md.
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use multivector::maxsim_flat;

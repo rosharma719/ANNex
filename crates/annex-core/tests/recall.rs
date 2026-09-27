@@ -147,7 +147,7 @@ fn recall_unfiltered_euclidean() {
         avg_recall /= num_queries as f64;
         let avg_search_ms = (total_search / num_queries as f64) * 1000.0;
         println!(
-            "✅ [ef_search={}] Average recall over {} queries: {:.3} | avg search {:.3} ms/query",
+            "[ef_search={}] Average recall over {} queries: {:.3} | avg search {:.3} ms/query",
             ef_search, num_queries, avg_recall, avg_search_ms
         );
         segment.hnsw().flush_unfiltered_search_stats();
@@ -294,7 +294,7 @@ fn recall_in_place_filtered() {
         avg_recall /= num_queries as f64;
         let avg_search_ms = (total_search / num_queries as f64) * 1000.0;
         println!(
-            "✅ [ef_search={}] Average filtered recall over {} queries: {:.3} | avg search {:.3} ms/query",
+            "[ef_search={}] Average filtered recall over {} queries: {:.3} | avg search {:.3} ms/query",
             ef_search, num_queries, avg_recall, avg_search_ms
         );
         segment.hnsw().flush_unfiltered_search_stats();

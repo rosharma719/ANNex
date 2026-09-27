@@ -1,4 +1,5 @@
-"""Stable provenance attached to every committed benchmark report."""
+"""Provenance for development diagnostic reports; comparative runs use measurement.py."""
+
 from __future__ import annotations
 
 import importlib.metadata
@@ -14,14 +15,20 @@ PACKAGES = ("ir-datasets", "numpy", "pylate", "sentence-transformers")
 
 def command(*args: str) -> str | None:
     try:
-        return subprocess.check_output(args, cwd=ROOT, text=True, stderr=subprocess.DEVNULL).strip()
+        return subprocess.check_output(
+            args, cwd=ROOT, text=True, stderr=subprocess.DEVNULL
+        ).strip()
     except (OSError, subprocess.CalledProcessError):
         return None
 
 
 def package_version() -> str:
     manifest = (ROOT / "Cargo.toml").read_text()
-    match = re.search(r'^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)"', manifest, re.MULTILINE)
+    match = re.search(
+        r'^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)"',
+        manifest,
+        re.MULTILINE,
+    )
     if match is None:
         raise RuntimeError("Cargo.toml must contain a SemVer package version")
     return match.group(1)

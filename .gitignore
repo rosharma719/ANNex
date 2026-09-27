@@ -15,3 +15,11 @@ experiments/
 
 # Orphan benchmark output when scripts run from the workspace root.
 /benchmark/
+
+# Generated benchmark artifacts (publish separately with a digest).
+**/benchmark/cache/
+**/benchmark/results/
+**/benchmark/reports/
+/crates/annex-core/bench/nyt256/results*
+.venv/
+.claude/

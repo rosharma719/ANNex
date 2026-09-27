@@ -1,5 +1,5 @@
 //! Opt-in, warmed NYT search benchmark. Recall and counters are measured outside
-//! the timed production search path. See docs/recall-investigation.md.
+//! the timed production search path. See docs/recall_frontier_pipeline.md.
 use std::{env, fs, hint::black_box, time::Instant};
 
 use annex::{
@@ -508,7 +508,7 @@ fn nytimes_lid_build_recall() {
             eprintln!("sort_by_lid({n_build}) took {:?}", t.elapsed());
         }
         let t = Instant::now();
-        let mut index = HNSWIndex::new(DistanceMetric::Cosine, 16, 200, 4, 256);
+        let index = HNSWIndex::new(DistanceMetric::Cosine, 16, 200, 4, 256);
         index.par_insert_batch(&entries).unwrap();
         eprintln!("build({n_build}, lid={apply_lid}) took {:?}", t.elapsed());
 

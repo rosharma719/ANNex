@@ -38,7 +38,7 @@ fn test_all_metrics_consistency() {
         DistanceMetric::Dot,
     ] {
         println!("Testing with metric: {:?}", metric);
-        let mut hnsw = HNSWIndex::new(metric, 16, 64, 16, 4);
+        let hnsw = HNSWIndex::new(metric, 16, 64, 16, 4);
         println!("Created HNSW index with dimension 4");
         let points = generate_points(50, 4, 10.0);
 
@@ -94,7 +94,7 @@ fn test_hnsw_robust_score_metrics() {
     let vectors: Vec<_> = (1..=1000).map(|i| vecf(&[i as f32, 0.0, 0.0])).collect();
 
     // Euclidean HNSW
-    let mut hnsw_euclidean = HNSWIndex::new(DistanceMetric::Euclidean, 16, 50, 16, 3);
+    let hnsw_euclidean = HNSWIndex::new(DistanceMetric::Euclidean, 16, 50, 16, 3);
     for (id, vec) in vectors.iter().enumerate() {
         hnsw_euclidean.insert(id as u64, vec.clone()).unwrap();
     }
@@ -102,7 +102,7 @@ fn test_hnsw_robust_score_metrics() {
     assert_eq!(results_euclidean[0].id, 0);
 
     // Cosine HNSW
-    let mut hnsw_cosine = HNSWIndex::new(DistanceMetric::Cosine, 16, 50, 16, 3);
+    let hnsw_cosine = HNSWIndex::new(DistanceMetric::Cosine, 16, 50, 16, 3);
     for (id, vec) in vectors.iter().enumerate() {
         hnsw_cosine.insert(id as u64, vec.clone()).unwrap();
     }
@@ -117,7 +117,7 @@ fn test_hnsw_robust_score_metrics() {
 #[test]
 fn test_large_insertion_and_ranking_accuracy() {
     println!("Starting test_large_insertion_and_ranking_accuracy");
-    let mut hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 32, 64, 16, 3);
+    let hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 32, 64, 16, 3);
     println!("Created HNSW index with Euclidean metric and dimension 3");
 
     let mut vectors = Vec::new();
@@ -165,7 +165,7 @@ fn test_large_insertion_and_ranking_accuracy() {
 #[test]
 fn test_dot_product_prefers_larger_magnitudes() {
     println!("Starting test_dot_product_prefers_larger_magnitudes");
-    let mut hnsw = HNSWIndex::new(DistanceMetric::Dot, 16, 50, 16, 2);
+    let hnsw = HNSWIndex::new(DistanceMetric::Dot, 16, 50, 16, 2);
     println!("Created HNSW index with Dot product metric and dimension 2");
 
     println!("Inserting vector with ID 1: [1.0, 1.0]");
@@ -196,7 +196,7 @@ fn test_dot_product_prefers_larger_magnitudes() {
 #[test]
 fn test_cosine_distance_with_opposite_vectors() {
     println!("Starting test_cosine_distance_with_opposite_vectors");
-    let mut hnsw = HNSWIndex::new(DistanceMetric::Cosine, 16, 50, 16, 3);
+    let hnsw = HNSWIndex::new(DistanceMetric::Cosine, 16, 50, 16, 3);
     println!("Created HNSW index with Cosine metric and dimension 3");
 
     println!("Inserting vector with ID 1: [1.0, 0.0, 0.0]");
@@ -228,7 +228,7 @@ fn test_cosine_distance_with_opposite_vectors() {
 #[test]
 fn test_idempotent_insert_and_query() {
     println!("Starting test_idempotent_insert_and_query");
-    let mut hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 50, 16, 2);
+    let hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 50, 16, 2);
     println!("Created HNSW index with Euclidean metric and dimension 2");
 
     println!("Inserting vector with ID 1: [3.0, 4.0]");
@@ -272,7 +272,7 @@ fn test_empty_index_search_returns_empty() {
 #[test]
 fn test_dimension_mismatch_is_handled() {
     println!("Starting test_dimension_mismatch_is_handled");
-    let mut hnsw = HNSWIndex::new(DistanceMetric::Cosine, 16, 50, 16, 5);
+    let hnsw = HNSWIndex::new(DistanceMetric::Cosine, 16, 50, 16, 5);
     println!("Created HNSW index with dimension 5");
 
     println!("Inserting valid vector with ID 1: [1.0, 1.0, 1.0, 1.0, 1.0]");
@@ -320,7 +320,7 @@ fn test_dimension_mismatch_is_handled() {
 
 #[test]
 fn test_search_k_greater_than_total_points() {
-    let mut hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 50, 16, 2);
+    let hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 50, 16, 2);
     hnsw.insert(1, vecf(&[1.0, 2.0])).unwrap();
     hnsw.insert(2, vecf(&[2.0, 3.0])).unwrap();
 
@@ -330,7 +330,7 @@ fn test_search_k_greater_than_total_points() {
 
 #[test]
 fn test_single_insertion_exact_retrieval() {
-    let mut hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 50, 16, 2);
+    let hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 50, 16, 2);
     let vec = vecf(&[3.15, 2.71]);
     hnsw.insert(42, vec.clone()).unwrap();
 
@@ -342,7 +342,7 @@ fn test_single_insertion_exact_retrieval() {
 
 #[test]
 fn test_insertion_order_independence() {
-    let mut hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 50, 16, 2);
+    let hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 50, 16, 2);
 
     // Insert in non-sorted order
     hnsw.insert(100, vecf(&[5.0, 5.0])).unwrap();
@@ -356,7 +356,7 @@ fn test_insertion_order_independence() {
 
 #[test]
 fn test_dense_cloud_retrieval_accuracy() {
-    let mut hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 64, 16, 3);
+    let hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 64, 16, 3);
     let center = vecf(&[0.0, 0.0, 0.0]);
 
     // Insert many points around the origin
@@ -378,7 +378,7 @@ fn test_high_dimensional_accuracy() {
     let ef = 64;
     let max_level_cap = 16;
 
-    let mut hnsw = HNSWIndex::new(DistanceMetric::Euclidean, m, ef, max_level_cap, dim);
+    let hnsw = HNSWIndex::new(DistanceMetric::Euclidean, m, ef, max_level_cap, dim);
 
     // Insert two far-apart high-dimensional vectors
     hnsw.insert(1, vecf(&vec![1.0; dim])).unwrap();
@@ -421,7 +421,7 @@ fn reorder_rcm_preserves_search_results() {
 #[test]
 fn ti_skip_matches_baseline_recall() {
     use annex::vector::hnsw::SearchRuntimeOptions;
-    let mut index = HNSWIndex::new(DistanceMetric::Cosine, 16, 200, 4, 8);
+    let index = HNSWIndex::new(DistanceMetric::Cosine, 16, 200, 4, 8);
     let vecs: Vec<Vec<f32>> = (0..200u64)
         .map(|i| {
             let mut v = vec![0.0f32; 8];
@@ -501,7 +501,7 @@ fn lid_sort_does_not_regress_recall() {
     use annex::vector::hnsw::{HNSWIndex, SearchRuntimeOptions};
 
     fn build_index(apply_lid: bool) -> HNSWIndex {
-        let mut index = HNSWIndex::new(DistanceMetric::Cosine, 8, 100, 4, 32);
+        let index = HNSWIndex::new(DistanceMetric::Cosine, 8, 100, 4, 32);
         let mut rng = 42u64;
         let mut lcg = || -> f32 {
             rng = rng
@@ -745,7 +745,7 @@ fn chunked_array_with_parking_lot_rwlock() {
 
 #[test]
 fn atomic_metadata_and_vector_arena_survive_snapshot_round_trip() {
-    let mut index = HNSWIndex::new(DistanceMetric::Euclidean, 4, 20, 300, 4);
+    let index = HNSWIndex::new(DistanceMetric::Euclidean, 4, 20, 300, 4);
     assert_eq!(index.max_level_cap(), u8::MAX as usize);
 
     for id in 0..10u64 {

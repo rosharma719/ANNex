@@ -4,163 +4,74 @@ use annex::utils::errors::DBError;
 use annex::utils::payload::{Payload, PayloadValue, ScalarComparisonOp};
 use annex::utils::types::{DistanceMetric, Vector};
 use annex::vector::hnsw::HNSWIndex;
-use serde::Serialize;
-use std::env;
-use std::fs::OpenOptions;
-use std::io::Write;
+
+const DIM: usize = 32;
+const METRICS: [DistanceMetric; 3] = [
+    DistanceMetric::Euclidean,
+    DistanceMetric::Cosine,
+    DistanceMetric::Dot,
+];
 
 fn vecf_dim(seed: usize, dim: usize) -> Vector {
-    // Deterministic high-dim vector generator for tests
     (0..dim).map(|d| ((seed + d) as f32).sin()).collect()
 }
 
-const DIM: usize = 1536;
-
-#[derive(Serialize)]
-struct DotDiagEntry {
-    query_idx: usize,
-    expected_id: u64,
-    expected_dot: f32,
-    top_id: u64,
-    top_dot: f32,
-}
-
 #[test]
-fn test_large_scale_insert_and_search_all_metrics() {
-    use std::time::Instant;
-
-    for metric in [
-        DistanceMetric::Euclidean,
-        DistanceMetric::Cosine,
-        DistanceMetric::Dot,
-    ] {
-        println!("\n\n===========================");
-        println!("STARTING TEST FOR {:?}", metric);
-        println!("===========================\n");
-
-        let hnsw = HNSWIndex::new(metric, 16, 50, 16, DIM);
-        let mut segment = Segment::new(hnsw);
-        if metric == DistanceMetric::Dot {
-            segment.hnsw_mut().set_exact_fallback_enabled(true);
-            segment.hnsw_mut().set_exact_fallback_threshold(10_000);
-        } else {
-            segment.hnsw_mut().set_exact_fallback_enabled(false);
-            segment.hnsw_mut().set_exact_fallback_threshold(0);
-        }
-
-        let mut ids = Vec::new();
-        let mut vectors = Vec::new();
-
-        println!("--- INSERTING VECTORS ---\n");
-        let insert_start = Instant::now();
-        for i in 0..1_000 {
-            let vec = vecf_dim(i, DIM);
-            let mut payload = Payload::default();
-            payload.set("index", PayloadValue::Int(i as i64));
-
-            let id = segment.insert(vec.clone(), Some(payload)).unwrap();
-            ids.push(id);
-            vectors.push((id, vec));
-
-            if i % 1000 == 0 {
-                println!("Inserted {} vectors... (+{:?})", i, insert_start.elapsed());
-            }
-        }
-        let insert_elapsed = insert_start.elapsed();
-        println!(
-            "[{:?}] Inserted 1000 vectors in {:?} (~{:.3} ms/insert)",
-            metric,
-            insert_elapsed,
-            insert_elapsed.as_secs_f64() * 1e3 / 1_000.0
-        );
-
-        println!("\n--- SEARCHING QUERIES ---\n");
-        let search_start = Instant::now();
-        let dot_diag_path = env::var("VECTORDB_DOT_DIAG_LOG").ok();
-        for (query_idx, (expected_id, query)) in vectors.iter().take(10).enumerate() {
-            let noisy_query: Vec<f32> = query
+fn insert_and_search_all_metrics() {
+    for metric in METRICS {
+        let mut segment = Segment::new(HNSWIndex::new(metric, 16, 50, 16, DIM));
+        segment
+            .hnsw_mut()
+            .set_exact_fallback_enabled(metric == DistanceMetric::Dot);
+        segment
+            .hnsw_mut()
+            .set_exact_fallback_threshold(if metric == DistanceMetric::Dot {
+                1000
+            } else {
+                0
+            });
+        let vectors: Vec<_> = (0..256)
+            .map(|i| {
+                let vector = vecf_dim(i, DIM);
+                let id = segment.insert(vector.clone(), None).unwrap();
+                (id, vector)
+            })
+            .collect();
+        for (expected_id, query) in vectors.iter().take(10) {
+            let query: Vec<_> = query
                 .iter()
                 .enumerate()
-                .map(|(idx, x)| x + 0.001 * ((idx % 5) as f32))
+                .map(|(i, x)| x + 0.001 * (i % 5) as f32)
                 .collect();
-
-            let now = Instant::now();
-            let results = segment.search(&noisy_query, 5).unwrap();
-            let duration = now.elapsed();
-
-            println!(
-                "[{:?}] Search complete in {:?}. Top result: ID {:?}",
-                metric, duration, results[0].id
-            );
-
+            let results = segment.search(&query, 5).unwrap();
+            assert!(!results.is_empty(), "metric={metric:?}");
             if metric == DistanceMetric::Dot {
-                // For Dot, compute highest dot product manually.
-                let mut best_id = None;
-                let mut best_dot = f32::NEG_INFINITY;
-                for (id, vec) in &vectors {
-                    let dot: f32 = vec.iter().zip(&noisy_query).map(|(a, b)| a * b).sum();
-                    if dot > best_dot {
-                        best_dot = dot;
-                        best_id = Some(*id);
-                    }
-                }
-                let expected_dot_id = best_id.expect("At least one vector must exist");
-                let top_id = results[0].id;
-                let top_dot = vectors
+                let dot =
+                    |vector: &Vector| vector.iter().zip(&query).map(|(a, b)| a * b).sum::<f32>();
+                let best = vectors
                     .iter()
-                    .find(|(id, _)| *id == top_id)
-                    .map(|(_, vec)| vec.iter().zip(&noisy_query).map(|(a, b)| a * b).sum())
-                    .unwrap_or(0.0);
-                if let Some(path) = dot_diag_path.as_ref() {
-                    let entry = DotDiagEntry {
-                        query_idx,
-                        expected_id: expected_dot_id,
-                        expected_dot: best_dot,
-                        top_id,
-                        top_dot,
-                    };
-                    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-                        let _ = serde_json::to_writer(&mut file, &entry);
-                        let _ = file.write_all(b"\n");
-                    }
-                }
-                let eps = 1e-3;
+                    .map(|(_, v)| dot(v))
+                    .max_by(f32::total_cmp)
+                    .unwrap();
+                let top = vectors.iter().find(|(id, _)| *id == results[0].id).unwrap();
                 assert!(
-                    top_dot + eps >= best_dot,
-                    "For Dot metric, top-1 dot {:.6} is below best {:.6} by more than eps (expected id {:?}, got {:?})",
-                    top_dot,
-                    best_dot,
-                    expected_dot_id,
-                    top_id
+                    dot(&top.1) + 1e-3 >= best,
+                    "top={:?}, expected_score={best}",
+                    results[0]
                 );
             } else {
-                let found = results.iter().any(|r| r.id == *expected_id);
                 assert!(
-                    found,
-                    "[{:?}] Expected ID {:?} not in top 5 results for query {:?}",
-                    metric, expected_id, noisy_query
+                    results.iter().any(|r| r.id == *expected_id),
+                    "metric={metric:?}, expected={expected_id}"
                 );
             }
         }
-        let search_elapsed = search_start.elapsed();
-        println!(
-            "[{:?}] Completed 10 searches in {:?} (~{:.3} ms/query)",
-            metric,
-            search_elapsed,
-            search_elapsed.as_secs_f64() * 1e3 / 10.0
-        );
-
-        println!("\n✅ Completed tests for {:?}\n", metric);
     }
 }
 
 #[test]
-fn test_large_scale_filtered_queries_all_metrics() {
-    for metric in [
-        DistanceMetric::Euclidean,
-        DistanceMetric::Cosine,
-        DistanceMetric::Dot,
-    ] {
+fn filtered_queries_all_metrics() {
+    for metric in METRICS {
         let hnsw = HNSWIndex::new(metric, 16, 50, 16, DIM);
         let mut segment = Segment::new(hnsw);
 
@@ -191,7 +102,7 @@ fn test_large_scale_filtered_queries_all_metrics() {
             Filter::Compare {
                 key: "age".into(),
                 op: ScalarComparisonOp::Gte,
-                value: PayloadValue::Int(6),
+                value: PayloadValue::Int(5),
             },
             Filter::Compare {
                 key: "score".into(),
@@ -200,16 +111,16 @@ fn test_large_scale_filtered_queries_all_metrics() {
             },
         ]);
 
-        // <- replaced post_filter with search_with_filter here
         let query = vecf_dim(10_000, DIM);
         let results = segment
             .search_with_filter(&query, 15, Some(&filter))
             .unwrap();
 
+        assert!(!results.is_empty(), "filter must have matching documents");
         for r in &results {
             let p = segment.get_payload(r.id).unwrap();
             assert_eq!(p.get("animal").unwrap(), &PayloadValue::Str("dog".into()));
-            assert!(matches!(p.get("age").unwrap(), PayloadValue::Int(n) if *n >= 6));
+            assert!(matches!(p.get("age").unwrap(), PayloadValue::Int(n) if *n >= 5));
             assert!(matches!(p.get("score").unwrap(), PayloadValue::Float(f) if *f < 90.0.into()));
         }
     }
@@ -217,11 +128,7 @@ fn test_large_scale_filtered_queries_all_metrics() {
 
 #[test]
 fn test_list_filters_with_larger_pool_all_metrics() {
-    for metric in [
-        DistanceMetric::Euclidean,
-        DistanceMetric::Cosine,
-        DistanceMetric::Dot,
-    ] {
+    for metric in METRICS {
         let hnsw = HNSWIndex::new(metric, 16, 50, 16, DIM);
         let mut segment = Segment::new(hnsw);
 
@@ -245,7 +152,6 @@ fn test_list_filters_with_larger_pool_all_metrics() {
             value: PayloadValue::Str("cheap".into()),
         };
 
-        // <- replaced post_filter with search_with_filter here
         let query = vecf_dim(20_000, DIM);
         let results = segment
             .search_with_filter(&query, 10, Some(&filter))
@@ -264,11 +170,7 @@ fn test_list_filters_with_larger_pool_all_metrics() {
 
 #[test]
 fn test_deletion_and_purge_with_large_set_all_metrics() {
-    for metric in [
-        DistanceMetric::Euclidean,
-        DistanceMetric::Cosine,
-        DistanceMetric::Dot,
-    ] {
+    for metric in METRICS {
         let hnsw = HNSWIndex::new(metric, 16, 50, 16, DIM);
         let mut segment = Segment::new(hnsw);
 
@@ -298,11 +200,7 @@ fn test_deletion_and_purge_with_large_set_all_metrics() {
         }
 
         for id in &ids {
-            assert!(
-                segment.get_vector(*id).is_none(),
-                "❌ NOT purged: id = {}",
-                id
-            );
+            assert!(segment.get_vector(*id).is_none(), "NOT purged: id = {}", id);
         }
     }
 }

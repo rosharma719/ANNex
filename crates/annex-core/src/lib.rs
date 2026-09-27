@@ -9,7 +9,7 @@
 //! payloads, an inverted index for filter acceleration, and an optional
 //! write-ahead log. A single `Segment` is not internally synchronised for
 //! writes — callers running multi-threaded workloads should wrap it in an
-//! [`std::sync::Arc`]`<`[`parking_lot::RwLock`]`<Segment>>` (a
+//! [`std::sync::Arc`]`<`[`std::sync::RwLock`]`<Segment>>` (a
 //! [`SharedSegment`]) and coordinate through the lock.
 //!
 //! # Quickstart
@@ -45,15 +45,9 @@
 //! # Configuration
 //!
 //! Runtime tuning (search budgets, purge thresholds, telemetry paths, and so
-//! on) is driven by `VECTORDB_*` environment variables read once at startup
+//! on) is driven by `VECTORDB_*` environment variables, often cached on first use
 //! (the prefix predates the ANNex rename and is retained for compatibility).
 //! See `.env.example` in the repository for the full list.
-//!
-//! # Feature status
-//!
-//! Implemented: HNSW index, deletion + purge, payload storage, boolean +
-//! comparison filters, inverted-index acceleration, snapshot persistence,
-//! WAL replay, background snapshotting.
 //!
 //! Everything below the `Segment` layer (the `vector`, `payload_storage`, and
 //! `analysis` modules) is exposed but considered an implementation detail

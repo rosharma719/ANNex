@@ -84,13 +84,15 @@ impl VectorChunk {
     /// its corresponding write has been published.
     #[inline]
     unsafe fn slice(&self, local_idx: usize, dim: usize) -> &[f32] {
-        let start = local_idx * dim;
-        // SAFETY: UnsafeCell<f32> has the same layout as f32. We reinterpret a
-        // slice of UnsafeCell<f32> as &[f32]. The slice is valid until the chunk
-        // is dropped (kept alive by Arc). No writes to these cells happen after
-        // publication (write-once protocol).
-        let ptr = self.data[start].get() as *const f32;
-        std::slice::from_raw_parts(ptr, dim)
+        unsafe {
+            let start = local_idx * dim;
+            // SAFETY: UnsafeCell<f32> has the same layout as f32. We reinterpret a
+            // slice of UnsafeCell<f32> as &[f32]. The slice is valid until the chunk
+            // is dropped (kept alive by Arc). No writes to these cells happen after
+            // publication (write-once protocol).
+            let ptr = self.data[start].get() as *const f32;
+            std::slice::from_raw_parts(ptr, dim)
+        }
     }
 }
 
@@ -202,12 +204,6 @@ impl VectorArena {
         drop(chunks);
         unsafe { std::slice::from_raw_parts(chunk.slice(local_idx, self.dim).as_ptr(), self.dim) }
     }
-
-    /// Iterate all pushed vectors in index order.  Single-threaded only.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &[f32])> {
-        let n = self.len();
-        (0..n).map(move |idx| (idx, self.get_direct(idx)))
-    }
 }
 
 /// Snapshot of [`VectorArena`]'s chunk list at a point in time.
@@ -263,7 +259,7 @@ impl<T: Default> ArrayChunk<T> {
     /// `local_idx` must be < chunk capacity.
     #[inline]
     unsafe fn get(&self, local_idx: usize) -> &T {
-        self.data.get_unchecked(local_idx)
+        unsafe { self.data.get_unchecked(local_idx) }
     }
 }
 

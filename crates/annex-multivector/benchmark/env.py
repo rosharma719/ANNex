@@ -3,6 +3,7 @@
 Existing environment variables always win, so CI and shell-provided secrets are
 never replaced by a checked-out .env file.
 """
+
 from __future__ import annotations
 
 import os

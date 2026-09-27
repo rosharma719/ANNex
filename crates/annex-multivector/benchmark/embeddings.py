@@ -1,4 +1,5 @@
 """Content-addressed caches for fixed and ragged benchmark embeddings."""
+
 from __future__ import annotations
 
 import hashlib
@@ -8,8 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from protocol import file_digest
 
-CACHE_SCHEMA = 2
+CACHE_SCHEMA = 3
 ENCODER_PACKAGES = ("numpy", "pylate", "sentence-transformers", "torch", "transformers")
 
 
@@ -96,7 +98,43 @@ def _info(path, key, identity, hit):
         "model_id": identity["model_id"],
         "model_revision": identity["model_revision"],
         "role": identity["role"],
+        "files_sha256": json.loads((path / "manifest.json").read_text())[
+            "files_sha256"
+        ],
     }
+
+
+def _verified_manifest(path, identity, files):
+    manifest = json.loads((path / "manifest.json").read_text())
+    if manifest["identity"] != identity:
+        raise RuntimeError(f"embedding cache identity mismatch: {path}")
+    expected = manifest.get("files_sha256", {})
+    if set(expected) != set(files) or any(
+        file_digest(path / name) != expected[name] for name in files
+    ):
+        raise RuntimeError(f"embedding cache checksum mismatch: {path}")
+    return manifest
+
+
+def _write_manifest(path, manifest, files):
+    if manifest["identity"]["model_revision"] == "unresolved-main":
+        raise RuntimeError(
+            "cannot persist embeddings with an unresolved model revision"
+        )
+    manifest["files_sha256"] = {name: file_digest(path / name) for name in files}
+    temporary = path / "manifest.json.tmp"
+    temporary.write_text(json.dumps(manifest, indent=2) + "\n")
+    temporary.replace(path / "manifest.json")
+
+
+def ragged_fingerprint(root, model_id, role, ids, texts, encoder_config):
+    """Verify bytes without loading arrays; bind them before freezing settings."""
+    identity = _identity(model_id, role, ids, texts, True, encoder_config)
+    if identity["model_revision"] == "unresolved-main":
+        raise RuntimeError("warm a revision-resolved embedding cache before freezing")
+    path, _ = _location(Path(root), "ragged", identity)
+    manifest = _verified_manifest(path, identity, ["values.npy", "offsets.npy"])
+    return {"identity": identity, "files_sha256": manifest["files_sha256"]}
 
 
 def cached_ragged(
@@ -108,16 +146,28 @@ def cached_ragged(
     path, key = _location(Path(root), "ragged", identity)
     manifest_path = path / "manifest.json"
     if manifest_path.exists() and not refresh:
-        manifest = json.loads(manifest_path.read_text())
-        if manifest["identity"] != identity:
-            raise RuntimeError(f"embedding cache identity mismatch: {path}")
-        values = np.load(path / "values.npy", mmap_mode="r")
-        offsets = np.load(path / "offsets.npy", mmap_mode="r")
+        manifest = _verified_manifest(path, identity, ["values.npy", "offsets.npy"])
+        values = np.load(path / "values.npy", mmap_mode="r", allow_pickle=False)
+        offsets = np.load(path / "offsets.npy", mmap_mode="r", allow_pickle=False)
+        if (
+            values.dtype != np.float32
+            or values.ndim != 2
+            or values.shape[1] != manifest["dimension"]
+            or offsets.dtype != np.int64
+            or offsets.shape != (len(ids) + 1,)
+            or offsets[0] != 0
+            or offsets[-1] != len(values)
+            or np.any(np.diff(offsets) <= 0)
+        ):
+            raise RuntimeError(f"invalid ragged cache shape/offsets: {path}")
         print(f"Embedding cache hit: {path}")
         return RaggedEmbeddings(values, offsets), _info(path, key, identity, True)
 
     encoded = [np.asarray(value, dtype=np.float32) for value in encoder()]
-    if len(encoded) != len(ids) or any(value.ndim != 2 for value in encoded):
+    if len(encoded) != len(ids) or any(
+        value.ndim != 2 or not len(value) or not np.isfinite(value).all()
+        for value in encoded
+    ):
         raise RuntimeError("ragged encoder returned invalid embeddings")
     dimensions = {value.shape[1] for value in encoded}
     if len(dimensions) != 1:
@@ -125,15 +175,20 @@ def cached_ragged(
     offsets = np.zeros(len(encoded) + 1, dtype=np.int64)
     offsets[1:] = np.cumsum([len(value) for value in encoded])
     values = np.concatenate(encoded, axis=0)
+    # A cold encoder may have downloaded the checkpoint while encoding.
+    identity["model_revision"] = _model_revision(model_id)
+    path, key = _location(Path(root), "ragged", identity)
     path.mkdir(parents=True, exist_ok=True)
     np.save(path / "values.npy", values, allow_pickle=False)
     np.save(path / "offsets.npy", offsets, allow_pickle=False)
-    manifest_path.write_text(
-        json.dumps(
-            {"identity": identity, "dimension": next(iter(dimensions)), "vectors": len(values)},
-            indent=2,
-        )
-        + "\n"
+    _write_manifest(
+        path,
+        {
+            "identity": identity,
+            "dimension": next(iter(dimensions)),
+            "vectors": len(values),
+        },
+        ["values.npy", "offsets.npy"],
     )
     print(f"Embedding cache stored: {path}")
     return RaggedEmbeddings(values, offsets), _info(path, key, identity, False)
@@ -144,19 +199,26 @@ def cached_fixed(root, model_id, role, ids, texts, encoder, normalized, refresh=
     path, key = _location(Path(root), "fixed", identity)
     manifest_path = path / "manifest.json"
     if manifest_path.exists() and not refresh:
-        manifest = json.loads(manifest_path.read_text())
-        if manifest["identity"] != identity:
-            raise RuntimeError(f"embedding cache identity mismatch: {path}")
+        manifest = _verified_manifest(path, identity, ["values.npy"])
+        values = np.load(path / "values.npy", mmap_mode="r", allow_pickle=False)
+        if values.dtype != np.float32 or values.shape != (
+            len(ids),
+            manifest["dimension"],
+        ):
+            raise RuntimeError(f"invalid fixed cache shape: {path}")
         print(f"Embedding cache hit: {path}")
-        return np.load(path / "values.npy", mmap_mode="r"), _info(path, key, identity, True)
+        return values, _info(path, key, identity, True)
 
     values = np.asarray(encoder(), dtype=np.float32)
-    if values.ndim != 2 or len(values) != len(ids):
+    if values.ndim != 2 or len(values) != len(ids) or not np.isfinite(values).all():
         raise RuntimeError("fixed encoder returned invalid embeddings")
+    # A cold encoder may have downloaded the checkpoint while encoding.
+    identity["model_revision"] = _model_revision(model_id)
+    path, key = _location(Path(root), "fixed", identity)
     path.mkdir(parents=True, exist_ok=True)
     np.save(path / "values.npy", values, allow_pickle=False)
-    manifest_path.write_text(
-        json.dumps({"identity": identity, "dimension": values.shape[1]}, indent=2) + "\n"
+    _write_manifest(
+        path, {"identity": identity, "dimension": values.shape[1]}, ["values.npy"]
     )
     print(f"Embedding cache stored: {path}")
     return values, _info(path, key, identity, False)

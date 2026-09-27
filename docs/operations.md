@@ -1,6 +1,6 @@
 # Runtime Operations
 
-This document collects the operational material that used to live in the root `README`.
+This contract covers `annex-core::Segment`. The multivector engine has a separate [durability contract](multivector-durability.md).
 
 ## Snapshot notes
 
@@ -15,9 +15,9 @@ This document collects the operational material that used to live in the root `R
 ```rust
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use vectordb::segment::{Segment, SnapshotConfig, start_background_snapshots};
-use vectordb::vector::hnsw::HNSWIndex;
-use vectordb::utils::types::DistanceMetric;
+use annex::segment::{Segment, SnapshotConfig, start_background_snapshots};
+use annex::vector::hnsw::HNSWIndex;
+use annex::utils::types::DistanceMetric;
 
 let segment = Arc::new(RwLock::new(Segment::new(
     HNSWIndex::new(DistanceMetric::Euclidean, 16, 32, 8, 2),
@@ -36,10 +36,10 @@ let snapshotter = start_background_snapshots(segment.clone(), cfg);
 Enable a WAL to make inserts, deletes, and payload updates durable between snapshots. WAL replay is automatic on `Segment::load_from_path` when `<snapshot>.wal` exists.
 
 ```rust
-use vectordb::segment::Segment;
+use annex::segment::Segment;
 
 let mut segment = Segment::new(hnsw);
-segment.enable_wal("data/segment.wal")?;
+segment.enable_wal("data/segment_snapshot.bin.wal")?;
 
 segment.insert_with_id(1, vec![1.0, 0.0], None)?;
 segment.save_to_path("data/segment_snapshot.bin")?;

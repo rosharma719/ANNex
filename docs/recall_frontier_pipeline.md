@@ -1,11 +1,11 @@
 # Recall frontier pipeline
 
-This document captures the “build + query + frontier + knob-effects” pipeline described earlier, so you have an executable version of your preferred workflow.
+Development analysis of NYT search policies. Reporting requirements live in [BENCHMARK_POLICY.md](../BENCHMARK_POLICY.md).
 
 ## 1. Inputs
 
 1. `logs/nyt_query_suite.jsonl` – produced by `scripts/run_query_grid.py`, contains both per-query entries (`type="query"`) and per-run summaries (`type="summary"`).
-   Each row now records the hidden runtime knobs and repo state that materially affect reproducibility:
+   Rows record runtime settings and repository state:
    `search_expansion_mult`, `search_expansion_cap`, `disable_early_exit`,
    `neighbor_rotate`, `neighbor_stride`, `neighbor_scan_patience`,
    `git_commit`, and `git_dirty`.
@@ -39,10 +39,5 @@ python scripts/analyze_nyt_query_suite.py \
 ## 3. Workflow
 
 1. Run `scripts/run_query_grid.py` to produce `logs/nyt_query_suite.jsonl`.
-   The runner now pins the hidden runtime knobs explicitly instead of inheriting them silently from ambient env/defaults.
+   The runner pins runtime settings in each record.
 2. Run `scripts/analyze_nyt_query_suite.py` to emit the frontier tables and knob-effect report.
-
-## 4. Next steps
-
-- You can consume `logs/frontier.csv` in the ML stack you already envisioned; every row is a candidate for your two-stage regressions/GBMs.
-- If you later want automatic frontier modeling + build recommendations, extend this script to produce the `threshold` table per build and feed it into your gradient-boosted trees.

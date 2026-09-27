@@ -228,7 +228,7 @@ fn build_hnm_segment(
     logs: &TestLogConfig,
 ) {
     logs.log_info(&format!(
-        "🚀 Inserting {} vectors with dataset-aligned IDs...",
+        "Inserting {} vectors with dataset-aligned IDs...",
         base.len()
     ));
     let start_insert = Instant::now();
@@ -248,7 +248,7 @@ fn build_hnm_segment(
     let insert_dur = start_insert.elapsed();
     let insert_ms = insert_dur.as_secs_f64() * 1000.0 / base.len().max(1) as f64;
     logs.log_info(&format!(
-        "✅ Inserted {} vectors in {:?} (~{:.3} ms/insert)",
+        "Inserted {} vectors in {:?} (~{:.3} ms/insert)",
         base.len(),
         insert_dur,
         insert_ms
@@ -256,11 +256,11 @@ fn build_hnm_segment(
 }
 
 fn persist_hnm_segment(segment: &Segment, path: &str, logs: &TestLogConfig) {
-    logs.log_info(&format!("💾 Persisting H&M segment to {} ...", path));
+    logs.log_info(&format!("Persisting H&M segment to {} ...", path));
     segment
         .save_to_path(path)
         .expect("failed to persist H&M segment");
-    logs.log_info(&format!("✅ Saved H&M segment to {}", path));
+    logs.log_info(&format!("Saved H&M segment to {}", path));
 }
 
 #[derive(Serialize)]
@@ -389,7 +389,7 @@ fn run_hnm_filtered_cosine_recall(mode: TestMode) {
     let mut segment = if harness.snapshot.use_snapshot {
         if !Path::new(&harness.snapshot.persist_path).exists() {
             if harness.snapshot.allow_build {
-                logs.log_info("💾 Snapshot missing; building a fresh segment...");
+                logs.log_info("Snapshot missing; building a fresh segment...");
                 let dim = base.first().map(|v| v.len()).unwrap_or(0);
                 assert_eq!(dim, 2048, "expected 2048-d vectors");
                 let metric = DistanceMetric::Cosine;
@@ -425,7 +425,7 @@ fn run_hnm_filtered_cosine_recall(mode: TestMode) {
             }
         } else {
             logs.log_info(&format!(
-                "💾 Loading persisted H&M segment from {} ...",
+                "Loading persisted H&M segment from {} ...",
                 harness.snapshot.persist_path
             ));
             Segment::load_from_path(&harness.snapshot.persist_path)
@@ -465,7 +465,7 @@ fn run_hnm_filtered_cosine_recall(mode: TestMode) {
     let collection_len = segment.hnsw().len();
     let mut query_logger = QueryLogWriter::new(logs.query_log_path.clone(), logs.query_log_every);
     logs.log_info(&format!(
-        "🔍 Sweeping ef_search over {:?} for {} queries (top_k={})...",
+        "Sweeping ef_search over {:?} for {} queries (top_k={})...",
         harness.search.ef_values, num_queries, top_k
     ));
 
@@ -665,14 +665,14 @@ fn run_hnm_recall_only() {
         );
     }
     logs.log_info(&format!(
-        "💾 Loading persisted H&M segment from {} ...",
+        "Loading persisted H&M segment from {} ...",
         harness.snapshot.persist_path
     ));
     let (mut segment, metadata) =
         Segment::load_from_path_with_metadata(&harness.snapshot.persist_path)
             .expect("failed to load persisted H&M segment");
     logs.log_info(&format!(
-        "✅ Loaded persisted segment with {} payloads, ef_search={}",
+        "Loaded persisted segment with {} payloads, ef_search={}",
         segment.payloads().len(),
         segment.hnsw().ef()
     ));

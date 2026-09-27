@@ -20,7 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VECTORDB_ADAPTIVE_EF_HIGH` and `VECTORDB_ADAPTIVE_EF_SCORE_THRESHOLD`.
 - `tests/adaptive_search.rs`: recall + latency harness for multi-entry and
   adaptive EF on synthetic data, with `#[ignore]` sweep benchmarks.
-- `tests/kernel_bench.rs`: distance-kernel throughput microbenchmark.
 - `nytimes_adaptive_search_sweep` benchmark: side-by-side recall/latency table
   across plain EF, multi-entry, and adaptive EF configs on 290k NYT-256-Angular.
 
@@ -31,31 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   independent accumulators (16 floats/iteration on NEON, 32 on AVX2), breaking
   the FMA latency chain and saturating the CPU's dual-issue FMA pipeline.
 
-### Benchmark results (NYT-256-Angular, 290k vectors, M=16, ef_construct=300)
+### Maintenance and verification
 
-Measured on Apple Silicon (aarch64 NEON), 1000 queries, top_k=20:
-
-| config | recall@20 | avg ms/query | vs prior |
-| --- | ---: | ---: | ---: |
-| plain ef=32 | 0.855 | 0.418 | −23% latency |
-| plain ef=64 | 0.886 | 0.542 | −27% latency |
-| plain ef=128 | 0.910 | 0.922 | −28% latency |
-| plain ef=256 | 0.934 | 1.604 | −34% latency |
-| ef=64, seeds=3 | 0.887 | 0.493 | — |
-| adaptive 32→128, t=0.55 | 0.878 | 0.479 | 225/1000 retried |
-| adaptive 64→256, t=0.40 | 0.902 | 1.116 | — |
-
-Index build time also improved ~42% due to the kernel being on the hot path
-during parallel graph construction.
-
-Prior baseline (single-accumulator kernels, same hardware and index):
-
-| ef | recall@20 | avg ms/query |
-| --- | ---: | ---: |
-| 32 | 0.855 | 0.541 |
-| 64 | 0.886 | 0.745 |
-| 128 | 0.910 | 1.284 |
-| 256 | 0.934 | 2.422 |
+- Removed generated benchmark output, superseded plans and retired exploratory
+  scripts from the active tree; historical evidence and corrections are linked
+  from `benchmark/RESULTS.md`.
+- Consolidated duplicate performance harnesses and documentation. Persistence
+  tests retain arena-boundary coverage with smaller fixtures; filtered tests
+  require nonempty matches.
+- Multivector HTTP rejects unknown fields, unsupported options and excessive
+  work parameters; added single-document deletion.
+- Head-to-head runs record actual exact/ANN backends, full training/ingestion/index
+  costs and durable per-query outcomes. Failed/interrupted requests remain visible.
+- Embedding caches verify file checksums. Diagnostic corpus slices preserve
+  original relevance denominators and avoid materializing the full source prefix.
+- CI exercises the actual HTTP process alongside the retrieval/transaction oracles.
+- Release the directory lock explicitly on index drop so inherited/duplicated
+  descriptors cannot delay reopening; the existing lock test covers this case.
 
 ## [0.1.0] - 2025-09-14
 

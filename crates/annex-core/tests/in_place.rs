@@ -173,7 +173,7 @@ fn benchmark_segment_ops_large() {
             );
         }
 
-        println!("[{:?}] ✅ done.", metric);
+        println!("[{:?}] done.", metric);
     }
 
     // at the end, fail if any

@@ -1,5 +1,4 @@
 """One authoritative ColBERTv2 encoding configuration for every benchmark."""
-from pylate import models
 
 MODEL_ID = "colbert-ir/colbertv2.0"
 QUERY_LENGTH = 32
@@ -20,6 +19,8 @@ def cache_config(role):
 
 
 def load(model_id=MODEL_ID):
+    from pylate import models
+
     return models.ColBERT(
         model_name_or_path=model_id,
         query_length=QUERY_LENGTH,

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Benchmark exact MiniLM search against the vectordb HNSW implementation."""
+
 import argparse
 import json
 import shutil
@@ -8,13 +9,12 @@ import time
 from pathlib import Path
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
-
 from data import load_slice
 from embeddings import cached_fixed
 from env import load_env
 from provenance import write_report
 from run import http, score, size
+from sentence_transformers import SentenceTransformer
 
 load_env()
 
@@ -31,12 +31,18 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--cache-dir", type=Path, default=Path("benchmark/cache"))
     parser.add_argument("--refresh-cache", action="store_true")
-    parser.add_argument("--output", type=Path, default=Path("benchmark/results/dense-vectordb"))
+    parser.add_argument(
+        "--output", type=Path, default=Path("benchmark/results/dense-vectordb")
+    )
     parser.add_argument("--report-dir", type=Path, default=Path("benchmark/reports"))
     args = parser.parse_args()
 
     docs, queries, qrels = load_slice(
-        args.dataset, args.limit_docs, args.limit_queries, args.sampling, args.sample_seed
+        args.dataset,
+        args.limit_docs,
+        args.limit_queries,
+        args.sampling,
+        args.sample_seed,
     )
     doc_ids = [doc.doc_id for doc in docs]
     doc_texts = [(getattr(doc, "title", "") + " " + doc.text).strip() for doc in docs]
@@ -49,25 +55,49 @@ def main():
         if model is None:
             model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
         return model.encode(
-            texts, batch_size=args.batch_size, normalize_embeddings=True, show_progress_bar=True
+            texts,
+            batch_size=args.batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=True,
         )
 
     documents, document_cache = cached_fixed(
-        args.cache_dir, "sentence-transformers/all-MiniLM-L6-v2", "document",
-        doc_ids, doc_texts, lambda: encode(doc_texts), True, args.refresh_cache,
+        args.cache_dir,
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "document",
+        doc_ids,
+        doc_texts,
+        lambda: encode(doc_texts),
+        True,
+        args.refresh_cache,
     )
     query_vectors, query_cache = cached_fixed(
-        args.cache_dir, "sentence-transformers/all-MiniLM-L6-v2", "query",
-        query_ids, query_texts, lambda: encode(query_texts), True, args.refresh_cache,
+        args.cache_dir,
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "query",
+        query_ids,
+        query_texts,
+        lambda: encode(query_texts),
+        True,
+        args.refresh_cache,
     )
 
     shutil.rmtree(args.output, ignore_errors=True)
     root = Path(__file__).resolve().parents[1]
     server = subprocess.Popen(
         [
-            "cargo", "run", "--release", "--bin", "dense_server", "--",
-            "--dimension", str(documents.shape[1]), "--path", str(args.output),
-            "--listen", "127.0.0.1:18081",
+            "cargo",
+            "run",
+            "--release",
+            "--bin",
+            "dense_server",
+            "--",
+            "--dimension",
+            str(documents.shape[1]),
+            "--path",
+            str(args.output),
+            "--listen",
+            "127.0.0.1:18081",
         ],
         cwd=root,
         stdout=subprocess.DEVNULL,
@@ -86,10 +116,12 @@ def main():
             http(
                 base,
                 "/v1/vectors/upsert",
-                {"documents": [
-                    {"id": doc_ids[index], "vector": documents[index].tolist()}
-                    for index in range(start, min(start + 256, len(docs)))
-                ]},
+                {
+                    "documents": [
+                        {"id": doc_ids[index], "vector": documents[index].tolist()}
+                        for index in range(start, min(start + 256, len(docs)))
+                    ]
+                },
             )
         started = time.perf_counter()
         http(base, "/v1/index", {"m": args.m, "ef_construct": args.ef_search})
@@ -100,11 +132,20 @@ def main():
         overlaps = []
         for query, vector in zip(queries, query_vectors):
             results = {}
-            for name, backend in (("exact_minilm", "exact"), ("vectordb_hnsw_minilm", "hnsw")):
+            for name, backend in (
+                ("exact_minilm", "exact"),
+                ("vectordb_hnsw_minilm", "hnsw"),
+            ):
                 started = time.perf_counter()
                 result = http(
-                    base, "/v1/query",
-                    {"vector": vector.tolist(), "top_k": 100, "backend": backend, "ef_search": args.ef_search},
+                    base,
+                    "/v1/query",
+                    {
+                        "vector": vector.tolist(),
+                        "top_k": 100,
+                        "backend": backend,
+                        "ef_search": args.ef_search,
+                    },
                 )
                 latencies[name].append(time.perf_counter() - started)
                 results[name] = [match["id"] for match in result["matches"]]

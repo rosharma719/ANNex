@@ -39,11 +39,11 @@ fn main() -> Result<()> {
     for snapshot in &cfg.snapshots {
         if cfg.skip_existing && existing_snapshots.contains(&snapshot.to_string_lossy().to_string())
         {
-            println!("⏭️  skipping {} (already recorded)", snapshot.display());
+            println!(" skipping {} (already recorded)", snapshot.display());
             continue;
         }
         if !snapshot.exists() {
-            println!("⚠️  skipping {} (file not found)", snapshot.display());
+            println!(" skipping {} (file not found)", snapshot.display());
             continue;
         }
         let analysis = AnalyzerConfig::from_paths(
@@ -56,7 +56,7 @@ fn main() -> Result<()> {
             cfg.neighbor_scan_cap,
         );
         println!(
-            "🔍 analyzing {} (top_k={}, num_queries={}, sample_size={}, neighbor_scan_cap={})",
+            "analyzing {} (top_k={}, num_queries={}, sample_size={}, neighbor_scan_cap={})",
             snapshot.display(),
             cfg.top_k,
             cfg.num_queries,

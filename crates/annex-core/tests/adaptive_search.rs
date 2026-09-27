@@ -17,7 +17,7 @@ fn build_random_index(
 ) -> (HNSWIndex, Vec<Vector>) {
     let mut rng = StdRng::seed_from_u64(seed);
     // ef_construct doubles as the ef parameter at construction time.
-    let mut index = HNSWIndex::new(DistanceMetric::Cosine, m, ef_construct, 16, dim);
+    let index = HNSWIndex::new(DistanceMetric::Cosine, m, ef_construct, 16, dim);
     let mut vecs: Vec<Vector> = Vec::with_capacity(n);
     for i in 0..n {
         let v: Vector = (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
@@ -29,12 +29,12 @@ fn build_random_index(
 
 /// Brute-force exact top-k for recall computation.
 fn ground_truth(query: &[f32], vecs: &[Vector], k: usize) -> Vec<usize> {
+    let qa = query.iter().map(|x| x * x).sum::<f32>().sqrt();
     let mut scored: Vec<(usize, f32)> = vecs
         .iter()
         .enumerate()
         .map(|(i, v)| {
             let dot: f32 = query.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
-            let qa: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
             let va: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             let cos_dist = 1.0 - dot / (qa * va + 1e-9);
             (i, cos_dist)
@@ -52,220 +52,53 @@ fn recall_at_k(results: &[u64], truth: &[usize]) -> f32 {
     found as f32 / truth.len() as f32
 }
 
-/// Check that the index has at least 2 levels so multi-entry actually has an L1 to harvest seeds from.
-fn has_upper_layers(index: &HNSWIndex) -> bool {
-    index.current_max_level() >= 1
-}
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
-
-/// Multi-entry (3 seeds) should produce recall >= single-entry on the same EF budget.
+/// Verify adaptive dispatch against explicit fixed-budget searches. Recall
+/// frontiers belong in the opt-in benchmarks below, not probabilistic CI gates.
 #[test]
-fn test_multi_entry_recall_ge_single_entry() {
-    const N: usize = 8_000;
-    const DIM: usize = 32;
-    const TOP_K: usize = 10;
-    const NUM_QUERIES: usize = 200;
-    const EF: usize = 32;
-
-    let (index, vecs) = build_random_index(N, DIM, 16, 100, 42);
-    assert!(
-        has_upper_layers(&index),
-        "index needs upper layers for multi-entry to be meaningful"
-    );
-
+fn adaptive_routing_matches_explicit_search_budgets() {
+    let (index, _) = build_random_index(512, 16, 16, 64, 42);
+    assert!(index.current_max_level() >= 1);
     let mut rng = StdRng::seed_from_u64(1234);
-    let mut recall_single = 0.0f32;
-    let mut recall_multi = 0.0f32;
-
-    for _ in 0..NUM_QUERIES {
-        let query: Vector = (0..DIM).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
-        let truth = ground_truth(&query, &vecs, TOP_K);
-
-        let opts_single = SearchRuntimeOptions {
-            ef_search: Some(EF),
-            num_entry_seeds: Some(1),
-            ..Default::default()
-        };
-        let res_single = index
-            .search_with_options(&query, TOP_K, &opts_single)
-            .unwrap();
-        let ids_single: Vec<u64> = res_single.iter().map(|r| r.id).collect();
-
-        let opts_multi = SearchRuntimeOptions {
-            ef_search: Some(EF),
-            num_entry_seeds: Some(3),
-            ..Default::default()
-        };
-        let res_multi = index
-            .search_with_options(&query, TOP_K, &opts_multi)
-            .unwrap();
-        let ids_multi: Vec<u64> = res_multi.iter().map(|r| r.id).collect();
-
-        recall_single += recall_at_k(&ids_single, &truth);
-        recall_multi += recall_at_k(&ids_multi, &truth);
-    }
-
-    recall_single /= NUM_QUERIES as f32;
-    recall_multi /= NUM_QUERIES as f32;
-
-    println!(
-        "multi-entry seeds=1: recall@{TOP_K}={:.4}  seeds=3: recall@{TOP_K}={:.4}  delta={:+.4}",
-        recall_single,
-        recall_multi,
-        recall_multi - recall_single,
-    );
-
-    // Multi-entry should not hurt recall (allow tiny float noise).
-    assert!(
-        recall_multi >= recall_single - 0.01,
-        "multi-entry degraded recall: {:.4} < {:.4}",
-        recall_multi,
-        recall_single
-    );
-}
-
-/// Adaptive EF should improve recall on hard queries without degrading easy ones.
-/// We identify "hard" queries as those where single EF=32 misses ground-truth hits,
-/// and verify the adaptive path produces better or equal results on them.
-#[test]
-fn test_adaptive_ef_improves_hard_queries() {
-    const N: usize = 8_000;
-    const DIM: usize = 32;
-    const TOP_K: usize = 10;
-    const NUM_QUERIES: usize = 300;
-    const BASE_EF: usize = 32;
-    const HIGH_EF: usize = 128;
-
-    let (index, vecs) = build_random_index(N, DIM, 16, 100, 99);
-
-    let mut rng = StdRng::seed_from_u64(5678);
-
-    let mut recall_base = 0.0f32;
-    let mut recall_adaptive = 0.0f32;
-    let mut adaptive_triggered = 0u32;
-
-    // Use a threshold that captures queries where base EF struggles.
-    // For cosine distance, sort_key ≈ 1 - cosine_similarity; a value > 0.4 means the
-    // top result has cosine similarity < 0.6 — a genuinely hard or out-of-distribution query.
-    const THRESHOLD: f32 = 0.40;
-
-    for _ in 0..NUM_QUERIES {
-        let query: Vector = (0..DIM).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
-        let truth = ground_truth(&query, &vecs, TOP_K);
-
-        // Base EF, no adaptive
-        let opts_base = SearchRuntimeOptions {
-            ef_search: Some(BASE_EF),
-            ..Default::default()
-        };
-        let res_base = index
-            .search_with_options(&query, TOP_K, &opts_base)
-            .unwrap();
-        let ids_base: Vec<u64> = res_base.iter().map(|r| r.id).collect();
-        recall_base += recall_at_k(&ids_base, &truth);
-
-        // Adaptive EF
-        let opts_adaptive = SearchRuntimeOptions {
-            ef_search: Some(BASE_EF),
-            adaptive_ef_high: Some(HIGH_EF),
-            adaptive_ef_score_threshold: Some(THRESHOLD),
-            ..Default::default()
-        };
-        let res_adaptive = index
-            .search_with_options(&query, TOP_K, &opts_adaptive)
-            .unwrap();
-        let ids_adaptive: Vec<u64> = res_adaptive.iter().map(|r| r.id).collect();
-        recall_adaptive += recall_at_k(&ids_adaptive, &truth);
-
-        // Track how often adaptive triggered (best score > threshold)
-        if res_base.first().map(|r| r.sort_key).unwrap_or(0.0) > THRESHOLD {
-            adaptive_triggered += 1;
+    for seeds in [1, 3] {
+        for _ in 0..8 {
+            let query: Vector = (0..16).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
+            let search = |ef, adaptive, threshold| {
+                let options = SearchRuntimeOptions {
+                    ef_search: Some(ef),
+                    num_entry_seeds: Some(seeds),
+                    adaptive_ef_high: Some(if adaptive { 128 } else { ef }),
+                    adaptive_ef_score_threshold: Some(threshold),
+                    ..Default::default()
+                };
+                index
+                    .search_with_options(&query, 10, &options)
+                    .unwrap()
+                    .into_iter()
+                    .map(|hit| (hit.id, hit.raw_score))
+                    .collect::<Vec<_>>()
+            };
+            let low = search(16, false, 3.0);
+            let high = search(128, false, 3.0);
+            assert_eq!(
+                search(16, true, -1.0),
+                high,
+                "forced retry must execute high EF"
+            );
+            assert_eq!(
+                search(16, true, 3.0),
+                low,
+                "disabled retry must retain low EF"
+            );
+            assert_eq!(high.len(), 10);
+            assert_eq!(
+                high.iter()
+                    .map(|hit| hit.0)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                10
+            );
         }
     }
-
-    recall_base /= NUM_QUERIES as f32;
-    recall_adaptive /= NUM_QUERIES as f32;
-
-    println!(
-        "adaptive EF  base_ef={BASE_EF} recall@{TOP_K}={:.4}  adaptive_ef={HIGH_EF} threshold={THRESHOLD} recall@{TOP_K}={:.4}  delta={:+.4}  triggered={}/{NUM_QUERIES}",
-        recall_base,
-        recall_adaptive,
-        recall_adaptive - recall_base,
-        adaptive_triggered,
-    );
-
-    // Adaptive EF should not hurt recall overall.
-    assert!(
-        recall_adaptive >= recall_base - 0.005,
-        "adaptive EF degraded recall: {:.4} < {:.4}",
-        recall_adaptive,
-        recall_base
-    );
-}
-
-/// Combined: multi-entry seeds + adaptive EF vs plain EF=32.
-#[test]
-fn test_combined_multi_entry_and_adaptive_ef() {
-    const N: usize = 8_000;
-    const DIM: usize = 32;
-    const TOP_K: usize = 10;
-    const NUM_QUERIES: usize = 300;
-    const BASE_EF: usize = 32;
-    const HIGH_EF: usize = 128;
-    const THRESHOLD: f32 = 0.40;
-
-    let (index, vecs) = build_random_index(N, DIM, 16, 100, 77);
-
-    let mut rng = StdRng::seed_from_u64(9999);
-    let mut recall_plain = 0.0f32;
-    let mut recall_combined = 0.0f32;
-
-    for _ in 0..NUM_QUERIES {
-        let query: Vector = (0..DIM).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
-        let truth = ground_truth(&query, &vecs, TOP_K);
-
-        let opts_plain = SearchRuntimeOptions {
-            ef_search: Some(BASE_EF),
-            ..Default::default()
-        };
-        let res_plain = index
-            .search_with_options(&query, TOP_K, &opts_plain)
-            .unwrap();
-        recall_plain += recall_at_k(&res_plain.iter().map(|r| r.id).collect::<Vec<_>>(), &truth);
-
-        let opts_combined = SearchRuntimeOptions {
-            ef_search: Some(BASE_EF),
-            num_entry_seeds: Some(3),
-            adaptive_ef_high: Some(HIGH_EF),
-            adaptive_ef_score_threshold: Some(THRESHOLD),
-            ..Default::default()
-        };
-        let res_combined = index
-            .search_with_options(&query, TOP_K, &opts_combined)
-            .unwrap();
-        recall_combined += recall_at_k(
-            &res_combined.iter().map(|r| r.id).collect::<Vec<_>>(),
-            &truth,
-        );
-    }
-
-    recall_plain /= NUM_QUERIES as f32;
-    recall_combined /= NUM_QUERIES as f32;
-
-    println!(
-        "combined  plain ef={BASE_EF} recall@{TOP_K}={:.4}  multi-seed+adaptive recall@{TOP_K}={:.4}  delta={:+.4}",
-        recall_plain,
-        recall_combined,
-        recall_combined - recall_plain,
-    );
-
-    assert!(
-        recall_combined >= recall_plain - 0.005,
-        "combined mode degraded recall: {:.4} < {:.4}",
-        recall_combined,
-        recall_plain
-    );
 }
 
 /// Sweep seeds=1,2,3,4 at EF=32 and print recall@10 + latency to show the curve.

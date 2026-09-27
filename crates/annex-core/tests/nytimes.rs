@@ -77,7 +77,7 @@ fn build_nytimes_segment(segment: &mut Segment, base: &[Vector], logs: &TestLogC
     let outer_chunk = logs.insert_progress_every.max(1000);
 
     logs.log_info(&format!(
-        "🚀 Bulk-loading {} vectors (outer_chunk={})...",
+        "Bulk-loading {} vectors (outer_chunk={})...",
         base.len(),
         outer_chunk,
     ));
@@ -107,7 +107,7 @@ fn build_nytimes_segment(segment: &mut Segment, base: &[Vector], logs: &TestLogC
     let insert_dur = start_insert.elapsed();
     let insert_ms = insert_dur.as_secs_f64() * 1000.0 / base.len().max(1) as f64;
     logs.log_info(&format!(
-        "✅ Inserted {} vectors in {:?} (~{:.3} ms/insert)",
+        "Inserted {} vectors in {:?} (~{:.3} ms/insert)",
         base.len(),
         insert_dur,
         insert_ms
@@ -115,7 +115,7 @@ fn build_nytimes_segment(segment: &mut Segment, base: &[Vector], logs: &TestLogC
 }
 
 fn persist_segment(segment: &Segment, path: &str, logs: &TestLogConfig) {
-    logs.log_info(&format!("💾 Persisting NYTimes segment to {} ...", path));
+    logs.log_info(&format!("Persisting NYTimes segment to {} ...", path));
     let start = Instant::now();
     segment
         .save_to_path(path)
@@ -123,7 +123,7 @@ fn persist_segment(segment: &Segment, path: &str, logs: &TestLogConfig) {
     let elapsed = start.elapsed();
     let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     logs.log_info(&format!(
-        "✅ Saved NYTimes segment to {} (size={} bytes, elapsed={:?})",
+        "Saved NYTimes segment to {} (size={} bytes, elapsed={:?})",
         path, size, elapsed
     ));
 }
@@ -273,7 +273,7 @@ fn run_nytimes_perf_and_recall(mode: TestMode) {
     let mut segment = if harness.snapshot.use_snapshot {
         if !Path::new(&harness.snapshot.persist_path).exists() {
             if harness.snapshot.allow_build {
-                logs.log_info("💾 Snapshot missing; building a fresh segment...");
+                logs.log_info("Snapshot missing; building a fresh segment...");
                 let dim = base.first().map(|v| v.len()).unwrap_or(0);
                 assert_eq!(dim, 256, "expected 256-d vectors");
                 let metric = DistanceMetric::Cosine;
@@ -311,7 +311,7 @@ fn run_nytimes_perf_and_recall(mode: TestMode) {
             }
         } else {
             logs.log_info(&format!(
-                "💾 Loading persisted NYTimes segment from {} ...",
+                "Loading persisted NYTimes segment from {} ...",
                 harness.snapshot.persist_path
             ));
             let (segment, metadata) =
@@ -360,7 +360,7 @@ fn run_nytimes_perf_and_recall(mode: TestMode) {
     let num_queries = queries.len().min(harness.search.queries_cap);
     let mut query_logger = QueryLogWriter::new(logs.query_log_path.clone(), logs.query_log_every);
     logs.log_info(&format!(
-        "🔍 Sweeping ef_search over {:?} for {} queries (top_k={})...",
+        "Sweeping ef_search over {:?} for {} queries (top_k={})...",
         harness.search.ef_values, num_queries, top_k
     ));
 
@@ -538,7 +538,6 @@ fn run_nytimes_recall_only() {
         "⏱️  Queries and truth loaded in {:?}",
         t0.elapsed()
     ));
-    log_peak_rss("nytimes_qps_loaded_queries");
     log_peak_rss("nytimes_loaded_queries");
 
     if !harness.snapshot.use_snapshot {
@@ -551,7 +550,7 @@ fn run_nytimes_recall_only() {
         );
     }
     logs.log_info(&format!(
-        "💾 Loading persisted NYTimes segment from {} ...",
+        "Loading persisted NYTimes segment from {} ...",
         harness.snapshot.persist_path
     ));
     let (mut segment, metadata) =
@@ -559,11 +558,10 @@ fn run_nytimes_recall_only() {
             .expect("failed to load persisted NYTimes segment");
     let cfg = segment.hnsw().config_summary();
     logs.log_info(&format!(
-        "✅ Loaded persisted segment with {} vectors (payloads={})",
+        "Loaded persisted segment with {} vectors (payloads={})",
         segment.hnsw().len(),
         segment.payloads().len()
     ));
-    log_peak_rss("nytimes_qps_loaded_snapshot");
     log_peak_rss("nytimes_loaded_snapshot");
     logs.log_info(&format!(
         "🧭 HNSW config: metric={:?} dim={} m={} m0={} ef={} ef_construct={} level_cap={} level_scale={:.3} max_level={} exact_fallback={} threshold={}",
@@ -589,10 +587,9 @@ fn run_nytimes_recall_only() {
     let num_queries = queries.len().min(harness.search.queries_cap);
     let mut query_logger = QueryLogWriter::new(logs.query_log_path.clone(), logs.query_log_every);
     logs.log_info(&format!(
-        "🔍 Sweeping ef_search over {:?} for {} queries (top_k={})...",
+        "Sweeping ef_search over {:?} for {} queries (top_k={})...",
         harness.search.ef_values, num_queries, top_k
     ));
-    log_peak_rss("nytimes_qps_before_sweep");
     log_peak_rss("nytimes_before_sweep");
 
     let mut summary: Vec<(usize, f64, f64)> = Vec::new();
@@ -779,7 +776,7 @@ fn run_nytimes_qps_latency_curve() {
         );
     }
     logs.log_info(&format!(
-        "💾 Loading persisted NYTimes segment from {} ...",
+        "Loading persisted NYTimes segment from {} ...",
         harness.snapshot.persist_path
     ));
     let (mut segment, metadata) =
@@ -787,7 +784,7 @@ fn run_nytimes_qps_latency_curve() {
             .expect("failed to load persisted NYTimes segment");
     let cfg = segment.hnsw().config_summary();
     logs.log_info(&format!(
-        "✅ Loaded persisted segment with {} vectors (payloads={})",
+        "Loaded persisted segment with {} vectors (payloads={})",
         segment.hnsw().len(),
         segment.payloads().len()
     ));
@@ -815,7 +812,7 @@ fn run_nytimes_qps_latency_curve() {
     let num_queries = queries.len().min(harness.search.queries_cap);
     let mut query_logger = QueryLogWriter::new(logs.query_log_path.clone(), logs.query_log_every);
     logs.log_info(&format!(
-        "🔍 Sweeping ef_search over {:?} for {} queries (top_k={})...",
+        "Sweeping ef_search over {:?} for {} queries (top_k={})...",
         harness.search.ef_values, num_queries, top_k
     ));
 
@@ -930,7 +927,7 @@ fn nytimes_adaptive_search_sweep() {
     // Load or build the segment.
     let segment = if Path::new(&harness.snapshot.persist_path).exists() {
         logs.log_info(&format!(
-            "💾 Loading snapshot from {} ...",
+            "Loading snapshot from {} ...",
             harness.snapshot.persist_path
         ));
         let (seg, _) = Segment::load_from_path_with_metadata(&harness.snapshot.persist_path)

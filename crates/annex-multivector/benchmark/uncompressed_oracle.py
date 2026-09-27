@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Compare cached uncompressed ColBERT with PLAID-compressed MaxSim."""
+
 import argparse
 import json
 import subprocess
@@ -7,7 +8,8 @@ import time
 from pathlib import Path
 
 import numpy as np
-from colbert_config import MODEL_ID, cache_config, load as load_colbert
+from colbert_config import MODEL_ID, cache_config
+from colbert_config import load as load_colbert
 from data import load_slice, slice_fingerprint
 from embeddings import cached_ragged
 from provenance import write_report
@@ -41,7 +43,9 @@ def maxsim_scores(query, documents, indices=None):
 
 
 def ranked_ids(ids, scores, top_k=100):
-    order = sorted(range(len(ids)), key=lambda index: (-float(scores[index]), ids[index]))
+    order = sorted(
+        range(len(ids)), key=lambda index: (-float(scores[index]), ids[index])
+    )
     return [ids[index] for index in order[:top_k]]
 
 
@@ -62,7 +66,9 @@ def main():
     parser.add_argument("--sample-seed", type=int, default=13)
     parser.add_argument("--centroids", type=int, default=256)
     parser.add_argument("--candidates", type=int, default=250)
-    parser.add_argument("--scope", choices=["candidates", "exhaustive", "both"], default="candidates")
+    parser.add_argument(
+        "--scope", choices=["candidates", "exhaustive", "both"], default="candidates"
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--cache-dir", type=Path, default=Path("benchmark/cache"))
     parser.add_argument("--refresh-cache", action="store_true")
@@ -70,7 +76,11 @@ def main():
     args = parser.parse_args()
 
     docs, queries, qrels = load_slice(
-        args.dataset, args.limit_docs, args.limit_queries, args.sampling, args.sample_seed
+        args.dataset,
+        args.limit_docs,
+        args.limit_queries,
+        args.sampling,
+        args.sample_seed,
     )
     manifest_path = args.index.parent / "slice.json"
     if manifest_path.exists():
@@ -91,20 +101,45 @@ def main():
         return colbert_encode(model, texts, is_query, args.batch_size)
 
     document_vectors, document_cache = cached_ragged(
-        args.cache_dir, MODEL_ID, "document", doc_ids, doc_texts,
-        lambda: encode(doc_texts, False), args.refresh_cache, cache_config("document"),
+        args.cache_dir,
+        MODEL_ID,
+        "document",
+        doc_ids,
+        doc_texts,
+        lambda: encode(doc_texts, False),
+        args.refresh_cache,
+        cache_config("document"),
     )
     query_vectors, query_cache = cached_ragged(
-        args.cache_dir, MODEL_ID, "query", query_ids, query_texts,
-        lambda: encode(query_texts, True), args.refresh_cache, cache_config("query"),
+        args.cache_dir,
+        MODEL_ID,
+        "query",
+        query_ids,
+        query_texts,
+        lambda: encode(query_texts, True),
+        args.refresh_cache,
+        cache_config("query"),
     )
     doc_index = {doc_id: index for index, doc_id in enumerate(doc_ids)}
 
     root = Path(__file__).resolve().parents[1]
     command = [
-        "cargo", "run", "--release", "--bin", "multivector", "--", "--dimension", "128", "--centroids",
-        str(args.centroids), "--probes", "8", "--path", str(args.index),
-        "--listen", "127.0.0.1:18080",
+        "cargo",
+        "run",
+        "--release",
+        "--bin",
+        "annex-multivector",
+        "--",
+        "--dimension",
+        "128",
+        "--centroids",
+        str(args.centroids),
+        "--probes",
+        "8",
+        "--path",
+        str(args.index),
+        "--listen",
+        "127.0.0.1:18080",
     ]
     server = subprocess.Popen(command, cwd=root, stdout=subprocess.DEVNULL)
     base = "http://127.0.0.1:18080"
@@ -123,7 +158,8 @@ def main():
         for query, vector in zip(queries, query_vectors):
             vector_json = np.asarray(vector).tolist()
             candidates = http(
-                base, "/v1/debug/candidates",
+                base,
+                "/v1/debug/candidates",
                 {"vectors": vector_json, "count": args.candidates},
             )["candidates"]
             candidate_ids = [candidate["id"] for candidate in candidates]
@@ -131,17 +167,22 @@ def main():
 
             started = time.perf_counter()
             result = http(
-                base, "/v1/query",
+                base,
+                "/v1/query",
                 {"vectors": vector_json, "top_k": 100, "candidates": args.candidates},
             )
             compressed_times.append(time.perf_counter() - started)
-            compressed_run[query.query_id] = [match["id"] for match in result["matches"]]
+            compressed_run[query.query_id] = [
+                match["id"] for match in result["matches"]
+            ]
 
             if args.scope in ("candidates", "both"):
                 started = time.perf_counter()
                 scores = maxsim_scores(vector, document_vectors, indices)
                 candidate_times.append(time.perf_counter() - started)
-                uncompressed_candidate_run[query.query_id] = ranked_ids(candidate_ids, scores)
+                uncompressed_candidate_run[query.query_id] = ranked_ids(
+                    candidate_ids, scores
+                )
 
             if args.scope in ("exhaustive", "both"):
                 started = time.perf_counter()

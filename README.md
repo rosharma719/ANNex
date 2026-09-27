@@ -1,155 +1,55 @@
 # ANNex
 
-[![CI](https://github.com/rosharma719/annex/actions/workflows/ci.yml/badge.svg)](https://github.com/rosharma719/annex/actions/workflows/ci.yml)
-[![Crates.io](https://img.shields.io/crates/v/annex.svg)](https://crates.io/crates/annex)
-[![Docs.rs](https://docs.rs/annex/badge.svg)](https://docs.rs/annex)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![CI](https://github.com/rosharma719/ANNex/actions/workflows/ci.yml/badge.svg)](https://github.com/rosharma719/ANNex/actions/workflows/ci.yml)
 
-**ANNex** — ANN + index — is an in-memory vector search engine in Rust. It
-implements HNSW-based approximate nearest-neighbor search, in-place payload
-filtering, snapshot persistence, and WAL-backed recovery.
+ANNex is a Rust workspace for vector and late-interaction retrieval.
 
-- **MSRV:** Rust 1.85 (2024 edition).
-- **Scope:** Rust library. There is no HTTP/gRPC server or client SDK — callers
-  embed `Segment` inside their own service.
+| Component | Purpose | Documentation |
+| --- | --- | --- |
+| `annex-core` | HNSW, payload filters, sparse retrieval primitives, snapshots and WAL | [Rust API](crates/annex-core/src/lib.rs), [operations](docs/operations.md) |
+| `annex-multivector` | Persistent token-vector retrieval with MUVERA candidates, compressed MaxSim and an HTTP API | [API and quickstart](crates/annex-multivector/README.md), [durability](docs/multivector-durability.md) |
+| `annex-server` | Dense-vector HTTP benchmark adapter | [source](crates/annex-server/src/bin/dense_server.rs) |
 
-## Features
+The core library's payload filters and sparse primitives are not yet exposed by
+the multivector API. Embeddings are supplied by the caller. Deployment limits and
+remaining launch work are tracked in the [implementation plan](docs/launch-verification-plan.md).
 
-- HNSW indexing for approximate nearest-neighbor search
-- Distance metrics: cosine, euclidean, dot
-- Schema-agnostic per-point payloads (ints, floats, strings, bools, homogeneous lists)
-- Equality and comparison filters with boolean composition (`And` / `Or` / `Not`)
-- Inverted index acceleration on scalar payload fields
-- Tombstone deletion with automatic purge/rebuild past a configurable threshold
-- Snapshot persistence, background snapshotting, and WAL replay on load
+## Build and use
 
-## Install
+Use the toolchain in [rust-toolchain.toml](rust-toolchain.toml):
+
+```sh
+cargo build --workspace
+cargo test --workspace
+cargo doc --workspace --no-deps --open
+```
+
+To embed the core library from a local checkout:
 
 ```toml
 [dependencies]
-annex = "0.1"
+annex = { package = "annex-core", path = "/path/to/ANNex/crates/annex-core" }
 ```
 
-## Quickstart
+The tested Rust quickstart lives in the [crate documentation](crates/annex-core/src/lib.rs).
+For the multivector server, follow its [quickstart](crates/annex-multivector/README.md).
 
-```rust
-use std::collections::HashMap;
-use annex::{DistanceMetric, Filter, Payload, PayloadValue, Segment};
+## Development and evaluation
 
-fn main() {
-    // 128-dim cosine index, m=16, ef=64, max level cap 16.
-    let mut seg = Segment::with_config(DistanceMetric::Cosine, 16, 64, 16, 128);
+- [Contribution and test workflow](CONTRIBUTING.md)
+- [Benchmark commands](docs/benchmarks.md) and [reporting policy](BENCHMARK_POLICY.md)
+- [Dataset setup](docs/data-download.md), [test configuration](docs/test-config.md)
+- [Snapshot construction](docs/index-construction.md), [recall analysis](docs/recall_frontier_pipeline.md)
+- [Historical benchmark corrections](crates/annex-multivector/benchmark/RESULTS.md)
 
-    for id in 0..4u64 {
-        let vector = vec![id as f32; 128];
-        let mut payload = Payload(HashMap::new());
-        payload.set(
-            "category",
-            PayloadValue::Str(if id % 2 == 0 { "even".into() } else { "odd".into() }),
-        );
-        seg.insert_with_id(id, vector, Some(payload)).unwrap();
-    }
+Runtime tuning uses the existing `VECTORDB_*` prefix; see [.env.example](.env.example).
+Core diagnostics use the `log` crate. Applications supply their logging backend.
+Benchmark artifacts and local logs are generated outside versioned source.
 
-    let query = vec![0.1_f32; 128];
-    let filter = Filter::Match {
-        key: "category".into(),
-        value: PayloadValue::Str("even".into()),
-    };
+## Contributing and license
 
-    let hits = seg.search_with_filter(&query, 2, Some(&filter)).unwrap();
-    for hit in hits {
-        println!("id={} score={}", hit.id, hit.raw_score);
-    }
-}
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md),
+and [security reporting](SECURITY.md).
 
-## Thread safety
-
-A single `Segment` is not internally synchronised for writes. For
-multi-threaded workloads, wrap it in `Arc<RwLock<Segment>>` (aliased as
-`SharedSegment`) and coordinate access through the lock:
-
-- take a read guard for `search*` calls,
-- take a write guard for `insert*`, `delete`, `update_payload`, and `purge`.
-
-Background snapshotting (see `start_background_snapshots`) takes only read
-locks and is safe to run alongside concurrent readers.
-
-## Filtering model
-
-- Payloads are per-point key/value maps (`Payload`).
-- Missing fields evaluate to false for match/compare checks.
-- Supported scalar types: `Int`, `Float`, `Str`, `Bool`, plus homogeneous lists.
-- Filters compose via `Filter::Match`, `Filter::Compare`, `Filter::And`,
-  `Filter::Or`, and `Filter::Not`.
-- Scalar payload fields can be routed through the inverted index for fast
-  exact-match filtering.
-
-## Configuration
-
-Runtime tuning is driven by `VECTORDB_*` environment variables read once at
-startup (search budgets, purge thresholds, telemetry paths, dataset paths for
-the benchmark harnesses). The prefix predates the ANNex rename and is
-retained for compatibility. See [`.env.example`](.env.example) for the full
-list and [`docs/test-config.md`](docs/test-config.md) for a per-test matrix.
-
-## Project layout
-
-- `src/segment/` — `Segment` lifecycle, persistence, WAL, background snapshotting
-- `src/vector/hnsw/` — HNSW index internals
-- `src/payload_storage/` — payload evaluation and inverted index
-- `src/bin/` — snapshot inspection and analysis utilities
-- `tests/` — correctness, persistence, recall, and dataset-driven harnesses
-- `scripts/` — experiment pipeline
-- `docs/` — operational notes, benchmark workflows, dataset setup
-
-## Docs
-
-- Dataset setup: [docs/data-download.md](docs/data-download.md)
-- Test and env-var matrix: [docs/test-config.md](docs/test-config.md)
-- Snapshot naming and build manifests: [docs/index-construction.md](docs/index-construction.md)
-- Runtime persistence and operations: [docs/operations.md](docs/operations.md)
-- Benchmark commands and recorded results: [docs/benchmarks.md](docs/benchmarks.md)
-- Recall frontier pipeline: [docs/recall_frontier_pipeline.md](docs/recall_frontier_pipeline.md)
-
-## Utilities
-
-```bash
-cargo run --bin snapshot_info -- <path>
-cargo run --bin index_analyzer -- --help
-cargo run --bin snapshot_sweeper -- --help
-cargo run --bin index_stats -- --help
-```
-
-## Logging
-
-Logging uses the `log` crate with targets such as `vector::hnsw`, `segment`,
-`payload`, and `filter`. Wire up any `log` backend (e.g. `env_logger`,
-`tracing-log`) and control verbosity through `RUST_LOG`.
-
-## Roadmap
-
-- `ANNEX_*` env-var prefix alongside `VECTORDB_*`
-- Optional Python bindings
-- Additional distance metrics
-- Multi-segment collection layer
-
-## Contributing
-
-Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). By
-participating you agree to abide by the [Code of Conduct](CODE_OF_CONDUCT.md).
-To report a vulnerability privately, see [SECURITY.md](SECURITY.md).
-
-## License
-
-Licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
-
-Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion in the work by you, as defined in the Apache-2.0
-license, shall be dual-licensed as above, without any additional terms or
-conditions.
+Licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+Contributions are offered under the same dual license.

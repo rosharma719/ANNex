@@ -156,7 +156,7 @@ impl SparseIndex {
     }
 
     /// Sparse dot product scoring. Query and doc are treated as sparse
-    /// vectors; per-doc score is the sum of q[i] * d[i] over shared
+    /// vectors; per-doc score is the sum of `q[i] * d[i]` over shared
     /// indices. Right choice for SPLADE-style learned-sparse embeddings.
     pub fn search_dot(&self, query: &SparseVector, top_k: usize) -> Vec<(PointId, f32)> {
         if top_k == 0 || query.is_empty() {

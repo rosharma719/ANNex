@@ -1,104 +1,71 @@
-# multivector
+# ANNex multivector
 
-A small, production-shaped late-interaction retrieval engine. Documents and
-queries are arrays of token embeddings (for example, ColBERT outputs). Search
-uses the PLAID pipeline:
+Persistent late-interaction retrieval over caller-supplied token embeddings.
+MUVERA fixed-dimensional encodings select candidates; packed residual vectors
+support compressed MaxSim reranking. Text encoding runs outside the database.
 
-1. A k-means codebook assigns every document token to a coarse centroid.
-2. Query-to-centroid interaction probes inverted lists and prunes documents with
-   approximate centroid MaxSim scores.
-3. Packed 2-bit residuals are fetched from object-shaped storage, decompressed,
-   and reranked with the ColBERT MaxSim scoring rule.
+## Quickstart
 
-This keeps the database API familiar while isolating the expensive multi-vector
-work to a small candidate set.
+From the workspace root:
 
-## Run
+```sh
+cargo run --release -p annex-multivector --bin annex-multivector -- \
+  --dimension 2 --centroids 2 --path ./data/multivector --listen 127.0.0.1:8080
 
-```bash
-cargo run --release -- --dimension 2 --centroids 2 --residual-bits 2 \
-  --probes 4 --path ./data --listen 127.0.0.1:8080
-```
-
-Train the coarse codebook once before ingestion using a representative sample
-of document token embeddings (at least as many samples as centroids):
-
-```bash
-curl -X POST localhost:8080/v1/train \
-  -H 'content-type: application/json' \
+curl localhost:8080/v1/train -H 'content-type: application/json' \
   -d '{"vectors":[[1,0],[0,1]],"iterations":20}'
+curl localhost:8080/v1/vectors/upsert -H 'content-type: application/json' \
+  -d '{"documents":[{"id":"doc-1","vectors":[[1,0],[0,1]],"metadata":{"source":"manual"}}]}'
+curl localhost:8080/v1/query -H 'content-type: application/json' \
+  -d '{"vectors":[[1,0]],"top_k":10,"candidates":80,"explain":true}'
 ```
 
-Ingest already-computed token embeddings:
+Train once before ingestion using representative document tokens from the same
+model. Reopening requires the same index configuration.
 
-```bash
-curl -X POST localhost:8080/v1/vectors/upsert \
-  -H 'content-type: application/json' \
-  -d '{"documents":[{"id":"doc-1","vectors":[[1,0],[0,1]],"metadata":{"source":"legal"}}]}'
-```
+## HTTP contract
 
-Query with token embeddings from the same model:
+| Route | Purpose |
+| --- | --- |
+| `GET /healthz` | Process liveness and version |
+| `GET /v1/stats` | Document/token counts, generation and ANN overlay sizes |
+| `POST /v1/train` | `vectors`, optional `iterations` |
+| `POST /v1/vectors/upsert` | Atomic `documents` batch; each has `id`, `vectors`, optional `metadata` |
+| `POST /v1/vectors/delete` | Delete one `id`; returns `deleted: false` when already absent |
+| `POST /v1/fde/index` | Build/rebuild ANN with optional `m`, `ef_construct` |
+| `POST /v1/query` | Token `vectors`, `top_k`, candidate controls below |
+| `POST /v1/debug/candidates` | Candidate IDs/scores; `vectors`, `count`, optional backend |
+| `POST /v1/debug/score` | Score `query` against exactly one of raw `document` or stored `id` |
 
-```bash
-curl -X POST localhost:8080/v1/query \
-  -H 'content-type: application/json' \
-  -d '{"vectors":[[1,0],[0,1]],"top_k":10,"candidates":80}'
-```
+Unknown fields are rejected, including unsupported filters and tenant constraints.
+Metadata is stored and returned; it does not currently constrain retrieval.
+Invalid parameters return 4xx. Storage failures return 5xx; uncertain commits
+require the recovery procedure in the durability contract.
 
-The Rust HTTP service intentionally does not embed text: keeping model serving out of
-the database lets callers use any late-interaction model and makes offline corpus
-and query-log benchmarks reproducible. Candidate generation defaults to
-asymmetric MUVERA fixed-dimensional encodings: document buckets store centroids,
-query buckets store sums, and empty document buckets use the nearest occupied
-SimHash bucket. The centroid path remains available for controlled probe sweeps.
-FDE candidate search uses raw inner products; it does not normalize document FDEs.
+Request bounds are enforced in [main.rs](src/main.rs): token/batch sizes, training
+work parameters, query budgets and ID lengths. ANN construction bounds also apply
+to Rust callers. The HTTP body limit is 256 MiB. These bounds do not provide
+admission control or guarantee latency under overload.
 
-An optional HNSW candidate index can be built over the persisted FDE segment:
+## Candidate selection
 
-```bash
-curl -X POST localhost:8080/v1/fde/index \
-  -H 'content-type: application/json' \
-  -d '{"m":16,"ef_construct":256}'
-```
+- Omitted backend or `auto`: HNSW when available, exact FDE otherwise.
+- `hnsw`: require a built graph; accepts `ef_search`.
+- `muvera`: exact FDE candidate scan. Optional `probes` selects the centroid
+  path; optional `rerank_candidates` enables centroid pruning. These two
+  options are mutually exclusive.
+- Explicit HNSW also accepts `rerank_candidates`, but rejects `probes`.
+  Exact MUVERA rejects `ef_search`; explicit auto rejects pruning/probe knobs.
+- Legacy omitted-backend requests with `probes` or `rerank_candidates` retain
+  their MUVERA/centroid behavior. Debug candidates default to exact FDE.
 
-Queries without a backend (or with `"candidate_backend":"auto"`) use this graph
-when available, with exact FDE fallback before a build and after reopening. Pin
-`"candidate_backend":"hnsw"` with optional `"ef_search"` to require ANN, or
-`"candidate_backend":"muvera"` for the exact FDE candidate oracle. Existing
-omitted-backend requests with `probes` or `rerank_candidates` keep their original
-centroid/exact-FDE behavior. `/v1/debug/candidates` defaults to exact FDE.
+Build ANN using `POST /v1/fde/index` with `{"m":16,"ef_construct":256}`.
+Writes preserve the graph through exact deltas and tombstones. Rebuild folds the
+overlay into a new base. Reopening currently requires rebuilding ANN.
 
-Writes keep the immutable graph usable through an exact delta and tombstones;
-rebuilding folds them into a new base. Stats expose base/delta/tombstone counts.
-`"explain":true` reports the backend actually executed, separately from the
-requested value. Centroid-only queries omit `fde_score` and report null FDE
-diagnostics; FDE pruning preserves the original FDE score.
+`explain: true` reports the requested and executed backend separately. FDE
+candidate scoring uses raw inner products. Centroid-only results omit FDE scores.
+Current MUVERA empty-bucket fill uses a bucket average, not nearest-token fill.
 
-See the [durability and compatibility contract](../../docs/multivector-durability.md)
-for atomic writes, recovery, encoding versions, and current scaling limits.
-FDE SQ8 storage and paper-faithful nearest-token empty-bucket fill remain future
-work; the current fill uses a bucket average.
-
-## Retrieval-quality benchmark
-
-The [free local benchmark](benchmark/README.md) compares this engine with
-ColBERTv2 against both exact MiniLM search and the vectordb HNSW implementation
-on identical BEIR documents, queries, and relevance judgments. It reports
-nDCG@10, Recall@10, retrieval latency, and index size without using paid APIs.
-
-## Versioning and reproducibility
-
-`Cargo.toml` is the single source of truth for the engine's Semantic Version.
-Use the checked-in helper before a release, then update `CHANGELOG.md` and tag
-the resulting commit as `v<version>`:
-
-```bash
-python scripts/version.py --check
-python scripts/version.py --bump patch  # or minor / major
-cargo test
-git tag v$(python scripts/version.py --print)
-```
-
-Every benchmark and score-validation command appends a JSON Lines record to
-`benchmark/reports/v<version>.jsonl` by default. Commit that version ledger with
-the change it measures; each record embeds complete runtime provenance.
+See [durability and compatibility](../../docs/multivector-durability.md),
+[benchmarking](benchmark/README.md) and the [remaining work](../../docs/launch-verification-plan.md).

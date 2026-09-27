@@ -1,55 +1,41 @@
-# Contributing to ANNex
+# Contributing
 
-Thanks for your interest in contributing.
+Use [rust-toolchain.toml](rust-toolchain.toml) and run from the workspace root:
 
-## Development setup
-
-- Install Rust stable (1.85+ — see `rust-version` in `Cargo.toml`).
-- Clone the repo and build: `cargo build`.
-- Run the fast local test suite: `cargo test`.
-
-## Before opening a PR
-
-Please make sure the following pass locally:
-
-```bash
+```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets
-cargo test
-cargo doc --no-deps
+cargo clippy --workspace --all-targets
+cargo test --workspace
+cargo doc --workspace --no-deps
+cargo build -p annex-multivector --bin annex-multivector
+ANNEX_TEST_BINARY=target/debug/annex-multivector \
+  python3 -m unittest discover -s crates/annex-multivector/benchmark -p 'test_*.py'
 ```
 
-The GitHub Actions workflow runs the same checks on every push and PR.
+Python tests require NumPy (no model or dataset downloads).
 
-## Datasets and benchmarks
+[CI](.github/workflows/ci.yml) validates Linux and macOS plus release benchmark
+compilation. The [nightly workflow](.github/workflows/correctness-nightly.yml)
+increases state-machine oracle seeds/steps.
 
-The dataset-driven tests and benchmarks under `tests/nytimes.rs`,
-`tests/hnm.rs`, and `src/bin/nyt_search_bench.rs` require downloaded data and
-are marked `#[ignore]` or gated behind env vars. See
-[`docs/data-download.md`](docs/data-download.md) and
-[`docs/benchmarks.md`](docs/benchmarks.md).
+Keep correctness tests deterministic and assert externally meaningful behavior.
+Retain crash-boundary, scalar-oracle, mutation and concurrency coverage. Put
+performance measurements in benchmark harnesses; avoid duplicate timing-only
+tests or performance assertions on shared CI hardware.
 
-## Style
+Dataset-dependent harnesses are opt-in; see [benchmark commands](docs/benchmarks.md).
+Generated results, caches, profiles and local agent settings are ignored. Publish
+benchmark evidence according to [BENCHMARK_POLICY.md](BENCHMARK_POLICY.md).
 
-- Rustfmt-formatted; no unformatted PRs.
-- Prefer small, focused PRs. Large behaviour changes benefit from an issue
-  first to align on approach.
-- Public API changes require a note in `CHANGELOG.md` under `## [Unreleased]`.
-- Anything under `vector::`, `payload_storage::`, and `analysis::` is treated
-  as an implementation detail (marked `#[doc(hidden)]`) and may change without
-  a major bump. New public surface goes through the crate root (`src/lib.rs`).
+Document each contract once: public API behavior in Rustdoc/the component README,
+persistence in [the durability contract](docs/multivector-durability.md), benchmark
+commands in the benchmark guide. Link those sources from summaries. Comments
+should explain invariants or decisions, not narrate the code.
 
-## Reporting bugs
+Public behavior changes require an entry under `Unreleased` in [CHANGELOG.md](CHANGELOG.md).
+Modules marked `doc(hidden)` are implementation details. Submit a reproducer and
+relevant runtime settings with bug reports. Use [SECURITY.md](SECURITY.md) for
+private vulnerability reports.
 
-Open a GitHub issue with a minimal reproducer, expected vs. actual behaviour,
-and the relevant `VECTORDB_*` env vars if applicable.
-
-## Security
-
-Please do not file security issues in the public tracker. See
-[SECURITY.md](SECURITY.md).
-
-## Licensing
-
-By contributing, you agree that your contributions will be dual-licensed under
-the MIT and Apache-2.0 licenses, as described in the project [README](README.md).
+Contributions are dual-licensed MIT/Apache-2.0 and subject to the
+[Code of Conduct](CODE_OF_CONDUCT.md).

@@ -37,27 +37,19 @@ impl Payload {
         op: ScalarComparisonOp,
         other: &PayloadValue,
     ) -> Result<bool, DBError> {
-        //println!("Evaluating comparison for field: '{}', operation: {:?}, against value: {:?}", field, op, other);
-
         match self.get(field) {
             Some(value) => {
-                //println!("Payload contains key '{}'. Value: {:?}", field, value);
-
                 match (value, other) {
                     // Handle ListStr comparison
                     (PayloadValue::ListStr(l), PayloadValue::ListStr(o)) => {
-                        //println!("Comparing ListStr with ListStr: left = {:?}, right = {:?}", l, o);
                         match op {
                             ScalarComparisonOp::Eq => {
-                                //println!("Performing Eq comparison between lists.");
                                 let result = l == o;
                                 log::debug!(target: "payload", "Result of Eq comparison: {}", result);
                                 Ok(result)
                             }
                             ScalarComparisonOp::Neq => {
-                                //println!("Performing Neq comparison between lists.");
                                 let result = l != o;
-                                //println!("Result of Neq comparison: {}", result);
                                 Ok(result)
                             }
                             _ => {
@@ -66,22 +58,16 @@ impl Payload {
                             }
                         }
                     },(PayloadValue::ListStr(l), PayloadValue::Str(s)) => {
-                        //println!("Comparing ListStr with Str: list = {:?}, string = {:?}", l, s);
                         match op {
                             ScalarComparisonOp::Eq => {
-                                //println!("Checking if list contains the string '{}'", s);
                                 let result = l.contains(s);
-                                //println!("Result of containment check: {}", result);
                                 Ok(result)
                             },
                             ScalarComparisonOp::Neq => {
-                                //println!("Checking if list does NOT contain the string '{}'", s);
                                 let result = !l.contains(s);
-                                //println!("Result of non-containment check: {}", result);
                                 Ok(result)
                             },
                             _ => {
-                                //println!("Invalid operation for ListStr and Str.");
                                 Err(DBError::InvalidPayload("Invalid operation for ListStr and Str".into()))
                             }
                         }
@@ -89,15 +75,12 @@ impl Payload {
                     ,
                     // Handle other types like Int, Float, etc.
                     _ => {
-                        //println!("Performing scalar comparison for field: '{}'", field);
                         let result = value.compare_scalar(op, other);
                         match result {
                             Some(res) => {
-                                //println!("Result of scalar comparison: {}", res);
                                 Ok(res)
                             },
                             None => {
-                                //println!("Type mismatch for field '{}'.", field);
                                 Err(DBError::InvalidPayload(format!("Type mismatch for field: {field}")))
                             }
                         }

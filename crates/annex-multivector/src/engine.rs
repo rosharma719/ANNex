@@ -239,6 +239,16 @@ struct State {
     postings: Vec<HashSet<String>>,
     fde_ann: Option<FdeAnn>,
 }
+struct DirectoryLock(File);
+
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        // Closing one descriptor does not release flock while a fork/dup copy
+        // survives. Release logical ownership explicitly before closing ours.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 pub struct MultiVectorIndex {
     root: PathBuf,
     config: IndexConfig,
@@ -248,7 +258,7 @@ pub struct MultiVectorIndex {
     state: RwLock<State>,
     durability: Durability,
     // One process/handle owns append offsets and manifest publication at a time.
-    _directory_lock: File,
+    _directory_lock: DirectoryLock,
 }
 
 impl MultiVectorIndex {
@@ -296,6 +306,7 @@ impl MultiVectorIndex {
         fs2::FileExt::try_lock_exclusive(&directory_lock).map_err(|e| {
             IndexError::Invalid(format!("index already open or cannot lock directory: {e}"))
         })?;
+        let directory_lock = DirectoryLock(directory_lock);
         let manifest_path = root.join("manifest.json");
         let (
             generation,
@@ -738,7 +749,7 @@ impl MultiVectorIndex {
         self.commit(&mut s, next)?;
         Ok(true)
     }
-    /// PLAID centroid interaction -> inverted-list candidate generation -> residual MaxSim.
+    /// Exact MUVERA candidates followed by compressed MaxSim rescoring.
     pub fn query(
         &self,
         vectors: &[Vector],
@@ -953,9 +964,9 @@ impl MultiVectorIndex {
     }
     /// Build an HNSW index over persisted FDEs. Exact FDE scan remains available as an oracle.
     pub fn build_fde_ann(&self, m: usize, ef_construct: usize) -> Result<usize, IndexError> {
-        if m == 0 || ef_construct == 0 {
+        if !(1..=128).contains(&m) || !(1..=65_536).contains(&ef_construct) {
             return Err(IndexError::Invalid(
-                "HNSW m and ef_construct must be positive".into(),
+                "HNSW m must be in 1..=128 and ef_construct in 1..=65536".into(),
             ));
         }
         let s = self.state.read().unwrap();

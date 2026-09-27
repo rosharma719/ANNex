@@ -14,19 +14,41 @@ class ProtocolTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "point.json"
-        self.docs = [NS(doc_id="a", text="alpha", title=""), NS(doc_id="b", text="beta")]
+        self.docs = [
+            NS(doc_id="a", text="alpha", title=""),
+            NS(doc_id="b", text="beta"),
+        ]
         self.queries = [NS(query_id=str(i), text=f"q{i}") for i in range(10)]
         self.qrels = {q.query_id: {"a": 1, "b": 2} for q in self.queries}
         self.settings = {"candidate_count": 500, "ef_search": 256, "fde": [20, 4, 8]}
 
     def args(self, **kwargs):
-        return NS(**({"partition": "dev", "split_seed": 13, "freeze_config": None,
-                      "frozen_config": None, "dataset": "fixture", "sampling": "qrels",
-                      "sample_seed": 13, "limit_docs": None, "limit_queries": None} | kwargs))
+        return NS(
+            **(
+                {
+                    "partition": "dev",
+                    "split_seed": 13,
+                    "freeze_config": None,
+                    "frozen_config": None,
+                    "dataset": "fixture",
+                    "sampling": "qrels",
+                    "sample_seed": 13,
+                    "limit_docs": None,
+                    "limit_queries": None,
+                }
+                | kwargs
+            )
+        )
 
     def prepare(self, args, settings=None, points=1):
-        return prepare_protocol(args, self.docs, self.queries, self.qrels,
-                                self.settings if settings is None else settings, operating_points=points)
+        return prepare_protocol(
+            args,
+            self.docs,
+            self.queries,
+            self.qrels,
+            self.settings if settings is None else settings,
+            operating_points=points,
+        )
 
     def freeze(self):
         return self.prepare(self.args(freeze_config=self.path))
@@ -43,7 +65,9 @@ class ProtocolTests(unittest.TestCase):
 
     def test_freeze_then_test_matches_and_cannot_overwrite(self):
         dev, _, _ = self.freeze()
-        test, _, report = self.prepare(self.args(partition="test", frozen_config=self.path))
+        test, _, report = self.prepare(
+            self.args(partition="test", frozen_config=self.path)
+        )
         self.assertFalse({q.query_id for q in dev} & {q.query_id for q in test})
         self.assertEqual(report["label"], "held-out frozen-config test")
         with self.assertRaises(FileExistsError):
@@ -74,7 +98,9 @@ class ProtocolTests(unittest.TestCase):
     def test_changed_split_or_tampered_artifact_rejected(self):
         self.freeze()
         with self.assertRaisesRegex(ValueError, "differ"):
-            self.prepare(self.args(partition="test", frozen_config=self.path, split_seed=999))
+            self.prepare(
+                self.args(partition="test", frozen_config=self.path, split_seed=999)
+            )
         artifact = json.loads(self.path.read_text())
         artifact["contract"]["settings"]["ef_search"] = 99
         self.path.write_text(json.dumps(artifact))
@@ -91,7 +117,9 @@ class ProtocolTests(unittest.TestCase):
             self.prepare(self.args())
 
     def test_exploratory_is_never_labelled_test(self):
-        selected, _, report = self.prepare(self.args(partition="exploratory"), points=10)
+        selected, _, report = self.prepare(
+            self.args(partition="exploratory"), points=10
+        )
         self.assertEqual(len(selected), len(self.queries))
         self.assertEqual(report["label"], "development exploration")
         with self.assertRaisesRegex(ValueError, "from dev"):

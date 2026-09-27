@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Precompute benchmark embeddings without building retrieval indexes."""
+
 import argparse
 import json
 from pathlib import Path
 
-from sentence_transformers import SentenceTransformer
-
-from colbert_config import MODEL_ID, cache_config, load as load_colbert
+from colbert_config import MODEL_ID, cache_config
+from colbert_config import load as load_colbert
 from data import load_slice
 from embeddings import cached_fixed, cached_ragged
 from env import load_env
 from run import colbert_encode
+from sentence_transformers import SentenceTransformer
 
 load_env()
 
@@ -28,7 +29,11 @@ def main():
     args = parser.parse_args()
 
     docs, queries, _ = load_slice(
-        args.dataset, args.limit_docs, args.limit_queries, args.sampling, args.sample_seed
+        args.dataset,
+        args.limit_docs,
+        args.limit_queries,
+        args.sampling,
+        args.sample_seed,
     )
     doc_ids = [doc.doc_id for doc in docs]
     doc_texts = [(getattr(doc, "title", "") + " " + doc.text).strip() for doc in docs]
@@ -44,12 +49,24 @@ def main():
         return colbert_encode(colbert, texts, is_query, args.batch_size)
 
     _, colbert_docs = cached_ragged(
-        args.cache_dir, MODEL_ID, "document", doc_ids, doc_texts,
-        lambda: encode_colbert(doc_texts, False), args.refresh_cache, cache_config("document"),
+        args.cache_dir,
+        MODEL_ID,
+        "document",
+        doc_ids,
+        doc_texts,
+        lambda: encode_colbert(doc_texts, False),
+        args.refresh_cache,
+        cache_config("document"),
     )
     _, colbert_queries = cached_ragged(
-        args.cache_dir, MODEL_ID, "query", query_ids, query_texts,
-        lambda: encode_colbert(query_texts, True), args.refresh_cache, cache_config("query"),
+        args.cache_dir,
+        MODEL_ID,
+        "query",
+        query_ids,
+        query_texts,
+        lambda: encode_colbert(query_texts, True),
+        args.refresh_cache,
+        cache_config("query"),
     )
 
     minilm = None
@@ -59,16 +76,31 @@ def main():
         if minilm is None:
             minilm = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
         return minilm.encode(
-            texts, batch_size=args.batch_size, normalize_embeddings=True, show_progress_bar=True
+            texts,
+            batch_size=args.batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=True,
         )
 
     _, minilm_docs = cached_fixed(
-        args.cache_dir, "sentence-transformers/all-MiniLM-L6-v2", "document",
-        doc_ids, doc_texts, lambda: encode_minilm(doc_texts), True, args.refresh_cache,
+        args.cache_dir,
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "document",
+        doc_ids,
+        doc_texts,
+        lambda: encode_minilm(doc_texts),
+        True,
+        args.refresh_cache,
     )
     _, minilm_queries = cached_fixed(
-        args.cache_dir, "sentence-transformers/all-MiniLM-L6-v2", "query",
-        query_ids, query_texts, lambda: encode_minilm(query_texts), True, args.refresh_cache,
+        args.cache_dir,
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "query",
+        query_ids,
+        query_texts,
+        lambda: encode_minilm(query_texts),
+        True,
+        args.refresh_cache,
     )
     print(
         json.dumps(

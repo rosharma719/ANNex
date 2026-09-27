@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Fail-fast audit of the ColBERT checkpoint and PyLate encoding conventions."""
+
 import argparse
 import json
 from pathlib import Path
 
 import numpy as np
 import torch
-from safetensors import safe_open
-from transformers.utils import cached_file
-
+from colbert_config import DOCUMENT_LENGTH
+from colbert_config import load as load_colbert
 from env import load_env
 from provenance import write_report
-from colbert_config import DOCUMENT_LENGTH, load as load_colbert
+from safetensors import safe_open
+from transformers.utils import cached_file
 
 load_env()
 
@@ -30,15 +31,21 @@ def main():
     projection_error = float((checkpoint_projection - loaded_projection).abs().max())
 
     query = model.encode(
-        ["What is compound interest?"], is_query=True, output_value=None,
+        ["What is compound interest?"],
+        is_query=True,
+        output_value=None,
         show_progress_bar=False,
     )
     document = model.encode(
-        ["Compound interest grows over time, with fees."], is_query=False,
-        output_value=None, show_progress_bar=False,
+        ["Compound interest grows over time, with fees."],
+        is_query=False,
+        output_value=None,
+        show_progress_bar=False,
     )
     query_tokens = model.tokenizer.convert_ids_to_tokens(query["input_ids"][0].tolist())
-    document_tokens = model.tokenizer.convert_ids_to_tokens(document["input_ids"][0].tolist())
+    document_tokens = model.tokenizer.convert_ids_to_tokens(
+        document["input_ids"][0].tolist()
+    )
     query_vectors = np.asarray(query["token_embeddings"][0])
     document_vectors = np.asarray(document["token_embeddings"][0])
     document_mask = np.asarray(document["masks"][0])
@@ -47,7 +54,8 @@ def main():
     ]
 
     checks = {
-        "checkpoint_architecture": model[0].auto_model.config.architectures[0] == "HF_ColBERT",
+        "checkpoint_architecture": model[0].auto_model.config.architectures[0]
+        == "HF_ColBERT",
         "projection_shape_128x768": tuple(loaded_projection.shape) == (128, 768),
         "projection_exact_checkpoint_match": torch.equal(
             checkpoint_projection, loaded_projection

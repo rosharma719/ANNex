@@ -1,20 +1,28 @@
 """Deterministic BEIR benchmark slices without synthetic relevance labels."""
+
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 from collections import defaultdict
-
-import ir_datasets
+from itertools import islice
 
 
 def _negative_key(seed: int, doc_id: str) -> bytes:
     return hashlib.blake2b(f"{seed}:{doc_id}".encode(), digest_size=8).digest()
 
 
-def load_slice(dataset_name, limit_docs=None, limit_queries=None, sampling="prefix", seed=13):
+def load_slice(
+    dataset_name, limit_docs=None, limit_queries=None, sampling="prefix", seed=13
+):
+    import ir_datasets
+
     dataset = ir_datasets.load(dataset_name)
-    queries = list(dataset.queries_iter())[:limit_queries]
+    for name, limit in [("limit_docs", limit_docs), ("limit_queries", limit_queries)]:
+        if limit is not None and limit <= 0:
+            raise ValueError(f"{name} must be positive or omitted for the full corpus")
+    queries = list(islice(dataset.queries_iter(), limit_queries))
     query_ids = {query.query_id for query in queries}
     relevant = defaultdict(dict)
     for qrel in dataset.qrels_iter():
@@ -22,35 +30,51 @@ def load_slice(dataset_name, limit_docs=None, limit_queries=None, sampling="pref
             relevant[qrel.query_id][qrel.doc_id] = qrel.relevance
 
     if sampling == "prefix":
-        docs = list(dataset.docs_iter())[:limit_docs]
+        docs = list(islice(dataset.docs_iter(), limit_docs))
     elif sampling == "qrels":
-        required_ids = {doc_id for judgments in relevant.values() for doc_id in judgments}
+        required_ids = {
+            doc_id for judgments in relevant.values() for doc_id in judgments
+        }
         if limit_docs is not None and len(required_ids) > limit_docs:
             raise ValueError(
                 f"{len(required_ids)} judged documents exceed --limit-docs={limit_docs}"
             )
-        all_docs = list(dataset.docs_iter())
         if limit_docs is None:
-            docs = all_docs
+            docs = list(dataset.docs_iter())
         else:
+            required = []
+
+            def negatives():
+                for doc in dataset.docs_iter():
+                    if doc.doc_id in required_ids:
+                        required.append(doc)
+                    else:
+                        yield doc
+
             negative_slots = limit_docs - len(required_ids)
-            negatives = sorted(
-                (doc for doc in all_docs if doc.doc_id not in required_ids),
-                key=lambda doc: _negative_key(seed, doc.doc_id),
-            )[:negative_slots]
-            selected_ids = required_ids | {doc.doc_id for doc in negatives}
-            docs = [doc for doc in all_docs if doc.doc_id in selected_ids]
+            # Keep O(limit_docs) documents, not a full corpus sorted in memory.
+            selected = heapq.nsmallest(
+                negative_slots,
+                negatives(),
+                key=lambda doc: (_negative_key(seed, doc.doc_id), doc.doc_id),
+            )
+            if negative_slots == 0:
+                # nsmallest(0, ...) does not consume the source.
+                required = [
+                    doc for doc in dataset.docs_iter() if doc.doc_id in required_ids
+                ]
+            if {doc.doc_id for doc in required} != required_ids:
+                raise ValueError(
+                    "relevance judgments reference documents absent from the corpus"
+                )
+            docs = sorted(required + selected, key=lambda doc: doc.doc_id)
     else:
         raise ValueError(f"unknown sampling mode: {sampling}")
 
-    doc_ids = {doc.doc_id for doc in docs}
-    qrels = defaultdict(dict)
-    for query_id, judgments in relevant.items():
-        for doc_id, relevance in judgments.items():
-            if doc_id in doc_ids:
-                qrels[query_id][doc_id] = relevance
-    queries = [query for query in queries if query.query_id in qrels]
-    return docs, queries, qrels
+    # Retain original positive judgments, including documents outside a diagnostic
+    # slice. Dropping them would inflate Recall and remove the hardest queries.
+    queries = [query for query in queries if query.query_id in relevant]
+    return docs, queries, dict(relevant)
 
 
 def slice_fingerprint(docs, queries) -> str:
@@ -62,7 +86,23 @@ def slice_fingerprint(docs, queries) -> str:
     return digest.hexdigest()
 
 
-def write_slice_manifest(path, dataset, sampling, seed, docs, queries) -> None:
+def write_slice_manifest(
+    path, dataset, sampling, seed, docs, queries, qrels=None
+) -> None:
+    doc_ids = {doc.doc_id for doc in docs}
+    coverage = (
+        None
+        if qrels is None
+        else {
+            "positive_judgments": sum(len(v) for v in qrels.values()),
+            "out_of_corpus_positive_judgments": sum(
+                d not in doc_ids for v in qrels.values() for d in v
+            ),
+            "queries_without_in_corpus_positive": sum(
+                not doc_ids.intersection(v) for v in qrels.values()
+            ),
+        }
+    )
     path.write_text(
         json.dumps(
             {
@@ -72,6 +112,7 @@ def write_slice_manifest(path, dataset, sampling, seed, docs, queries) -> None:
                 "documents": len(docs),
                 "queries": len(queries),
                 "fingerprint": slice_fingerprint(docs, queries),
+                "relevance_coverage": coverage,
             },
             indent=2,
         )

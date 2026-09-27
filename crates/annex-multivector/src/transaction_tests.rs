@@ -455,6 +455,8 @@ fn exclusive_directory_lock_and_buffered_reopen() {
     assert!(MultiVectorIndex::open(dir.path(), config()).is_err());
     train(&index);
     index.upsert_batch(vec![doc("a", 0)]).unwrap();
+    // Models a descriptor inherited by an unrelated subprocess before exec.
+    let inherited = index._directory_lock.0.try_clone().unwrap();
     drop(index);
     assert_eq!(
         MultiVectorIndex::open(dir.path(), config())
@@ -463,6 +465,7 @@ fn exclusive_directory_lock_and_buffered_reopen() {
             .documents,
         1
     );
+    assert!(inherited.metadata().is_ok());
 }
 
 #[test]
@@ -594,10 +597,16 @@ fn reference_compress(vectors: &[Vector], centers: &[Vector], residuals: &[f32])
                 .collect();
             let center = centers
                 .iter()
-                .max_by(|a, b| {
-                    let score =
-                        |c: &&Vector| v.iter().zip(c.iter()).map(|(x, y)| x * y).sum::<f32>();
-                    score(a).total_cmp(&score(b))
+                // Coarse assignment uses squared L2, including its first-center
+                // tie rule. Dot-product equivalence is not exact in FP32.
+                .min_by(|a, b| {
+                    let distance = |c: &&Vector| {
+                        v.iter()
+                            .zip(c.iter())
+                            .map(|(x, y)| (x - y).powi(2))
+                            .sum::<f32>()
+                    };
+                    distance(a).total_cmp(&distance(b))
                 })
                 .unwrap();
             v.iter()
@@ -724,10 +733,12 @@ fn randomized_mutation_restart_state_machine_matches_scalar_oracle() {
             assert_eq!(ids, model.keys().cloned().collect());
             for hit in &actual {
                 let (vectors, metadata) = &model[&hit.id];
+                let expected = reference_score(&query, vectors);
                 assert!(
-                    (hit.score - reference_score(&query, vectors)).abs() < 1e-5,
-                    "seed={seed} step={step} id={}",
-                    hit.id
+                    (hit.score - expected).abs() < 1e-5,
+                    "seed={seed} step={step} id={} score={} expected={expected}",
+                    hit.id,
+                    hit.score
                 );
                 assert_eq!(&hit.metadata, metadata);
             }

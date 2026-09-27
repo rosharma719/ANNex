@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Measure the exhaustive compressed-MaxSim ceiling and ANN candidate recall."""
+
 import argparse
 import json
 import subprocess
@@ -7,7 +8,8 @@ import time
 from pathlib import Path
 
 import numpy as np
-from colbert_config import MODEL_ID, cache_config, load as load_colbert
+from colbert_config import MODEL_ID, cache_config
+from colbert_config import load as load_colbert
 from data import load_slice, slice_fingerprint
 from embeddings import cached_ragged
 from provenance import write_report
@@ -29,6 +31,7 @@ def main():
     parser.add_argument("--centroids", type=int, default=256)
     parser.add_argument("--candidates", type=int, default=250)
     parser.add_argument("--ef-search", type=int, default=256)
+    parser.add_argument("--hnsw-ef-construct", type=int, default=256)
     parser.add_argument("--hnsw-m", type=int, default=16)
     parser.add_argument("--report-dir", type=Path, default=Path("benchmark/reports"))
     parser.add_argument("--cache-dir", type=Path, default=Path("benchmark/cache"))
@@ -36,7 +39,11 @@ def main():
     args = parser.parse_args()
 
     docs, queries, qrels = load_slice(
-        args.dataset, args.limit_docs, args.limit_queries, args.sampling, args.sample_seed
+        args.dataset,
+        args.limit_docs,
+        args.limit_queries,
+        args.sampling,
+        args.sample_seed,
     )
     manifest_path = args.index.parent / "slice.json"
     if manifest_path.exists():
@@ -54,17 +61,28 @@ def main():
         "query",
         [query.query_id for query in queries],
         query_texts,
-        lambda: colbert_encode(
-            load_colbert(), query_texts, True, 32
-        ),
+        lambda: colbert_encode(load_colbert(), query_texts, True, 32),
         args.refresh_cache,
         cache_config("query"),
     )
     root = Path(__file__).resolve().parents[1]
     command = [
-        "cargo", "run", "--release", "--bin", "multivector", "--", "--dimension", "128",
-        "--centroids", str(args.centroids), "--probes", "8", "--path",
-        str(args.index), "--listen", "127.0.0.1:18080",
+        "cargo",
+        "run",
+        "--release",
+        "--bin",
+        "annex-multivector",
+        "--",
+        "--dimension",
+        "128",
+        "--centroids",
+        str(args.centroids),
+        "--probes",
+        "8",
+        "--path",
+        str(args.index),
+        "--listen",
+        "127.0.0.1:18080",
     ]
     server = subprocess.Popen(command, cwd=root, stdout=subprocess.DEVNULL)
     base = "http://127.0.0.1:18080"
@@ -78,7 +96,11 @@ def main():
         else:
             raise RuntimeError("server did not start")
         started = time.perf_counter()
-        http(base, "/v1/fde/index", {"m": args.hnsw_m, "ef_construct": args.ef_search})
+        http(
+            base,
+            "/v1/fde/index",
+            {"m": args.hnsw_m, "ef_construct": args.hnsw_ef_construct},
+        )
         build_seconds = time.perf_counter() - started
 
         runs = {"exhaustive": {}, "exact_fde": {}, "hnsw": {}}
@@ -86,7 +108,11 @@ def main():
         overlaps, exact_relevant, ann_relevant = [], [], []
         for query, vector in zip(queries, vectors):
             vector = np.asarray(vector).tolist()
-            request = {"vectors": vector, "count": args.candidates, "candidate_backend": "muvera"}
+            request = {
+                "vectors": vector,
+                "count": args.candidates,
+                "candidate_backend": "muvera",
+            }
             exact = http(base, "/v1/debug/candidates", request)["candidates"]
             ann = http(
                 base,
@@ -101,15 +127,33 @@ def main():
             ann_relevant.append(len(ann_ids & relevant) / len(relevant))
 
             configurations = {
-                "exhaustive": {"vectors": vector, "top_k": 100, "candidates": stats["documents"], "candidate_backend": "muvera"},
-                "exact_fde": {"vectors": vector, "top_k": 100, "candidates": args.candidates, "candidate_backend": "muvera"},
-                "hnsw": {"vectors": vector, "top_k": 100, "candidates": args.candidates, "candidate_backend": "hnsw", "ef_search": args.ef_search},
+                "exhaustive": {
+                    "vectors": vector,
+                    "top_k": 100,
+                    "candidates": stats["documents"],
+                    "candidate_backend": "muvera",
+                },
+                "exact_fde": {
+                    "vectors": vector,
+                    "top_k": 100,
+                    "candidates": args.candidates,
+                    "candidate_backend": "muvera",
+                },
+                "hnsw": {
+                    "vectors": vector,
+                    "top_k": 100,
+                    "candidates": args.candidates,
+                    "candidate_backend": "hnsw",
+                    "ef_search": args.ef_search,
+                },
             }
             for name, body in configurations.items():
                 started = time.perf_counter()
                 result = http(base, "/v1/query", body)
                 latencies[name].append(time.perf_counter() - started)
-                runs[name][query.query_id] = [match["id"] for match in result["matches"]]
+                runs[name][query.query_id] = [
+                    match["id"] for match in result["matches"]
+                ]
     finally:
         server.terminate()
         server.wait(timeout=30)

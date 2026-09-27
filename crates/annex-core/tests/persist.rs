@@ -103,7 +103,7 @@ fn segment_build_and_persist_synthetic_snapshot() -> Result<(), DBError> {
 
 #[test]
 fn hnsw_round_trip_preserves_results() -> Result<(), DBError> {
-    let mut hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 32, 8, 3);
+    let hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 32, 8, 3);
     for i in 0..50u64 {
         hnsw.insert(i, vecf(&[i as f32, (i * 2) as f32, 1.0]))?;
     }
@@ -171,10 +171,10 @@ fn segment_round_trip_preserves_payload_filtered_results() -> Result<(), DBError
 }
 
 #[test]
-fn segment_round_trip_large_dataset() -> Result<(), DBError> {
-    // Build a 20k-point deterministic dataset with even/odd payloads.
+fn segment_round_trip_across_arena_boundary() -> Result<(), DBError> {
+    // Cross the 4096-slot arena boundary with payloads.
     let dim = 4;
-    let size = 20_000u64;
+    let size = 4_097u64;
     let mut seg = Segment::new(HNSWIndex::new(DistanceMetric::Euclidean, 16, 64, 16, dim));
     seg.hnsw_mut().set_ef_construct(100);
     seg.hnsw_mut().set_ef_search(128);
@@ -231,8 +231,8 @@ fn segment_round_trip_large_dataset() -> Result<(), DBError> {
 #[test]
 fn segment_persist_append_and_reload() -> Result<(), DBError> {
     let dim = 4;
-    let initial = 10_000u64;
-    let extra = 2_000u64;
+    let initial = 4_095u64;
+    let extra = 4u64;
 
     let mut seg = Segment::new(HNSWIndex::new(DistanceMetric::Euclidean, 16, 64, 16, dim));
     seg.hnsw_mut().set_ef_construct(80);
@@ -266,7 +266,7 @@ fn segment_persist_append_and_reload() -> Result<(), DBError> {
     assert_eq!(seg.hnsw().len(), (initial + extra) as usize);
 
     let sample_old = 1234u64;
-    let sample_new = initial + 42;
+    let sample_new = initial + extra - 1;
     let query_old = vec![
         sample_old as f32,
         (sample_old % 10) as f32,
@@ -292,7 +292,7 @@ fn segment_persist_append_and_reload() -> Result<(), DBError> {
 
 #[test]
 fn hnsw_snapshot_checksum_detects_corruption() -> Result<(), DBError> {
-    let mut hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 32, 8, 3);
+    let hnsw = HNSWIndex::new(DistanceMetric::Euclidean, 16, 32, 8, 3);
     for i in 0..10u64 {
         hnsw.insert(i, vecf(&[i as f32, (i * 2) as f32, 1.0]))?;
     }
@@ -887,7 +887,7 @@ fn wal_with_deletes_and_purge_replay() -> Result<(), DBError> {
 
 #[test]
 fn deletion_count_survives_duplicate_deletes_and_snapshot_restore() -> Result<(), DBError> {
-    let mut index = HNSWIndex::new(DistanceMetric::Euclidean, 4, 16, 4, 2);
+    let index = HNSWIndex::new(DistanceMetric::Euclidean, 4, 16, 4, 2);
     for i in 0..10 {
         index.insert(i, vec![i as f32, 1.0])?;
     }
@@ -896,7 +896,7 @@ fn deletion_count_survives_duplicate_deletes_and_snapshot_restore() -> Result<()
     index.mark_deleted(3);
     index.mark_deleted(99);
     assert_eq!(index.deleted_count(), 1);
-    let mut restored = HNSWIndex::from_snapshot(index.to_snapshot());
+    let restored = HNSWIndex::from_snapshot(index.to_snapshot());
     assert_eq!(restored.deleted_count(), 1);
     assert_eq!(restored.deleted_fraction(), 0.1);
     restored.insert(10, vec![10.0, 1.0])?;

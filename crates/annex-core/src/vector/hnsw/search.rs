@@ -659,9 +659,6 @@ impl HNSWIndex {
                                             }
                                             if let Some(rp) = scratch.result_set.peek() {
                                                 worst_score = rp.0.sort_key;
-                                                sq8_thresh =
-                                                    ((1.0 - worst_score) * 127.5 * 127.5 * 0.85)
-                                                        as i32;
                                             }
                                         }
                                     }

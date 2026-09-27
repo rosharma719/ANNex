@@ -3,22 +3,18 @@
 use std::convert::TryInto;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::time::Instant;
 
 use serde::Serialize;
 use serde_json;
 
-use annex::payload_storage::filters::Filter;
-use annex::segment::segment::Segment;
 use annex::utils::env::{
     env_bool_first as shared_env_bool_first, env_string,
     env_string_first as shared_env_string_first, env_usize_first as shared_env_usize_first,
     env_usize_list_first as shared_env_usize_list_first,
 };
-use annex::utils::payload::{Payload, PayloadValue, ScalarComparisonOp};
+use annex::utils::payload::{Payload, PayloadValue};
 use annex::utils::telemetry::{HarnessTelemetryConfig, HumanLogLevel};
-use annex::utils::types::{DistanceMetric, Vector};
-use annex::vector::hnsw::HNSWIndex;
+use annex::utils::types::Vector;
 
 /// Return the first present env var (by key) parsed as usize.
 pub fn env_usize_first(keys: &[&str]) -> Option<usize> {
@@ -65,7 +61,7 @@ pub fn peak_rss_bytes() -> Option<u64> {
 pub fn log_peak_rss(label: &str) {
     if let Some(bytes) = peak_rss_bytes() {
         let mb = bytes as f64 / (1024.0 * 1024.0);
-        println!("🧠 peak_rss {} = {:.2} MiB", label, mb);
+        eprintln!("peak_rss label={label} mib={mb:.2}");
     }
 }
 
@@ -475,82 +471,4 @@ pub fn generate_payload(i: usize) -> Payload {
     );
     payload.set("active", PayloadValue::Bool(i % 3 == 0));
     payload
-}
-
-// === Insertion Benchmark ===
-pub fn bench_insertion(metric: DistanceMetric, size: usize) -> Segment {
-    println!("\n🛠️ Inserting {} points with {:?} metric", size, metric);
-    let hnsw = HNSWIndex::new(metric, 16, 64, 16, 3);
-    let mut segment = Segment::new(hnsw);
-    segment.hnsw_mut().set_ef_construct(100);
-
-    let start = Instant::now();
-    for i in 0..size {
-        let vec = generate_vector(i);
-        let payload = generate_payload(i);
-        segment.insert(vec, Some(payload)).unwrap();
-    }
-    println!("✅ Insertion took {:?}", start.elapsed());
-    segment
-}
-
-// === Deletion Benchmark ===
-pub fn bench_deletion(segment: &mut Segment, size: usize) {
-    println!("\n❌ Deleting every 7th point...");
-    let start = Instant::now();
-    for i in (0..size).step_by(7) {
-        let _ = segment.delete((i + 1) as u64); // IDs start at 1
-    }
-    println!("Sparse deletion took {:?}", start.elapsed());
-
-    println!("🧹 Full deletion...");
-    let start = Instant::now();
-    for i in 0..size {
-        let _ = segment.delete((i + 1) as u64);
-    }
-    println!("Full deletion (purge) took {:?}", start.elapsed());
-}
-
-pub fn bench_search(segment: &Segment, query: &Vector) {
-    println!("\n🔍 Basic search...");
-    let start = Instant::now();
-    let _ = segment.search(query, 10).unwrap();
-    println!("Basic search took {:?}", start.elapsed());
-
-    let filter = Filter::And(vec![
-        Filter::Match {
-            key: "animal".into(),
-            value: PayloadValue::Str("dog".into()),
-        },
-        Filter::Compare {
-            key: "age".into(),
-            op: ScalarComparisonOp::Gte,
-            value: PayloadValue::Int(6),
-        },
-        Filter::Compare {
-            key: "score".into(),
-            op: ScalarComparisonOp::Lt,
-            value: PayloadValue::Float(90.0.into()),
-        },
-    ]);
-
-    println!("🧃 Filtered search...");
-    let start = Instant::now();
-    let _ = segment
-        .search_with_filter(query, 10, Some(&filter))
-        .unwrap();
-    println!("Filtered search took {:?}", start.elapsed());
-
-    let tag_filter = Filter::Compare {
-        key: "tags".into(),
-        op: ScalarComparisonOp::Eq,
-        value: PayloadValue::Str("cheap".into()),
-    };
-
-    println!("📦 List match search...");
-    let start = Instant::now();
-    let _ = segment
-        .search_with_filter(query, 10, Some(&tag_filter))
-        .unwrap();
-    println!("List filter took {:?}", start.elapsed());
 }

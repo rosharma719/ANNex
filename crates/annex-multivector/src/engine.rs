@@ -1,3 +1,5 @@
+#[path = "retrieval.rs"]
+mod retrieval;
 use crate::{
     fde::{Vector, dot, maxsim_flat, normalize},
     muvera::FdeEncoder,
@@ -11,19 +13,25 @@ use annex::{
     vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
 };
 use rayon::prelude::*;
+pub use retrieval::{
+    AdaptiveRerank, Channel, Chunk, ContextHit, ContextOptions, Fusion, Predicate, Representation,
+    Rerank, RetrievalDocument, RetrievalResponse, RetrievalTrace, RetrieveRequest,
+};
+use retrieval::{FieldSchema, Fields, RetrievalState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
-    sync::RwLock,
+    sync::{Mutex, RwLock},
 };
 use thiserror::Error;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct IndexConfig {
     pub dimension: usize,
     #[serde(default = "default_centroids")]
@@ -80,6 +88,10 @@ struct DocumentRecord {
     metadata: Value,
     tokens: usize,
     compressed_bytes: u64,
+    #[serde(default)]
+    fields: Arc<Fields>,
+    #[serde(default)]
+    storage_id: u64,
 }
 /// Persisted manifest header. `format_version` lets us evolve the on-disk
 /// layout later without silently accepting mismatched files. `generation`
@@ -87,7 +99,7 @@ struct DocumentRecord {
 /// FDE in particular) prove it was built against the current document set.
 ///
 /// Format changes: bump FORMAT_VERSION and add a From<oldManifest> path.
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 /// Fsync is the default: acknowledge only after segment data, the manifest,
 /// and its directory entry are synced. Buffered retains atomic visibility,
@@ -126,8 +138,16 @@ struct Manifest {
     codebook: Vec<Vector>,
     residual_codebook: Vec<f32>,
     documents: HashMap<String, DocumentRecord>,
+    /// Immutable kind/dimension contract for every named representation ever
+    /// committed in this collection. It outlives the last document using a field.
+    #[serde(default)]
+    representation_schema: BTreeMap<String, FieldSchema>,
     #[serde(default)]
     segments: Option<SegmentBoundaries>,
+    #[serde(default)]
+    storage_generation: Option<u64>,
+    #[serde(default)]
+    sealed: Vec<(u64, SegmentBoundaries)>,
 }
 
 fn legacy_fde_encoding_version() -> u32 {
@@ -194,6 +214,8 @@ pub struct IndexStats {
     pub fde_ann_delta_documents: usize,
     pub fde_ann_tombstones: usize,
     pub fde_encoding_version: u32,
+    pub storage_segments: usize,
+    pub dense_ann_fields: HashMap<String, usize>,
 }
 #[derive(Debug, Error)]
 pub enum IndexError {
@@ -218,6 +240,7 @@ struct FdeAnnBase {
     index: HNSWIndex,
     ids: Vec<String>,
     by_id: HashMap<String, u64>,
+    field: Option<String>,
 }
 
 #[derive(Clone)]
@@ -238,7 +261,109 @@ struct State {
     documents: HashMap<String, DocumentRecord>,
     postings: Vec<HashSet<String>>,
     fde_ann: Option<FdeAnn>,
+    named_ann: HashMap<String, FdeAnn>,
+    stores: Arc<SegmentStores>,
+    retrieval: Arc<RetrievalState>,
+    objects_map: Option<Arc<memmap2::Mmap>>,
+    fde_map: Option<Arc<memmap2::Mmap>>,
+    sealed: HashMap<u64, Arc<SegmentSnapshot>>,
 }
+struct SegmentSnapshot {
+    stores: Arc<SegmentStores>,
+    objects: Option<Arc<memmap2::Mmap>>,
+    fde: Option<Arc<memmap2::Mmap>>,
+    bounds: SegmentBoundaries,
+}
+impl SegmentSnapshot {
+    fn open(root: &Path, id: u64, bounds: SegmentBoundaries) -> Result<Self, IndexError> {
+        let path = if id == 0 {
+            root.to_owned()
+        } else {
+            root.join("segments").join(id.to_string())
+        };
+        if !path.is_dir() {
+            return Err(IndexError::Invalid("missing sealed segment".into()));
+        }
+        let stores = Arc::new(SegmentStores {
+            objects: CompressedVectorStore::new(path.join("objects"))?,
+            fde: FixedVectorStore::new(path.join("fde"))?,
+            root: path,
+            id: if id == 0 { None } else { Some(id) },
+            retired: std::sync::atomic::AtomicBool::new(false),
+        });
+        if stores.objects.len()? < bounds.objects || stores.fde.len()? < bounds.fde {
+            return Err(IndexError::Invalid(
+                "sealed segment shorter than committed boundary".into(),
+            ));
+        }
+        Ok(Self {
+            objects: if bounds.objects > 0 {
+                Some(Arc::new(stores.objects.map()?))
+            } else {
+                None
+            },
+            fde: if bounds.fde > 0 {
+                Some(Arc::new(stores.fde.map()?))
+            } else {
+                None
+            },
+            stores,
+            bounds,
+        })
+    }
+}
+impl State {
+    fn record_fde(&self, record: &DocumentRecord) -> &[u8] {
+        if record.storage_id == self.stores.id.unwrap_or(0) {
+            self.fde_bytes()
+        } else {
+            self.sealed[&record.storage_id]
+                .fde
+                .as_deref()
+                .map(|m| &m[..self.sealed[&record.storage_id].bounds.fde as usize])
+                .unwrap_or(&[])
+        }
+    }
+    fn record_objects(&self, record: &DocumentRecord) -> &[u8] {
+        if record.storage_id == self.stores.id.unwrap_or(0) {
+            self.object_bytes()
+        } else {
+            self.sealed[&record.storage_id]
+                .objects
+                .as_deref()
+                .map(|m| &m[..self.sealed[&record.storage_id].bounds.objects as usize])
+                .unwrap_or(&[])
+        }
+    }
+    fn object_bytes(&self) -> &[u8] {
+        self.objects_map.as_deref().map(|m| &m[..]).unwrap_or(&[])
+    }
+    fn fde_bytes(&self) -> &[u8] {
+        self.fde_map.as_deref().map(|m| &m[..]).unwrap_or(&[])
+    }
+}
+
+struct SegmentStores {
+    objects: CompressedVectorStore,
+    fde: FixedVectorStore,
+    root: PathBuf,
+    id: Option<u64>,
+    retired: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for SegmentStores {
+    fn drop(&mut self) {
+        if self.retired.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.id.is_some() {
+                let _ = fs::remove_dir_all(&self.root);
+            } else {
+                let _ = fs::remove_dir_all(self.root.join("objects"));
+                let _ = fs::remove_dir_all(self.root.join("fde"));
+            }
+        }
+    }
+}
+
 struct DirectoryLock(File);
 
 impl Drop for DirectoryLock {
@@ -252,16 +377,38 @@ impl Drop for DirectoryLock {
 pub struct MultiVectorIndex {
     root: PathBuf,
     config: IndexConfig,
-    objects: CompressedVectorStore,
     fde: FdeEncoder,
-    fde_store: FixedVectorStore,
-    state: RwLock<State>,
+    state: RwLock<Arc<State>>,
+    writer: Mutex<()>,
     durability: Durability,
     // One process/handle owns append offsets and manifest publication at a time.
     _directory_lock: DirectoryLock,
 }
 
 impl MultiVectorIndex {
+    pub(crate) fn initialize(&self) -> Result<(), IndexError> {
+        let _writer = self.writer.lock().unwrap();
+        self.persist(&self.snapshot())
+    }
+    pub fn open_existing(
+        path: impl AsRef<Path>,
+        durability: Durability,
+    ) -> Result<Self, IndexError> {
+        let bytes = fs::read(path.as_ref().join("manifest.json"))?;
+        let value: Value = serde_json::from_slice(&bytes)?;
+        let manifest: Manifest = if value.get("manifest").is_some() {
+            let envelope: ManifestEnvelope = serde_json::from_value(value)?;
+            if blake3::hash(envelope.manifest.as_bytes()).to_hex().as_str()
+                != envelope.checksum_blake3
+            {
+                return Err(IndexError::Invalid("manifest checksum mismatch".into()));
+            }
+            serde_json::from_str(&envelope.manifest)?
+        } else {
+            serde_json::from_slice(&bytes)?
+        };
+        Self::open_with_durability(path, manifest.config, durability)
+    }
     pub fn open(path: impl AsRef<Path>, config: IndexConfig) -> Result<Self, IndexError> {
         Self::open_with_durability(path, config, Durability::Fsync)
     }
@@ -314,14 +461,17 @@ impl MultiVectorIndex {
             codebook,
             residual_codebook,
             mut documents,
+            representation_schema,
             segments,
+            storage_generation,
+            sealed_bounds,
             checksummed,
         ) = if manifest_path.exists() {
             let bytes = fs::read(&manifest_path)?;
             let header: Value = serde_json::from_slice(&bytes)?;
             let (m, checksummed): (Manifest, bool) = if header.get("manifest").is_some() {
                 let envelope: ManifestEnvelope = serde_json::from_slice(&bytes)?;
-                if envelope.format_version != FORMAT_VERSION
+                if !matches!(envelope.format_version, 2 | FORMAT_VERSION)
                     || blake3::hash(envelope.manifest.as_bytes()).to_hex().as_str()
                         != envelope.checksum_blake3
                 {
@@ -334,8 +484,11 @@ impl MultiVectorIndex {
                 verify_manifest_checksum(&bytes, &root.join("manifest.sha256"))?;
                 (serde_json::from_slice(&bytes)?, false)
             };
-            if m.format_version != if checksummed { FORMAT_VERSION } else { 1 }
-                || (checksummed && m.segments.is_none())
+            if !(if checksummed {
+                matches!(m.format_version, 2 | FORMAT_VERSION)
+            } else {
+                m.format_version == 1
+            }) || (checksummed && m.segments.is_none())
             {
                 return Err(IndexError::Invalid(
                     "unsupported manifest version or missing committed boundaries".into(),
@@ -353,7 +506,10 @@ impl MultiVectorIndex {
                 m.codebook,
                 m.residual_codebook,
                 m.documents,
+                m.representation_schema,
                 m.segments,
+                m.storage_generation,
+                m.sealed,
                 checksummed,
             )
         } else {
@@ -364,7 +520,10 @@ impl MultiVectorIndex {
                 vec![],
                 vec![],
                 HashMap::new(),
+                BTreeMap::new(),
                 Some(SegmentBoundaries { objects: 0, fde: 0 }),
+                None,
+                Vec::new(),
                 false,
             )
         };
@@ -377,11 +536,26 @@ impl MultiVectorIndex {
             &config,
             &codebook,
             &residual_codebook,
-            !documents.is_empty(),
+            documents.values().any(|d| d.tokens > 0),
         )?;
-        let objects = CompressedVectorStore::new(root.join("objects"))?;
-        let fde_store = FixedVectorStore::new(root.join("fde"))?;
-        if !manifest_path.exists() && (objects.len()? != 0 || fde_store.len()? != 0) {
+        let store_root = storage_generation
+            .map(|id| root.join("segments").join(id.to_string()))
+            .unwrap_or_else(|| root.clone());
+        if storage_generation.is_some() && !store_root.is_dir() {
+            return Err(IndexError::Invalid(
+                "missing committed segment directory".into(),
+            ));
+        }
+        let objects = CompressedVectorStore::new(store_root.join("objects"))?;
+        let fde_store = FixedVectorStore::new(store_root.join("fde"))?;
+        if !manifest_path.exists()
+            && (objects.len()? != 0
+                || fde_store.len()? != 0
+                || root
+                    .join("segments")
+                    .read_dir()
+                    .is_ok_and(|mut entries| entries.next().is_some()))
+        {
             return Err(IndexError::Invalid(
                 "missing manifest for non-empty segments".into(),
             ));
@@ -395,16 +569,35 @@ impl MultiVectorIndex {
                 "segment shorter than committed boundary".into(),
             ));
         }
+        let mut sealed = HashMap::new();
+        for (id, bounds) in sealed_bounds {
+            if id == storage_generation.unwrap_or(0) || sealed.contains_key(&id) {
+                return Err(IndexError::Invalid("duplicate storage segment".into()));
+            }
+            sealed.insert(id, Arc::new(SegmentSnapshot::open(&root, id, bounds)?));
+        }
         if !documents.is_empty() {
-            let objects_map = objects.map()?;
-            let fde_map = fde_store.map()?;
+            let objects_map = if objects.len()? > 0 {
+                Some(objects.map()?)
+            } else {
+                None
+            };
+            let fde_map = if fde_store.len()? > 0 {
+                Some(fde_store.map()?)
+            } else {
+                None
+            };
             let object_bytes = objects_map
+                .as_deref()
+                .unwrap_or(&[])
                 .get(
                     ..usize::try_from(boundaries.objects)
                         .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?,
                 )
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
             let fde_bytes = fde_map
+                .as_deref()
+                .unwrap_or(&[])
                 .get(
                     ..usize::try_from(boundaries.fde)
                         .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?,
@@ -413,6 +606,36 @@ impl MultiVectorIndex {
             let fde_dimension =
                 (1usize << config.fde_ksim) * config.fde_projected * config.fde_repetitions;
             for d in documents.values_mut() {
+                let (object_bytes, fde_bytes) = if d.storage_id == storage_generation.unwrap_or(0) {
+                    (object_bytes, fde_bytes)
+                } else {
+                    let segment = sealed.get(&d.storage_id).ok_or_else(|| {
+                        IndexError::Invalid("document references missing segment".into())
+                    })?;
+                    (
+                        segment
+                            .objects
+                            .as_deref()
+                            .map(|m| &m[..segment.bounds.objects as usize])
+                            .unwrap_or(&[]),
+                        segment
+                            .fde
+                            .as_deref()
+                            .map(|m| &m[..segment.bounds.fde as usize])
+                            .unwrap_or(&[]),
+                    )
+                };
+                d.fields.verify(fde_bytes)?;
+                if d.tokens == 0 {
+                    if !d.centroid_ids.is_empty()
+                        || !d.unique_centroids.is_empty()
+                        || d.location.length != 0
+                        || d.fde_location.length != 0
+                    {
+                        return Err(IndexError::Invalid("invalid empty multivector".into()));
+                    }
+                    continue;
+                }
                 verify_record(object_bytes, d.location, checksummed)?;
                 verify_record(fde_bytes, d.fde_location, checksummed)?;
                 let decoded = CompressedVectorStore::decode(
@@ -462,14 +685,45 @@ impl MultiVectorIndex {
             }
         }
         // No mappings survive this point: discard only the uncommitted tail.
+        for segment in sealed.values() {
+            segment.stores.objects.recover(segment.bounds.objects)?;
+            segment.stores.fde.recover(segment.bounds.fde)?;
+        }
         objects.recover(boundaries.objects)?;
         fde_store.recover(boundaries.fde)?;
         if durability == Durability::Fsync {
-            File::open(root.join("objects"))?.sync_all()?;
-            File::open(root.join("fde"))?.sync_all()?;
+            File::open(store_root.join("objects"))?.sync_all()?;
+            File::open(store_root.join("fde"))?.sync_all()?;
             File::open(&root)?.sync_all()?;
             for parent in created_parents {
                 File::open(parent)?.sync_all()?;
+            }
+        }
+        if manifest_path.exists() {
+            if let Ok(entries) = fs::read_dir(root.join("segments")) {
+                for entry in entries {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_dir() {
+                        continue;
+                    }
+                    if let Some(id) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        if Some(id) != storage_generation && !sealed.contains_key(&id) {
+                            fs::remove_dir_all(entry.path())?;
+                        }
+                    }
+                }
+            }
+            if storage_generation.is_some() && !sealed.contains_key(&0) {
+                for name in ["objects", "fde"] {
+                    let path = root.join(name);
+                    if path.exists() {
+                        fs::remove_dir_all(path)?;
+                    }
+                }
             }
         }
         let mut postings = vec![HashSet::new(); codebook.len()];
@@ -477,6 +731,16 @@ impl MultiVectorIndex {
             for &c in &d.centroid_ids {
                 postings[c as usize].insert(id.clone());
             }
+        }
+        // New manifests preserve the collection's immutable named-field
+        // contract even when no live document still uses a field. Legacy
+        // manifests default to an empty map and infer it while replaying docs;
+        // the next mutation persists the inferred schema.
+        let mut retrieval = RetrievalState::from_schema(representation_schema)?;
+        let mut ordered: Vec<_> = documents.iter().collect();
+        ordered.sort_by(|a, b| a.0.cmp(b.0));
+        for (id, d) in ordered {
+            retrieval.insert(id, &d.fields)?;
         }
         Ok(Self {
             fde: if fde_encoding_version == 2 {
@@ -497,22 +761,45 @@ impl MultiVectorIndex {
                     fde_encoding_version,
                 )
             },
-            fde_store,
-            objects,
+            writer: Mutex::new(()),
             durability,
             _directory_lock: directory_lock,
-            state: RwLock::new(State {
+            state: RwLock::new(Arc::new(State {
                 generation,
                 codebook,
                 residual_codebook,
                 documents,
                 postings,
                 fde_ann: None,
-            }),
+                named_ann: HashMap::new(),
+                objects_map: if objects.len()? > 0 {
+                    Some(Arc::new(objects.map()?))
+                } else {
+                    None
+                },
+                fde_map: if fde_store.len()? > 0 {
+                    Some(Arc::new(fde_store.map()?))
+                } else {
+                    None
+                },
+                stores: Arc::new(SegmentStores {
+                    objects,
+                    fde: fde_store,
+                    root: store_root,
+                    id: storage_generation,
+                    retired: std::sync::atomic::AtomicBool::new(false),
+                }),
+                retrieval: Arc::new(retrieval),
+                sealed,
+            })),
             root,
             config,
         })
     }
+    fn snapshot(&self) -> Arc<State> {
+        Arc::clone(&self.state.read().unwrap())
+    }
+
     fn validate(&self, v: &[Vector]) -> Result<(), IndexError> {
         if v.is_empty()
             || v.iter()
@@ -528,9 +815,9 @@ impl MultiVectorIndex {
     }
     fn persist(&self, s: &State) -> Result<(), IndexError> {
         if self.durability == Durability::Fsync {
-            self.objects.sync()?;
+            s.stores.objects.sync()?;
             commit_boundary("objects_synced")?;
-            self.fde_store.sync()?;
+            s.stores.fde.sync()?;
             commit_boundary("fde_synced")?;
         }
         let manifest = serde_json::to_string(&Manifest {
@@ -541,9 +828,16 @@ impl MultiVectorIndex {
             codebook: s.codebook.clone(),
             residual_codebook: s.residual_codebook.clone(),
             documents: s.documents.clone(),
+            representation_schema: s.retrieval.schema().clone(),
+            storage_generation: s.stores.id,
+            sealed: s
+                .sealed
+                .iter()
+                .map(|(&id, segment)| (id, segment.bounds))
+                .collect(),
             segments: Some(SegmentBoundaries {
-                objects: self.objects.len()?,
-                fde: self.fde_store.len()?,
+                objects: s.stores.objects.len()?,
+                fde: s.stores.fde.len()?,
             }),
         })?;
         let envelope = ManifestEnvelope {
@@ -566,7 +860,7 @@ impl MultiVectorIndex {
         })
     }
 
-    fn commit(&self, current: &mut State, mut next: State) -> Result<(), IndexError> {
+    fn commit(&self, current: &State, mut next: State) -> Result<(), IndexError> {
         next.generation = current
             .generation
             .checked_add(1)
@@ -576,9 +870,21 @@ impl MultiVectorIndex {
         if let Some(ann) = next.fde_ann.as_mut() {
             ann.generation = next.generation;
         }
+        for ann in next.named_ann.values_mut() {
+            ann.generation = next.generation;
+        }
+        if next.stores.objects.len()? as usize != next.object_bytes().len() {
+            next.objects_map = Some(Arc::new(next.stores.objects.map()?));
+        }
+        if next.stores.fde.len()? as usize != next.fde_bytes().len() {
+            next.fde_map = Some(Arc::new(next.stores.fde.map()?));
+        }
         let result = self.persist(&next);
         if result.is_ok() || matches!(result, Err(IndexError::CommitUncertain(_))) {
-            *current = next;
+            next.stores
+                .retired
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            *self.state.write().unwrap() = Arc::new(next);
         }
         result
     }
@@ -593,10 +899,11 @@ impl MultiVectorIndex {
                 "training samples must be >= centroid count".into(),
             ));
         }
-        let mut s = self.state.write().unwrap();
-        if !s.documents.is_empty() {
+        let _writer = self.writer.lock().unwrap();
+        let s = self.snapshot();
+        if s.documents.values().any(|d| d.tokens > 0) {
             return Err(IndexError::Invalid(
-                "cannot retrain a non-empty index".into(),
+                "cannot retrain an index containing token vectors".into(),
             ));
         }
         let samples: Vec<_> = samples.iter().map(|sample| normalize(sample)).collect();
@@ -622,7 +929,7 @@ impl MultiVectorIndex {
                 }
             }
         }
-        let mut next = s.clone();
+        let mut next = (*s).clone();
         next.codebook = centers;
         let residuals: Vec<f32> = samples
             .iter()
@@ -640,7 +947,7 @@ impl MultiVectorIndex {
         next.postings = vec![HashSet::new(); next.codebook.len()];
         // Retraining an empty collection resets its derived graph/overlay.
         Self::invalidate_fde_ann(&mut next);
-        self.commit(&mut s, next)
+        self.commit(&s, next)
     }
     pub fn upsert(
         &self,
@@ -659,21 +966,42 @@ impl MultiVectorIndex {
     /// posting, generation, or existing ANN changes; unreachable bytes may
     /// remain in the append-only segments until recovery/compaction.
     pub fn upsert_batch(&self, batch: Vec<UpsertDocument>) -> Result<(), IndexError> {
+        self.upsert_records(
+            batch
+                .into_iter()
+                .map(|d| RetrievalDocument {
+                    id: d.id,
+                    vectors: d.vectors,
+                    metadata: d.metadata,
+                    ..RetrievalDocument::default()
+                })
+                .collect(),
+        )
+    }
+    pub fn upsert_records(&self, batch: Vec<RetrievalDocument>) -> Result<(), IndexError> {
         if batch.is_empty() {
             return Ok(());
         }
         for document in &batch {
-            self.validate(&document.vectors)?;
+            if !document.vectors.is_empty() {
+                self.validate(&document.vectors)?;
+            }
         }
-        let mut s = self.state.write().unwrap();
-        if s.codebook.is_empty() {
+        let _writer = self.writer.lock().unwrap();
+        let s = self.snapshot();
+        if s.codebook.is_empty() && batch.iter().any(|d| !d.vectors.is_empty()) {
             return Err(IndexError::Invalid(
                 "index is untrained; call train first".into(),
             ));
         }
-        let mut next = s.clone();
+        let mut next = (*s).clone();
+        if next.stores.objects.len()? + next.stores.fde.len()? >= 64 * 1024 * 1024 {
+            self.rotate_segment(&mut next)?;
+        }
         for document in batch {
+            let fields = Arc::new(Fields::prepare(&document, &next.stores)?);
             let id = document.id;
+            Arc::make_mut(&mut next.retrieval).insert(&id, &fields)?;
             if let Some(old_ids) = next
                 .documents
                 .get(&id)
@@ -695,16 +1023,34 @@ impl MultiVectorIndex {
             let mut unique_centroids = ids.clone();
             unique_centroids.sort_unstable();
             unique_centroids.dedup();
-            let (location, size) = self.objects.put(
-                &vectors,
-                &ids,
-                &next.codebook,
-                &next.residual_codebook,
-                self.config.residual_bits,
-            )?;
+            let (location, size) = if vectors.is_empty() {
+                (
+                    ObjectLocation {
+                        offset: 0,
+                        length: 0,
+                        checksum: None,
+                    },
+                    0,
+                )
+            } else {
+                next.stores.objects.put(
+                    &vectors,
+                    &ids,
+                    &next.codebook,
+                    &next.residual_codebook,
+                    self.config.residual_bits,
+                )?
+            };
             commit_boundary("object_appended")?;
-            let fde = self.fde.encode_document(&vectors);
-            let fde_location = self.fde_store.put(&fde)?;
+            let fde_location = if vectors.is_empty() {
+                ObjectLocation {
+                    offset: 0,
+                    length: 0,
+                    checksum: None,
+                }
+            } else {
+                next.stores.fde.put(&self.fde.encode_document(&vectors))?
+            };
             commit_boundary("fde_appended")?;
             for &c in &unique_centroids {
                 next.postings[c as usize].insert(id.clone());
@@ -713,7 +1059,21 @@ impl MultiVectorIndex {
                 if let Some(&point_id) = ann.base.by_id.get(&id) {
                     ann.tombstones.insert(point_id);
                 }
-                ann.delta.insert(id.clone());
+                if vectors.is_empty() {
+                    ann.delta.remove(&id);
+                } else {
+                    ann.delta.insert(id.clone());
+                }
+            }
+            for (field, ann) in &mut next.named_ann {
+                if let Some(&point) = ann.base.by_id.get(&id) {
+                    ann.tombstones.insert(point);
+                }
+                if fields.has_dense(field) {
+                    ann.delta.insert(id.clone());
+                } else {
+                    ann.delta.remove(&id);
+                }
             }
             next.documents.insert(
                 id,
@@ -725,18 +1085,22 @@ impl MultiVectorIndex {
                     metadata: document.metadata,
                     tokens: vectors.len(),
                     compressed_bytes: size,
+                    fields,
+                    storage_id: next.stores.id.unwrap_or(0),
                 },
             );
         }
-        self.commit(&mut s, next)
+        self.commit(&s, next)
     }
     pub fn delete(&self, id: &str) -> Result<bool, IndexError> {
-        let mut s = self.state.write().unwrap();
+        let _writer = self.writer.lock().unwrap();
+        let s = self.snapshot();
         if !s.documents.contains_key(id) {
             return Ok(false);
         }
-        let mut next = s.clone();
+        let mut next = (*s).clone();
         let d = next.documents.remove(id).unwrap();
+        Arc::make_mut(&mut next.retrieval).remove(id);
         for c in d.unique_centroids {
             next.postings[c as usize].remove(id);
         }
@@ -746,7 +1110,13 @@ impl MultiVectorIndex {
             }
             ann.delta.remove(id);
         }
-        self.commit(&mut s, next)?;
+        for ann in next.named_ann.values_mut() {
+            if let Some(&point) = ann.base.by_id.get(id) {
+                ann.tombstones.insert(point);
+            }
+            ann.delta.remove(id);
+        }
+        self.commit(&s, next)?;
         Ok(true)
     }
     /// Exact MUVERA candidates followed by compressed MaxSim rescoring.
@@ -765,13 +1135,13 @@ impl MultiVectorIndex {
         // so exact_fde_scores can partial-sort instead of fully sorting the
         // 10K+ pool it just scored.
         let cap = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
-        let s = self.state.read().unwrap();
+        let s = self.snapshot();
         let approximate = self.exact_fde_scores_capped(&s, &normalized, Some(cap))?;
         self.rescore(&s, &normalized, approximate, top_k, candidates)
     }
     /// Whether the base plus mutable overlay covers the current generation.
     pub fn hnsw_ready(&self) -> bool {
-        let s = self.state.read().unwrap();
+        let s = self.snapshot();
         s.fde_ann
             .as_ref()
             .is_some_and(|ann| ann.generation == s.generation)
@@ -806,7 +1176,7 @@ impl MultiVectorIndex {
         }
         let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
         let count = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
-        let s = self.state.read().unwrap();
+        let s = self.snapshot();
         let (approximate, backend) = if s
             .fde_ann
             .as_ref()
@@ -839,7 +1209,7 @@ impl MultiVectorIndex {
         self.validate(vectors)?;
         check_pruning_shape(top_k, candidates, rerank_candidates)?;
         let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
-        let s = self.state.read().unwrap();
+        let s = self.snapshot();
         let approximate = self.exact_fde_scores_capped(&s, &normalized, Some(candidates))?;
         self.prune_and_rescore(
             &s,
@@ -867,7 +1237,7 @@ impl MultiVectorIndex {
         check_pruning_shape(top_k, candidates, rerank_candidates)?;
         let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
         let query_fde = self.fde.encode_query(&normalized);
-        let s = self.state.read().unwrap();
+        let s = self.snapshot();
         let approximate = self.ann_fde_scores(&s, &query_fde, candidates, ef_search)?;
         self.prune_and_rescore(
             &s,
@@ -892,7 +1262,7 @@ impl MultiVectorIndex {
         self.rescore(s, normalized, pruned, top_k, Some(rerank_candidates))
     }
     fn exact_fde_scores(&self, normalized: &[Vector]) -> Result<Vec<(String, f32)>, IndexError> {
-        let s = self.state.read().unwrap();
+        let s = self.snapshot();
         self.exact_fde_scores_capped(&s, normalized, None)
     }
 
@@ -907,21 +1277,34 @@ impl MultiVectorIndex {
         normalized: &[Vector],
         cap: Option<usize>,
     ) -> Result<Vec<(String, f32)>, IndexError> {
-        if s.documents.is_empty() {
+        self.exact_fde_scores_filtered(s, normalized, cap, None)
+    }
+    fn exact_fde_scores_filtered(
+        &self,
+        s: &State,
+        normalized: &[Vector],
+        cap: Option<usize>,
+        eligible: Option<&HashSet<&str>>,
+    ) -> Result<Vec<(String, f32)>, IndexError> {
+        if !s.documents.values().any(|d| d.tokens > 0) {
             return Ok(Vec::new());
         }
         let query_fde = self.fde.encode_query(normalized);
-        let mapped_fdes = self.fde_store.map()?;
         let fde_dimension = self.fde.output_dimension();
         let approximate_results: Result<Vec<_>, io::Error> = s
             .documents
             .par_iter()
+            .filter(|(id, d)| d.tokens > 0 && eligible.is_none_or(|ids| ids.contains(id.as_str())))
             .map(|(id, record)| {
                 Ok((
                     id.clone(),
                     dot(
                         &query_fde,
-                        FixedVectorStore::get(&mapped_fdes, record.fde_location, fde_dimension)?,
+                        FixedVectorStore::get(
+                            s.record_fde(record),
+                            record.fde_location,
+                            fde_dimension,
+                        )?,
                     ),
                 ))
             })
@@ -964,19 +1347,39 @@ impl MultiVectorIndex {
     }
     /// Build an HNSW index over persisted FDEs. Exact FDE scan remains available as an oracle.
     pub fn build_fde_ann(&self, m: usize, ef_construct: usize) -> Result<usize, IndexError> {
+        self.build_ann(None, m, ef_construct)
+    }
+    pub fn build_dense_ann(
+        &self,
+        field: &str,
+        m: usize,
+        ef_construct: usize,
+    ) -> Result<usize, IndexError> {
+        self.build_ann(Some(field), m, ef_construct)
+    }
+    fn build_ann(
+        &self,
+        field: Option<&str>,
+        m: usize,
+        ef_construct: usize,
+    ) -> Result<usize, IndexError> {
         if !(1..=128).contains(&m) || !(1..=65_536).contains(&ef_construct) {
             return Err(IndexError::Invalid(
                 "HNSW m must be in 1..=128 and ef_construct in 1..=65536".into(),
             ));
         }
-        let s = self.state.read().unwrap();
-        let dimension = self.fde.output_dimension();
-        let mapped = if s.documents.is_empty() {
-            None
+        let s = self.snapshot();
+        let dimension = if let Some(field) = field {
+            s.retrieval.dense_dimension(field)?
         } else {
-            Some(self.fde_store.map()?)
+            self.fde.output_dimension()
         };
-        let mut ids: Vec<_> = s.documents.keys().cloned().collect();
+        let mut ids: Vec<_> = s
+            .documents
+            .iter()
+            .filter(|(_, d)| field.map_or(d.tokens > 0, |f| d.fields.has_dense(f)))
+            .map(|(id, _)| id.clone())
+            .collect();
         ids.sort();
         let mut hnsw = HNSWIndex::new(DistanceMetric::Dot, m, ef_construct, 16, dimension);
         // Build in chunks so peak memory stays bounded regardless of corpus
@@ -990,11 +1393,15 @@ impl MultiVectorIndex {
                 .iter()
                 .enumerate()
                 .map(|(offset, id)| {
-                    let vector = FixedVectorStore::get(
-                        mapped.as_deref().unwrap(),
-                        s.documents[id].fde_location,
-                        dimension,
-                    )?
+                    let vector = if let Some(field) = field {
+                        self.dense_vector(&s, id, field)?
+                    } else {
+                        FixedVectorStore::get(
+                            s.record_fde(&s.documents[id]),
+                            s.documents[id].fde_location,
+                            dimension,
+                        )?
+                    }
                     .to_vec();
                     Ok::<_, IndexError>(((base + offset) as u64, vector))
                 })
@@ -1013,7 +1420,8 @@ impl MultiVectorIndex {
         commit_boundary("ann_built_before_publish")?;
         #[cfg(test)]
         transaction_tests::before_ann_publish();
-        let mut s = self.state.write().unwrap();
+        let _writer = self.writer.lock().unwrap();
+        let s = self.snapshot();
         if s.generation != built_generation {
             return Err(IndexError::Invalid(format!(
                 "index generation moved during HNSW build ({} -> {}); retry",
@@ -1026,16 +1434,24 @@ impl MultiVectorIndex {
             .enumerate()
             .map(|(idx, id)| (id.clone(), idx as u64))
             .collect();
-        s.fde_ann = Some(FdeAnn {
+        let mut next = (*s).clone();
+        let ann = FdeAnn {
             base: Arc::new(FdeAnnBase {
                 index: hnsw,
                 ids,
                 by_id,
+                field: field.map(str::to_owned),
             }),
             delta: HashSet::new(),
             tombstones: HashSet::new(),
             generation: built_generation,
-        });
+        };
+        if let Some(field) = field {
+            next.named_ann.insert(field.to_owned(), ann);
+        } else {
+            next.fde_ann = Some(ann);
+        }
+        *self.state.write().unwrap() = Arc::new(next);
         Ok(count)
     }
     pub fn query_with_fde_ann(
@@ -1053,7 +1469,7 @@ impl MultiVectorIndex {
         }
         let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
         let query_fde = self.fde.encode_query(&normalized);
-        let s = self.state.read().unwrap();
+        let s = self.snapshot();
         let count = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
         let approximate = self.ann_fde_scores(&s, &query_fde, count, ef_search)?;
         self.rescore(&s, &normalized, approximate, top_k, candidates)
@@ -1068,6 +1484,16 @@ impl MultiVectorIndex {
         let ann = s.fde_ann.as_ref().ok_or_else(|| {
             IndexError::Invalid("FDE ANN is not built; call /v1/fde/index".into())
         })?;
+        self.ann_scores(s, ann, query_fde, count, ef_search)
+    }
+    fn ann_scores(
+        &self,
+        s: &State,
+        ann: &FdeAnn,
+        query_fde: &Vector,
+        count: usize,
+        ef_search: usize,
+    ) -> Result<Vec<(String, f32)>, IndexError> {
         if ann.generation != s.generation {
             return Err(IndexError::Invalid(
                 "FDE ANN generation is stale; rebuild".into(),
@@ -1106,17 +1532,20 @@ impl MultiVectorIndex {
             }
         }
         if !ann.delta.is_empty() {
-            let mapped = self.fde_store.map()?;
             for id in &ann.delta {
                 let record = s
                     .documents
                     .get(id)
                     .ok_or_else(|| IndexError::Invalid("missing delta document".into()))?;
-                let vector = FixedVectorStore::get(
-                    &mapped,
-                    record.fde_location,
-                    self.fde.output_dimension(),
-                )?;
+                let vector = if let Some(field) = &ann.base.field {
+                    self.dense_vector(s, id, field)?
+                } else {
+                    FixedVectorStore::get(
+                        s.record_fde(record),
+                        record.fde_location,
+                        self.fde.output_dimension(),
+                    )?
+                };
                 scores.push((id.clone(), dot(query_fde, vector)));
             }
         }
@@ -1144,7 +1573,7 @@ impl MultiVectorIndex {
         }
         let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
         let query_fde = self.fde.encode_query(&normalized);
-        let s = self.state.read().unwrap();
+        let s = self.snapshot();
         Ok(self
             .ann_fde_scores(&s, &query_fde, count, ef_search)?
             .into_iter()
@@ -1163,7 +1592,7 @@ impl MultiVectorIndex {
             return Err(IndexError::Invalid("top_k must be positive".into()));
         }
         let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
-        let s = self.state.read().unwrap();
+        let s = self.snapshot();
         if s.codebook.is_empty() {
             return Err(IndexError::Invalid("index is untrained".into()));
         }
@@ -1219,7 +1648,6 @@ impl MultiVectorIndex {
             return Ok(Vec::new());
         }
         let count = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
-        let mapped = self.objects.map()?;
         // Per-stage timing accumulators, gated by MULTIVECTOR_TIMING. Cached
         // in a OnceLock so a live server pays the env::var HashMap lookup
         // exactly once, not per rescoring call.
@@ -1260,7 +1688,7 @@ impl MultiVectorIndex {
                     |cell| -> Result<(f32, Option<std::time::Instant>), io::Error> {
                         let mut scratch = cell.borrow_mut();
                         let dim = CompressedVectorStore::decode_into(
-                            &mapped,
+                            s.record_objects(record),
                             record.location,
                             &s.codebook,
                             &s.residual_codebook,
@@ -1331,8 +1759,145 @@ impl MultiVectorIndex {
             .collect();
         Ok(hits)
     }
+    fn new_segment(&self, generation: u64) -> Result<Arc<SegmentStores>, IndexError> {
+        let mut id = generation
+            .checked_add(1)
+            .ok_or_else(|| IndexError::Invalid("generation exhausted".into()))?;
+        let parent = self.root.join("segments");
+        fs::create_dir_all(&parent)?;
+        let root = loop {
+            let path = parent.join(id.to_string());
+            match fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    id = id
+                        .checked_add(1)
+                        .ok_or_else(|| IndexError::Invalid("segment IDs exhausted".into()))?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let stores = Arc::new(SegmentStores {
+            objects: CompressedVectorStore::new(root.join("objects"))?,
+            fde: FixedVectorStore::new(root.join("fde"))?,
+            root,
+            id: Some(id),
+            retired: std::sync::atomic::AtomicBool::new(true),
+        });
+        Ok(stores)
+    }
+    fn rotate_segment(&self, next: &mut State) -> Result<(), IndexError> {
+        let stores = self.new_segment(next.generation)?;
+        // A failed append can leave a tail beyond the published mappings.
+        // Sealing preserves the committed prefix, never the physical file size.
+        let bounds = SegmentBoundaries {
+            objects: next.object_bytes().len() as u64,
+            fde: next.fde_bytes().len() as u64,
+        };
+        next.sealed.insert(
+            next.stores.id.unwrap_or(0),
+            Arc::new(SegmentSnapshot {
+                stores: Arc::clone(&next.stores),
+                objects: next.objects_map.take(),
+                fde: next.fde_map.take(),
+                bounds,
+            }),
+        );
+        if self.durability == Durability::Fsync {
+            for path in [
+                stores.root.join("objects"),
+                stores.root.join("fde"),
+                stores.root.clone(),
+                self.root.join("segments"),
+            ] {
+                File::open(path)?.sync_all()?;
+            }
+            File::open(&self.root)?.sync_all()?;
+        }
+        next.stores = stores;
+        Ok(())
+    }
+    pub fn seal(&self) -> Result<(), IndexError> {
+        let _writer = self.writer.lock().unwrap();
+        let s = self.snapshot();
+        let mut next = (*s).clone();
+        self.rotate_segment(&mut next)?;
+        self.commit(&s, next)
+    }
+    /// Copy live records into a new append segment and atomically publish its
+    /// locations. Existing readers retain their old files until they finish.
+    pub fn compact(&self) -> Result<serde_json::Value, IndexError> {
+        let s = self.snapshot();
+        let before = s.stores.objects.len()?
+            + s.stores.fde.len()?
+            + s.sealed
+                .values()
+                .map(|v| Ok::<_, io::Error>(v.stores.objects.len()? + v.stores.fde.len()?))
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .sum::<u64>();
+        let stores = self.new_segment(s.generation)?;
+        let mut next = (*s).clone();
+        next.stores = Arc::clone(&stores);
+        next.objects_map = None;
+        next.fde_map = None;
+        next.sealed.clear();
+        for document in next.documents.values_mut() {
+            if document.tokens > 0 {
+                document.location = stores
+                    .objects
+                    .copy_record(s.record_objects(document), document.location)?;
+                document.fde_location = stores
+                    .fde
+                    .copy_record(s.record_fde(document), document.fde_location)?;
+            }
+            let source = s.record_fde(document);
+            Arc::make_mut(&mut document.fields).relocate(source, &stores.fde)?;
+            document.storage_id = stores.id.unwrap();
+        }
+        if self.durability == Durability::Fsync {
+            for path in [
+                stores.root.join("objects"),
+                stores.root.join("fde"),
+                stores.root.clone(),
+                self.root.join("segments"),
+            ] {
+                File::open(path)?.sync_all()?;
+            }
+            File::open(&self.root)?.sync_all()?;
+        }
+        commit_boundary("compaction_copied")?;
+        let _writer = self.writer.lock().unwrap();
+        if self.snapshot().generation != s.generation {
+            return Err(IndexError::Invalid(
+                "generation changed during compaction; retry".into(),
+            ));
+        }
+        let result = self.commit(&s, next);
+        if result.is_ok() || matches!(result, Err(IndexError::CommitUncertain(_))) {
+            stores
+                .retired
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        if result.is_ok() {
+            s.stores
+                .retired
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            for old in s.sealed.values() {
+                old.stores
+                    .retired
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        result?;
+        let after = stores.objects.len()? + stores.fde.len()?;
+        Ok(
+            serde_json::json!({"generation":s.generation+1,"bytes_before":before,"bytes_after":after,"bytes_reclaimed":before.saturating_sub(after)}),
+        )
+    }
+
     pub fn stats(&self) -> IndexStats {
-        let s = self.state.read().unwrap();
+        let s = self.snapshot();
         IndexStats {
             documents: s.documents.len(),
             generation: s.generation,
@@ -1349,6 +1914,17 @@ impl MultiVectorIndex {
             fde_ann_delta_documents: s.fde_ann.as_ref().map_or(0, |ann| ann.delta.len()),
             fde_ann_tombstones: s.fde_ann.as_ref().map_or(0, |ann| ann.tombstones.len()),
             fde_encoding_version: self.fde.encoding_version(),
+            storage_segments: s.sealed.len() + 1,
+            dense_ann_fields: s
+                .named_ann
+                .iter()
+                .map(|(field, ann)| {
+                    (
+                        field.clone(),
+                        ann.base.ids.len() - ann.tombstones.len() + ann.delta.len(),
+                    )
+                })
+                .collect(),
         }
     }
     /// Diagnostic score over caller-provided vectors; used to verify scorer parity.
@@ -1368,14 +1944,13 @@ impl MultiVectorIndex {
     pub fn score_compressed(&self, query: &[Vector], id: &str) -> Result<f32, IndexError> {
         self.validate(query)?;
         let query: Vec<_> = query.iter().map(|v| normalize(v)).collect();
-        let s = self.state.read().unwrap();
+        let s = self.snapshot();
         let record = s
             .documents
             .get(id)
             .ok_or_else(|| IndexError::Invalid(format!("unknown document: {id}")))?;
-        let mapped = self.objects.map()?;
         let document = CompressedVectorStore::decode(
-            &mapped,
+            s.record_objects(record),
             record.location,
             &s.codebook,
             &s.residual_codebook,

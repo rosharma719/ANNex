@@ -11,6 +11,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -97,7 +98,22 @@ def environment_settings():
             packages[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             packages[name] = None
+    hardware = {"processor": platform.processor()}
+    if platform.system() == "Darwin":
+        hardware.update(
+            processor=subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"], text=True
+            ).strip(),
+            memory_bytes=int(
+                subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True)
+            ),
+        )
+    elif hasattr(os, "sysconf"):
+        hardware["memory_bytes"] = os.sysconf("SC_PAGE_SIZE") * os.sysconf(
+            "SC_PHYS_PAGES"
+        )
     return {
+        "hardware": hardware,
         "packages": packages,
         "python": platform.python_version(),
         "machine": platform.machine(),

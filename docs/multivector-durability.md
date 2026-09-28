@@ -7,12 +7,17 @@ benchmarks. This setting is per open, not part of the stored index configuration
 
 ## Atomic mutations
 
-An upsert batch, training operation, or successful delete commits one generation.
+An upsert batch, training operation, successful delete, seal or compaction commits
+one generation.
 Concurrent queries see one whole generation for candidate selection and rescoring.
 Duplicate IDs in a batch are applied in order (last wins). Empty batches and deletes
 of missing IDs are no-ops, including for ANN validity. Generations never wrap.
 
-A mutation builds a private copy of metadata and postings under the writer lock.
+Queries retain an immutable `Arc` generation and its memory mappings; the state
+lock is held only while obtaining or publishing that reference. A mutation stages
+a private copy of metadata and postings under the writer lock. Text, named
+representations, sparse/BM25 postings, chunk metadata and ANN overlays publish
+together with the document records.
 Pre-publication errors leave documents, codebooks, postings, generation, and any
 built FDE ANN unchanged. Upserts and deletes stage an ANN overlay alongside the
 documents: updated/new IDs enter an exact-scanned delta, and overwritten/deleted
@@ -65,20 +70,43 @@ wholly inside committed boundaries. Open then discards only uncommitted segment
 tails; pending manifests are ignored. A missing manifest with nonempty segments
 is rejected without truncation.
 
-New manifests use format 2. Format 1 (including manifests predating an explicit
-version) remains readable. Its optional, historically named `manifest.sha256`
+New manifests use format 3, which records named representations and multiple
+storage segments. Formats 1 and 2 remain readable. Format 1 includes manifests
+predating an explicit version; its optional, historically named `manifest.sha256`
 sidecar is checked if present; legacy records receive structural validation and
 are assigned digests in memory. The next successful mutation upgrades the
 manifest. Legacy data without digests cannot retroactively provide integrity
-proof. A format-2 manifest is self-contained and ignores stale legacy sidecars.
-Older binaries cannot open newly committed format-2 manifests; keep a backup if
-you need to roll back binaries. This is independent of annex-core's HNSW format.
+proof. Format-2/3 manifests are self-contained and ignore stale legacy sidecars.
+Older binaries reject newly committed format-3 manifests; keep a backup if you
+need to roll back binaries. This is independent of annex-core's HNSW format.
+
+## Segments and compaction
+
+Vector records append to one active segment; sealed segments and their mappings
+remain readable by older query generations. Sealing rotates the active files;
+`storage_segments` reports their count. The library exposes `seal()`, and ingest
+rotates sufficiently large active segments automatically.
+
+`POST /v1/compact` copies live compressed/default/named vector records into a new
+segment, preserves stored bytes, and publishes new locations through the normal
+manifest protocol. Copying runs without the writer lock. If a mutation changes
+the generation before publication, compaction fails with a retryable generation
+conflict; the caller must retry. Old files are retired after successful
+publication and removed when their last reader releases them. Reopen removes
+unreferenced segment directories left by interrupted maintenance.
+
+Compaction reclaims superseded vector records; it does not turn the full manifest
+into an incremental log, compact lexical vocabulary, or rebuild ANN graphs. Its
+reported byte savings cover vector segments, not total process memory or all
+index files. Backup/restore and hardware power-loss drills remain separate work.
 
 ## Mutable ANN and encoding versions
 
 The HTTP query default (`auto`) uses the built base plus its current overlay, or
 an exact FDE scan when no graph is available. Build/rebuild explicitly with
-`POST /v1/fde/index`; reopening starts with exact fallback. A rebuild folds live
+`POST /v1/fde/index`; named dense fields use `POST /v1/dense/index`. Graphs are not
+persisted: reopening starts with exact fallback. Named-field graphs use the same
+base/delta/tombstone lifecycle; named multivectors remain exhaustive FP32 MaxSim. A rebuild folds live
 records into a new base and clears the overlay. If the document generation moves
 before publication, the build fails and preserves the current base/overlay.
 `fde_ann_base_nodes`, `fde_ann_delta_documents`, and `fde_ann_tombstones` expose
@@ -116,8 +144,9 @@ These are process-interruption tests, **not hardware power-cut testing**.
 The scheduled correctness workflow expands the model test to 128 seeds × 512
 operations; normal CI runs 8 × 160. Seed/step are included in model assertions.
 
-This correctness-first implementation still clones metadata/postings and rewrites
-the full manifest per mutation, holds a write lock during ingest, and scans live
-record checksums on open. Superseded records inside committed boundaries require
-future compaction. Immutable query generations, WAL/checkpointing, persistent
-mmaps, automatic ANN maintenance, and execution pools remain subsequent systems work.
+The implementation still clones metadata/postings and rewrites the full manifest
+per mutation, serializes writers during ingest, and scans live record checksums
+on open. Persistent mappings and immutable query generations avoid remapping
+per request and let existing readers survive publication/compaction. Incremental
+WAL/checkpointing, automatic ANN maintenance, bounded execution pools and verified
+backup/restore remain subsequent systems work.

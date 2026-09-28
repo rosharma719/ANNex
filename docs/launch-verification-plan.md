@@ -1,22 +1,29 @@
 # Launch verification work order
 
 Target: a self-hosted, single-node CPU service for text RAG. This is a roadmap,
-not a declaration of completed features or benchmark results.
+not a declaration of launch readiness or comparative superiority.
 
-## Implementation order
+The current implementation includes the measurement/API foundation, filtered
+hybrid retrieval, named dense/sparse/multivector fields, context selection,
+collection namespaces, immutable query generations, retained mappings and vector
+segment compaction. The API and storage contracts below own their guarantees
+and limitations; benchmark results must distinguish completed evidence from
+planned evaluations.
 
-1. **Measurement and API contracts:** reject unsupported request fields/options;
-   bound work; expose deletion; journal every benchmark outcome; measure actual
-   exact/ANN backends and full build costs; validate process-level behavior.
+## Remaining implementation order
+
+1. **Measurement coverage:** extend durable benchmark journals to matched-quality
+   competitor configurations, held-out corpora and answer/evidence evaluation;
+   measure actual backends and complete build/resource costs.
 2. **Bounded serving and lifecycle:** separate query/ingest/maintenance execution,
    admission limits and cancellation; atomic source replacement, revision
    preconditions and idempotent retries.
-3. **Filtered hybrid retrieval:** typed metadata predicates across all retrieval
-   paths; durable sparse/BM25 state in the same generation as dense data; explicit
-   fusion/reranking, grouping and filtered exact oracles.
+3. **Retrieval scaling:** accelerate selective filters against the existing exact
+   oracle, measure adaptive rerank/context policies, and avoid quality claims from
+   fixtures or inspected development queries.
 4. **Write scaling and maintenance:** incremental durable records/checkpoints,
-   immutable readers and retained mappings; bounded delta folding, safe concurrent
-   rebuilds, restart readiness, compaction and consistent backup/restore.
+   bounded delta folding, graph persistence/restart readiness and consistent
+   backup/restore; stress existing compaction under concurrent writes/readers.
 5. **Measured optimization:** profile FP16/SQ8 FDE storage, duplicate-vector
    removal, fused compressed MaxSim and SIMD; retain independent scalar/FP32
    oracles. Promote changes only after quality/latency/memory measurements.

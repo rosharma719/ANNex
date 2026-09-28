@@ -22,6 +22,7 @@ the corrections; the [benchmark policy](../../../BENCHMARK_POLICY.md) governs ne
 | LanceDB has no native multivector support | The old adapter mean-pooled tokens. Treat those numbers as a mean-pool ablation, not evidence about native multivector retrieval. |
 | SciFact's remaining deficit was necessarily model behavior | The original encoder used a shorter document limit. Later experiments changed that limit and exposed candidate-pruning losses. |
 | Unsourced latency ranges for PLAID and Vespa | Withdrawn; these were not comparable measurements on the recorded workload. |
+| Early local NFCorpus hybrid numbers used standard BEIR nDCG | The initial runner used exponential gains (`2^grade−1`). BEIR/trec_eval uses the relevance grade directly. New summaries use linear gains; preserved early summaries must not be compared numerically with them. Binary-relevance SciFact/ArguAna scores are unaffected. |
 
 Historic NYT/H&M curves and optimization notes are also exploratory. Their
 original files remain in the same revision. Current commands live in

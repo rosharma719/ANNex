@@ -1,24 +1,14 @@
 """Deterministic paired-bootstrap comparisons for retrieval runs."""
 
-import math
-
 import numpy as np
+from measurement import evaluate
 
 
 def per_query_ndcg(run, qrels, k=10):
-    values = []
-    for query_id, relevant in qrels.items():
-        ranked = run.get(query_id, [])[:k]
-        gains = [relevant.get(doc_id, 0) for doc_id in ranked]
-        ideal = sorted(relevant.values(), reverse=True)[:k]
-        dcg = sum(
-            (2**gain - 1) / math.log2(index + 2) for index, gain in enumerate(gains)
-        )
-        idcg = sum(
-            (2**gain - 1) / math.log2(index + 2) for index, gain in enumerate(ideal)
-        )
-        values.append(dcg / idcg if idcg else 0.0)
-    return np.asarray(values, dtype=np.float64)
+    return np.asarray(
+        [row[f"ndcg@{k}"] for row in evaluate(qrels, run, k)["per_query"]],
+        dtype=np.float64,
+    )
 
 
 def paired_bootstrap(run_a, run_b, qrels, k=10, samples=10_000, seed=13):

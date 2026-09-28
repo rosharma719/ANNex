@@ -1,37 +1,30 @@
-//! Sparse-vector index for hybrid retrieval.
-//!
-//! Companion to the dense HNSW engine: enables BM25 / SPLADE / uniCOIL style
-//! learned-sparse and classic-lexical retrieval, which is table stakes for
-//! any 2026 RAG stack.
-//!
-//! Data model:
-//! - Each document is a `SparseVector` of `(index, value)` pairs.
-//! - The index is an inverted list keyed by `index`, mapping to `(doc, value)`.
-//! - Two scoring modes on query:
-//!   - `search_dot`: plain sparse dot product between query and document
-//!     sparse vectors. Right choice when the caller has SPLADE-shaped
-//!     `(token_id, weight)` embeddings and just wants the inner product.
-//!   - `search_bm25`: Okapi BM25 with configurable k1, b. Right choice
-//!     when the input is `(token_id, term_frequency)` from a classic
-//!     lexical pipeline.
-//!
-//! Storage is in-memory; snapshot / WAL integration is a separate follow-up.
-//! Concurrent inserts are serialized behind a single mutex — this crate's
-//! current focus is establishing the primitive, not scaling it. The hot
-//! path (query) does not take that mutex.
+//! In-memory sparse dot/BM25 retrieval. Weights are finite and nonnegative;
+//! feature IDs are arbitrary u32 values. Clone creates an independent snapshot.
 
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
 use crate::utils::types::PointId;
 
-/// Sparse vector: parallel arrays of feature indices and their values.
-/// Indices should be sorted ascending; not enforced but assumed by the
-/// dot-product path for early termination opportunities in future
-/// optimisations.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum SparseError {
+    #[error("sparse indices and values must have equal lengths")]
+    LengthMismatch,
+    #[error("sparse weights must be finite and nonnegative")]
+    InvalidWeight,
+    #[error("sparse weight or score exceeds f32 range")]
+    Overflow,
+    #[error("BM25 requires finite k1 >= 0 and b in [0, 1]")]
+    InvalidBm25,
+}
+
+/// Parallel feature/weight arrays. Index operations validate and canonicalize
+/// these arrays: sort features, sum duplicates, and omit zero weights.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SparseVector {
     pub indices: Vec<u32>,
     pub values: Vec<f32>,
@@ -39,16 +32,11 @@ pub struct SparseVector {
 
 impl SparseVector {
     pub fn new() -> Self {
-        Self {
-            indices: Vec::new(),
-            values: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn from_pairs(pairs: impl IntoIterator<Item = (u32, f32)>) -> Self {
-        let mut v: Vec<_> = pairs.into_iter().collect();
-        v.sort_by_key(|(i, _)| *i);
-        let (indices, values) = v.into_iter().unzip();
+        let (indices, values) = pairs.into_iter().unzip();
         Self { indices, values }
     }
 
@@ -59,40 +47,100 @@ impl SparseVector {
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
     }
-}
 
-impl Default for SparseVector {
-    fn default() -> Self {
-        Self::new()
+    pub fn canonicalized(&self) -> Result<Self, SparseError> {
+        if self.indices.len() != self.values.len() {
+            return Err(SparseError::LengthMismatch);
+        }
+        if self.values.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return Err(SparseError::InvalidWeight);
+        }
+        let mut pairs: Vec<_> = self
+            .indices
+            .iter()
+            .copied()
+            .zip(self.values.iter().copied())
+            .collect();
+        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+        let mut result = Self::new();
+        let mut i = 0;
+        while i < pairs.len() {
+            let feature = pairs[i].0;
+            let mut weight = 0.0f64;
+            while i < pairs.len() && pairs[i].0 == feature {
+                weight += f64::from(pairs[i].1);
+                i += 1;
+            }
+            if weight > f64::from(f32::MAX) {
+                return Err(SparseError::Overflow);
+            }
+            if weight > 0.0 {
+                result.indices.push(feature);
+                result.values.push(weight as f32);
+            }
+        }
+        Ok(result)
     }
 }
 
-/// Per-index inverted posting.
-#[derive(Debug, Default)]
-struct Posting {
-    /// (doc_local_id, value) pairs. Sorted by doc_local_id insertion order.
-    entries: Vec<(u32, f32)>,
+#[derive(Clone, Debug)]
+struct Document {
+    vector: SparseVector,
+    length: f64,
 }
 
-/// In-memory inverted-index sparse retriever.
+#[derive(Clone, Debug, Default)]
+struct SparseIndexInner {
+    postings: HashMap<u32, Arc<HashMap<PointId, f32>>>,
+    documents: HashMap<PointId, Arc<Document>>,
+    // Subtract within similar magnitudes so deleting a large document cannot
+    // erase the accumulated lengths of much smaller remaining documents.
+    length_bins: BTreeMap<u16, (usize, f64)>,
+}
+
+impl SparseIndexInner {
+    fn remove(&mut self, id: PointId) -> bool {
+        let Some(doc) = self.documents.remove(&id) else {
+            return false;
+        };
+        for &feature in &doc.vector.indices {
+            let posting = self.postings.get_mut(&feature).expect("indexed feature");
+            Arc::make_mut(posting).remove(&id);
+            if posting.is_empty() {
+                self.postings.remove(&feature);
+            }
+        }
+        if doc.length > 0.0 {
+            let exponent = (doc.length.to_bits() >> 52) as u16;
+            let bin = self.length_bins.get_mut(&exponent).expect("indexed length");
+            if bin.0 == 1 {
+                self.length_bins.remove(&exponent);
+            } else {
+                bin.0 -= 1;
+                bin.1 -= doc.length;
+            }
+        }
+        true
+    }
+}
+
+/// Memory grows with live documents and nonzero features, never feature IDs.
 #[derive(Debug, Default)]
 pub struct SparseIndex {
     inner: RwLock<SparseIndexInner>,
 }
 
-#[derive(Debug, Default)]
-struct SparseIndexInner {
-    /// Postings keyed by feature index. Vec is faster than HashMap when
-    /// feature indices are dense/contiguous (typical for BPE tokens with
-    /// vocab ~30-50k); we resize on demand.
-    postings: Vec<Posting>,
-    /// Public PointId ↔ internal local u32 id mapping.
-    id_to_local: HashMap<PointId, u32>,
-    local_to_id: Vec<PointId>,
-    /// Sum of values per document — used as "doc length" for BM25.
-    doc_lens: Vec<f32>,
-    /// Total accumulated doc length; divided at query time to get avgdl.
-    total_len: f64,
+impl Clone for SparseIndex {
+    fn clone(&self) -> Self {
+        Self {
+            inner: RwLock::new(
+                self.inner
+                    .read()
+                    .expect("sparse index lock poisoned")
+                    .clone(),
+            ),
+        }
+    }
 }
 
 impl SparseIndex {
@@ -100,54 +148,42 @@ impl SparseIndex {
         Self::default()
     }
 
-    /// Insert or replace a document's sparse vector.
-    ///
-    /// Replacement is O(sum of posting lengths); simple linear scan of each
-    /// touched posting. Fine for the append-heavy workloads sparse indexes
-    /// typically serve; a real deletion story lives with the compaction /
-    /// segments effort.
-    pub fn upsert(&self, id: PointId, vec: &SparseVector) {
-        let mut inner = self.inner.write().expect("sparse index mutex poisoned");
-        let local = if let Some(&existing) = inner.id_to_local.get(&id) {
-            // Remove old contributions from postings + doc_len bookkeeping.
-            let old_len = inner.doc_lens[existing as usize];
-            inner.total_len -= old_len as f64;
-            inner.doc_lens[existing as usize] = 0.0;
-            let posting_count = inner.postings.len();
-            for posting in &mut inner.postings[..posting_count] {
-                posting.entries.retain(|&(doc, _)| doc != existing);
-            }
-            existing
-        } else {
-            let new_local = inner.local_to_id.len() as u32;
-            inner.local_to_id.push(id);
-            inner.id_to_local.insert(id, new_local);
-            inner.doc_lens.push(0.0);
-            new_local
-        };
-
-        // Now add new contributions.
-        let mut doc_len = 0.0f32;
-        for (&feature, &value) in vec.indices.iter().zip(&vec.values) {
-            if feature as usize >= inner.postings.len() {
-                inner
-                    .postings
-                    .resize_with(feature as usize + 1, Posting::default);
-            }
-            inner.postings[feature as usize]
-                .entries
-                .push((local, value));
-            doc_len += value;
+    /// Validation precedes mutation. Replacement and deletion touch only the
+    /// document's own terms. Snapshots share postings until a writer changes them.
+    pub fn upsert(&self, id: PointId, vector: &SparseVector) -> Result<(), SparseError> {
+        let vector = vector.canonicalized()?;
+        let length: f64 = vector.values.iter().map(|&v| f64::from(v)).sum();
+        let mut inner = self.inner.write().expect("sparse index lock poisoned");
+        inner.remove(id);
+        for (&feature, &value) in vector.indices.iter().zip(&vector.values) {
+            Arc::make_mut(inner.postings.entry(feature).or_default()).insert(id, value);
         }
-        inner.doc_lens[local as usize] = doc_len;
-        inner.total_len += doc_len as f64;
+        if length > 0.0 {
+            let bin = inner
+                .length_bins
+                .entry((length.to_bits() >> 52) as u16)
+                .or_default();
+            bin.0 += 1;
+            bin.1 += length;
+        }
+        inner
+            .documents
+            .insert(id, Arc::new(Document { vector, length }));
+        Ok(())
+    }
+
+    pub fn delete(&self, id: PointId) -> bool {
+        self.inner
+            .write()
+            .expect("sparse index lock poisoned")
+            .remove(id)
     }
 
     pub fn len(&self) -> usize {
         self.inner
             .read()
-            .expect("sparse index mutex poisoned")
-            .local_to_id
+            .expect("sparse index lock poisoned")
+            .documents
             .len()
     }
 
@@ -155,76 +191,135 @@ impl SparseIndex {
         self.len() == 0
     }
 
-    /// Sparse dot product scoring. Query and doc are treated as sparse
-    /// vectors; per-doc score is the sum of `q[i] * d[i]` over shared
-    /// indices. Right choice for SPLADE-style learned-sparse embeddings.
-    pub fn search_dot(&self, query: &SparseVector, top_k: usize) -> Vec<(PointId, f32)> {
-        if top_k == 0 || query.is_empty() {
-            return Vec::new();
-        }
-        let inner = self.inner.read().expect("sparse index mutex poisoned");
-        let mut scores: HashMap<u32, f32> = HashMap::new();
-        for (&feature, &q_value) in query.indices.iter().zip(&query.values) {
-            if let Some(posting) = inner.postings.get(feature as usize) {
-                for &(doc, d_value) in &posting.entries {
-                    *scores.entry(doc).or_insert(0.0) += q_value * d_value;
-                }
-            }
-        }
-        let mut ranked: Vec<_> = scores
-            .into_iter()
-            .map(|(local, score)| (inner.local_to_id[local as usize], score))
-            .collect();
-        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        ranked.truncate(top_k);
-        ranked
+    pub fn search_dot(
+        &self,
+        query: &SparseVector,
+        top_k: usize,
+    ) -> Result<Vec<(PointId, f32)>, SparseError> {
+        self.search_dot_filtered(query, top_k, |_| true)
     }
 
-    /// Okapi BM25 scoring. Assumes query values are 1.0 (term appears in
-    /// query) and document values are term frequencies. Standard k1=1.2,
-    /// b=0.75. Doc length = sum of values (i.e. total token count for
-    /// classic BM25).
+    pub fn search_dot_filtered(
+        &self,
+        query: &SparseVector,
+        top_k: usize,
+        eligible: impl Fn(PointId) -> bool,
+    ) -> Result<Vec<(PointId, f32)>, SparseError> {
+        self.search_dot_filtered_by(query, top_k, eligible, |a, b| a.cmp(&b))
+    }
+
+    /// Supply a stable external-ID order when local IDs can change on rebuild.
+    pub fn search_dot_filtered_by(
+        &self,
+        query: &SparseVector,
+        top_k: usize,
+        eligible: impl Fn(PointId) -> bool,
+        tie_break: impl Fn(PointId, PointId) -> Ordering,
+    ) -> Result<Vec<(PointId, f32)>, SparseError> {
+        self.search(query, top_k, None, eligible, tie_break)
+    }
+
+    /// BM25 uses global live-document statistics, including empty documents.
+    /// Query weights multiply term contributions; use ones for lexical queries.
     pub fn search_bm25(
         &self,
         query: &SparseVector,
         top_k: usize,
         k1: f32,
         b: f32,
-    ) -> Vec<(PointId, f32)> {
+    ) -> Result<Vec<(PointId, f32)>, SparseError> {
+        self.search_bm25_filtered(query, top_k, k1, b, |_| true)
+    }
+
+    /// Eligibility is applied before scoring and top-k, without changing IDF.
+    pub fn search_bm25_filtered(
+        &self,
+        query: &SparseVector,
+        top_k: usize,
+        k1: f32,
+        b: f32,
+        eligible: impl Fn(PointId) -> bool,
+    ) -> Result<Vec<(PointId, f32)>, SparseError> {
+        self.search_bm25_filtered_by(query, top_k, k1, b, eligible, |a, b| a.cmp(&b))
+    }
+
+    /// BM25 with eligibility and caller-defined ordering for equal scores.
+    pub fn search_bm25_filtered_by(
+        &self,
+        query: &SparseVector,
+        top_k: usize,
+        k1: f32,
+        b: f32,
+        eligible: impl Fn(PointId) -> bool,
+        tie_break: impl Fn(PointId, PointId) -> Ordering,
+    ) -> Result<Vec<(PointId, f32)>, SparseError> {
+        if !k1.is_finite() || k1 < 0.0 || !b.is_finite() || !(0.0..=1.0).contains(&b) {
+            return Err(SparseError::InvalidBm25);
+        }
+        self.search(
+            query,
+            top_k,
+            Some((f64::from(k1), f64::from(b))),
+            eligible,
+            tie_break,
+        )
+    }
+
+    fn search(
+        &self,
+        query: &SparseVector,
+        top_k: usize,
+        bm25: Option<(f64, f64)>,
+        eligible: impl Fn(PointId) -> bool,
+        tie_break: impl Fn(PointId, PointId) -> Ordering,
+    ) -> Result<Vec<(PointId, f32)>, SparseError> {
+        let query = query.canonicalized()?;
         if top_k == 0 || query.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let inner = self.inner.read().expect("sparse index mutex poisoned");
-        let n = inner.local_to_id.len();
-        if n == 0 {
-            return Vec::new();
-        }
-        let avgdl = (inner.total_len / n as f64) as f32;
-        let mut scores: HashMap<u32, f32> = HashMap::new();
-        for (&feature, &q_value) in query.indices.iter().zip(&query.values) {
-            let Some(posting) = inner.postings.get(feature as usize) else {
+        let inner = self.inner.read().expect("sparse index lock poisoned");
+        let n = inner.documents.len() as f64;
+        let total_len: f64 = inner.length_bins.values().map(|bin| bin.1).sum();
+        let avgdl = if n > 0.0 { total_len / n } else { 0.0 };
+        let mut scores: HashMap<PointId, f64> = HashMap::new();
+        for (&feature, &q) in query.indices.iter().zip(&query.values) {
+            let Some(posting) = inner.postings.get(&feature) else {
                 continue;
             };
-            let df = posting.entries.len() as f32;
-            if df == 0.0 {
-                continue;
-            }
-            // Standard BM25 IDF variant with +1 smoothing.
-            let idf = ((n as f32 - df + 0.5) / (df + 0.5) + 1.0).ln();
-            for &(doc, tf) in &posting.entries {
-                let dl = inner.doc_lens[doc as usize].max(1e-6);
-                let denom = tf + k1 * (1.0 - b + b * dl / avgdl.max(1e-6));
-                let contribution = q_value * idf * (tf * (k1 + 1.0)) / denom;
-                *scores.entry(doc).or_insert(0.0) += contribution;
+            let df = posting.len() as f64;
+            let idf = ((n - df + 0.5) / (df + 0.5)).ln_1p();
+            for (&id, &value) in posting.iter() {
+                if !eligible(id) {
+                    continue;
+                }
+                let tf = f64::from(value);
+                let contribution = match bm25 {
+                    Some((k1, b)) => {
+                        let dl = inner.documents[&id].length;
+                        let denom = tf + k1 * (1.0 - b + b * dl / avgdl);
+                        f64::from(q) * idf * tf * (k1 + 1.0) / denom
+                    }
+                    None => f64::from(q) * tf,
+                };
+                *scores.entry(id).or_default() += contribution;
             }
         }
-        let mut ranked: Vec<_> = scores
-            .into_iter()
-            .map(|(local, score)| (inner.local_to_id[local as usize], score))
-            .collect();
-        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        ranked.truncate(top_k);
-        ranked
+        let mut ranked = Vec::with_capacity(scores.len());
+        for (id, score) in scores {
+            if !score.is_finite() || score > f64::from(f32::MAX) {
+                return Err(SparseError::Overflow);
+            }
+            ranked.push((id, score as f32));
+        }
+        let order = |a: &(PointId, f32), b: &(PointId, f32)| {
+            b.1.total_cmp(&a.1).then_with(|| tie_break(a.0, b.0))
+        };
+        if ranked.len() > top_k {
+            ranked.select_nth_unstable_by(top_k, order);
+            ranked.truncate(top_k);
+        }
+        ranked.sort_unstable_by(order);
+        Ok(ranked)
     }
 }
 
@@ -233,57 +328,187 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dot_scores_and_ranks_correctly() {
+    fn canonicalization_validation_and_atomic_replacement() {
         let idx = SparseIndex::new();
-        idx.upsert(1, &SparseVector::from_pairs([(0, 1.0), (2, 1.0)]));
-        idx.upsert(2, &SparseVector::from_pairs([(0, 2.0), (5, 1.0)]));
-        idx.upsert(3, &SparseVector::from_pairs([(2, 3.0), (5, 1.0)]));
-        // Query is [0: 1.0, 2: 1.0]. Doc 1 shares both (score 1+1=2),
-        // doc 3 shares only 2 (score 3), doc 2 shares only 0 (score 2).
-        // Expected order: 3 (3.0), 1 (2.0), 2 (2.0) — tie broken by id.
-        let query = SparseVector::from_pairs([(0, 1.0), (2, 1.0)]);
-        let hits = idx.search_dot(&query, 10);
-        assert_eq!(hits[0].0, 3);
-        assert!((hits[0].1 - 3.0).abs() < 1e-6);
-        assert_eq!(hits[1].0, 1);
-        assert_eq!(hits[2].0, 2);
+        let vector = SparseVector::from_pairs([(u32::MAX, 1.0), (2, 1.0), (2, 2.0), (3, 0.0)]);
+        let canonical = vector.canonicalized().unwrap();
+        assert_eq!(
+            canonical,
+            SparseVector::from_pairs([(2, 3.0), (u32::MAX, 1.0)])
+        );
+        idx.upsert(1, &vector).unwrap();
+        idx.upsert(2, &canonical).unwrap();
+        assert_eq!(idx.inner.read().unwrap().postings.len(), 2);
+        assert_eq!(
+            idx.search_dot(&vector, 10).unwrap(),
+            vec![(1, 10.0), (2, 10.0)]
+        );
+        assert_eq!(
+            idx.search_dot_filtered_by(&vector, 1, |_| true, |a, b| b.cmp(&a))
+                .unwrap()[0]
+                .0,
+            2
+        );
+        assert_eq!(
+            idx.search_bm25_filtered_by(&vector, 1, 1.2, 0.75, |_| true, |a, b| b.cmp(&a))
+                .unwrap()[0]
+                .0,
+            2
+        );
+        for invalid in [
+            SparseVector {
+                indices: vec![1],
+                values: vec![],
+            },
+            SparseVector::from_pairs([(2, f32::NAN)]),
+            SparseVector::from_pairs([(2, f32::INFINITY)]),
+            SparseVector::from_pairs([(2, -1.0)]),
+            SparseVector::from_pairs([(2, f32::MAX), (2, f32::MAX)]),
+        ] {
+            assert!(idx.upsert(1, &invalid).is_err());
+            assert!(idx.search_dot(&invalid, 10).is_err());
+            assert_eq!(
+                idx.search_dot(&vector, 10).unwrap(),
+                vec![(1, 10.0), (2, 10.0)]
+            );
+        }
+        let huge = SparseVector::from_pairs([(7, f32::MAX)]);
+        idx.upsert(3, &huge).unwrap();
+        assert_eq!(idx.search_dot(&huge, 1), Err(SparseError::Overflow));
     }
 
     #[test]
-    fn bm25_favors_rare_terms() {
+    fn replacement_deletion_filter_and_independent_snapshot() {
         let idx = SparseIndex::new();
-        // Term 0 appears in every doc — common word.
-        // Term 100 appears only in doc 3 — rare word.
-        idx.upsert(1, &SparseVector::from_pairs([(0, 5.0)]));
-        idx.upsert(2, &SparseVector::from_pairs([(0, 5.0)]));
-        idx.upsert(3, &SparseVector::from_pairs([(0, 1.0), (100, 1.0)]));
-        // Query includes both terms.
-        let query = SparseVector::from_pairs([(0, 1.0), (100, 1.0)]);
-        let hits = idx.search_bm25(&query, 10, 1.2, 0.75);
-        // Doc 3 must rank first because of the rare term contribution.
-        assert_eq!(hits[0].0, 3);
+        idx.upsert(1, &SparseVector::from_pairs([(0, 10.0)]))
+            .unwrap();
+        idx.upsert(2, &SparseVector::from_pairs([(0, 2.0)]))
+            .unwrap();
+        let snapshot = idx.clone();
+        let query = SparseVector::from_pairs([(0, 1.0)]);
+        assert_eq!(
+            idx.search_dot_filtered(&query, 1, |id| id == 2).unwrap(),
+            vec![(2, 2.0)]
+        );
+        idx.upsert(1, &SparseVector::from_pairs([(5, 1.0)]))
+            .unwrap();
+        assert_eq!(idx.search_dot(&query, 10).unwrap(), vec![(2, 2.0)]);
+        assert!(idx.delete(2));
+        assert!(!idx.delete(2));
+        assert!(idx.search_dot(&query, 10).unwrap().is_empty());
+        assert_eq!(
+            snapshot.search_dot(&query, 10).unwrap(),
+            vec![(1, 10.0), (2, 2.0)]
+        );
+        idx.upsert(2, &query).unwrap();
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx.search_dot(&query, 10).unwrap(), vec![(2, 1.0)]);
+        assert!(idx.delete(1));
+        assert!(idx.delete(2));
+        let inner = idx.inner.read().unwrap();
+        assert!(inner.postings.is_empty());
+        assert!(inner.length_bins.is_empty());
     }
 
     #[test]
-    fn upsert_replaces_previous_contribution() {
+    fn bm25_matches_independent_oracle_after_mutations() {
         let idx = SparseIndex::new();
-        idx.upsert(1, &SparseVector::from_pairs([(0, 10.0)]));
-        idx.upsert(1, &SparseVector::from_pairs([(5, 1.0)]));
-        // Query on term 0 must find nothing (doc 1's term-0 contribution
-        // was removed by the upsert overwrite).
-        let hits = idx.search_dot(&SparseVector::from_pairs([(0, 1.0)]), 10);
-        assert!(hits.is_empty());
-        // Query on term 5 must find doc 1.
-        let hits = idx.search_dot(&SparseVector::from_pairs([(5, 1.0)]), 10);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, 1);
+        let mut corpus: HashMap<u64, [f64; 4]> = HashMap::new();
+        let query = SparseVector::from_pairs([(0, 1.0), (2, 0.5), (3, 1.0)]);
+        for step in 0..80u64 {
+            let id = step * 7 % 11;
+            if step % 4 == 3 {
+                assert_eq!(idx.delete(id), corpus.remove(&id).is_some());
+            } else {
+                let counts = std::array::from_fn(|term| ((step + term as u64 * 3) % 6) as f64);
+                corpus.insert(id, counts);
+                idx.upsert(
+                    id,
+                    &SparseVector::from_pairs(
+                        counts
+                            .iter()
+                            .enumerate()
+                            .map(|(term, &tf)| (term as u32, tf as f32)),
+                    ),
+                )
+                .unwrap();
+            }
+            let n = corpus.len() as f64;
+            let avgdl = corpus.values().flatten().sum::<f64>() / n;
+            let k1 = f64::from(1.2f32);
+            let mut expected = Vec::new();
+            for (&doc, counts) in &corpus {
+                if doc % 2 != 0 {
+                    continue;
+                }
+                let dl = counts.iter().sum::<f64>();
+                let mut score = 0.0;
+                for (term, q) in [(0, 1.0), (2, 0.5), (3, 1.0)] {
+                    if counts[term] == 0.0 {
+                        continue;
+                    }
+                    let df = corpus.values().filter(|counts| counts[term] > 0.0).count() as f64;
+                    let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+                    score += q * idf * (counts[term] * (k1 + 1.0))
+                        / (counts[term] + k1 * (0.25 + 0.75 * dl / avgdl));
+                }
+                if score > 0.0 {
+                    expected.push((doc, score as f32));
+                }
+            }
+            expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            expected.truncate(3);
+            let actual = idx
+                .search_bm25_filtered(&query, 3, 1.2, 0.75, |id| id % 2 == 0)
+                .unwrap();
+            assert_eq!(
+                actual.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+                expected.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+                "step {step}"
+            );
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!(
+                    (actual.1 - expected.1).abs() < 1e-6,
+                    "step {step}: {actual:?} vs {expected:?}"
+                );
+            }
+        }
+        assert!(idx.search_bm25(&query, 3, -1.0, 0.75).is_err());
+        assert!(idx.search_bm25(&query, 3, 1.2, f32::NAN).is_err());
+        assert!(idx.search_dot(&SparseVector::new(), 10).unwrap().is_empty());
+        assert!(
+            SparseIndex::new()
+                .search_bm25(&query, 10, 1.2, 0.75)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
-    fn empty_query_or_index_returns_empty() {
-        let idx = SparseIndex::new();
-        assert!(idx.search_dot(&SparseVector::new(), 10).is_empty());
-        idx.upsert(1, &SparseVector::from_pairs([(0, 1.0)]));
-        assert!(idx.search_dot(&SparseVector::new(), 10).is_empty());
+    fn deleting_large_documents_preserves_small_document_lengths() {
+        let index = SparseIndex::new();
+        let weights = [f32::MAX, 1e16, 1.0, f32::MIN_POSITIVE];
+        let query = SparseVector::from_pairs([(0, 1.0)]);
+        for (id, &weight) in weights.iter().enumerate() {
+            index
+                .upsert(id as u64, &SparseVector::from_pairs([(0, weight)]))
+                .unwrap();
+        }
+        // Three separated scales defeat both ordinary f64 summation and a
+        // two-part compensated total when large documents are removed first.
+        for removed in 0..weights.len() {
+            assert!(index.delete(removed as u64));
+            let rebuilt = SparseIndex::new();
+            for (id, &weight) in weights.iter().enumerate().skip(removed + 1) {
+                rebuilt
+                    .upsert(id as u64, &SparseVector::from_pairs([(0, weight)]))
+                    .unwrap();
+            }
+            assert_eq!(
+                index.search_bm25(&query, 10, 1.2, 0.75).unwrap(),
+                rebuilt.search_bm25(&query, 10, 1.2, 0.75).unwrap()
+            );
+        }
+        assert!(index.inner.read().unwrap().length_bins.is_empty());
     }
 }

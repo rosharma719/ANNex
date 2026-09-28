@@ -9,11 +9,24 @@ from unittest.mock import patch
 
 import numpy as np
 from data import load_slice
-from embeddings import cached_fixed, cached_ragged, ragged_fingerprint
-from measurement import Journal, summarize
+from embeddings import (
+    cached_fixed,
+    cached_ragged,
+    fixed_fingerprint,
+    ragged_fingerprint,
+)
+from measurement import Journal, evaluate, summarize
 
 
 class MeasurementTests(unittest.TestCase):
+    def test_trec_linear_gains_and_full_recall_denominator(self):
+        result = evaluate({"q": {"a": 1, "b": 2}}, {"q": ["a", "b"]})
+        self.assertAlmostEqual(result["ndcg@10"], 0.8597186998521972)
+        self.assertEqual(result["mrr@10"], 1.0)
+        self.assertEqual(result["recall@100"], 1.0)
+        missing = evaluate({"q": {"a": 1, "b": 2}}, {"q": ["a"]})
+        self.assertEqual(missing["recall@20"], 0.5)
+
     def setUp(self):
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
 
@@ -49,6 +62,10 @@ class MeasurementTests(unittest.TestCase):
                     self.assertEqual(
                         ragged_fingerprint(*args, {})["files_sha256"],
                         info["files_sha256"],
+                    )
+                else:
+                    self.assertEqual(
+                        fixed_fingerprint(*args)["files_sha256"], info["files_sha256"]
                     )
                 with (Path(info["path"]) / "values.npy").open("r+b") as file:
                     file.seek(-1, 2)

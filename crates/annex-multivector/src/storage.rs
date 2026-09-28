@@ -55,6 +55,29 @@ impl FixedVectorStore {
             checksum: Some(*blake3::hash(bytes).as_bytes()),
         })
     }
+    pub fn copy_record(
+        &self,
+        source: &[u8],
+        location: ObjectLocation,
+    ) -> io::Result<ObjectLocation> {
+        // Compaction must preserve integrity rather than assign a fresh digest
+        // to already-corrupted source bytes. Legacy records gain digests on open.
+        verify_record(source, location, true)?;
+        let bytes = record_bytes(source, location)?;
+        let mut file = self.writer.lock().unwrap();
+        let length = file.metadata()?.len();
+        let padding = (4 - length % 4) % 4;
+        file.write_all(&[0; 3][..padding as usize])?;
+        let offset = length
+            .checked_add(padding)
+            .ok_or_else(|| invalid("offset overflow"))?;
+        append_record(&mut file, bytes, "compact_partial_write")?;
+        Ok(ObjectLocation {
+            offset,
+            length: bytes.len() as u64,
+            checksum: Some(*blake3::hash(bytes).as_bytes()),
+        })
+    }
     pub fn len(&self) -> io::Result<u64> {
         Ok(self.writer.lock().unwrap().metadata()?.len())
     }
@@ -92,7 +115,7 @@ impl FixedVectorStore {
 }
 
 /// Append-only, contiguous PLAID residual segment. Superseded records are
-/// reclaimed by a future compaction rather than creating per-document files.
+/// reclaimed by compaction rather than creating per-document files.
 pub struct CompressedVectorStore {
     path: PathBuf,
     writer: Mutex<File>,
@@ -180,6 +203,29 @@ impl CompressedVectorStore {
             },
             bytes.len() as u64,
         ))
+    }
+    pub fn copy_record(
+        &self,
+        source: &[u8],
+        location: ObjectLocation,
+    ) -> io::Result<ObjectLocation> {
+        // Compaction must preserve integrity rather than assign a fresh digest
+        // to already-corrupted source bytes. Legacy records gain digests on open.
+        verify_record(source, location, true)?;
+        let bytes = record_bytes(source, location)?;
+        let mut file = self.writer.lock().unwrap();
+        let length = file.metadata()?.len();
+        let padding = (4 - length % 4) % 4;
+        file.write_all(&[0; 3][..padding as usize])?;
+        let offset = length
+            .checked_add(padding)
+            .ok_or_else(|| invalid("offset overflow"))?;
+        append_record(&mut file, bytes, "compact_partial_write")?;
+        Ok(ObjectLocation {
+            offset,
+            length: bytes.len() as u64,
+            checksum: Some(*blake3::hash(bytes).as_bytes()),
+        })
     }
     pub fn len(&self) -> io::Result<u64> {
         Ok(self.writer.lock().unwrap().metadata()?.len())

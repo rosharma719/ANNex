@@ -113,3 +113,57 @@ ANNEX_TEST_BINARY=target/debug/annex-multivector \
 Tests need NumPy; they do not download models or datasets. The real-server tests
 check HTTP validation, delete/reopen behavior, exact/ANN execution and scalar
 fixture scores. CI supplies the binary; local runs without it skip those tests.
+
+## Dense, lexical, and hybrid quality comparisons
+
+`quality.py` evaluates full NFCorpus (3,633 documents), SciFact (5,183), and
+ArguAna (8,674), with the same pinned MiniLM vectors for every engine. Each
+engine runs exact cosine, BM25, and RRF with 100 candidates per channel. The
+primary metric is nDCG@10; Recall@10/20/100, MRR@10, and paired bootstrap intervals
+are retained. No strategy is selected per test query or per test corpus.
+
+Install `lancedb==0.39.0` in the benchmark environment. Download the native
+Qdrant Server 1.19.1 binary for your platform from its official release; pass
+its path explicitly. This runner owns isolated local server/index directories,
+uses loopback, and records the binary digest. It does not use Qdrant client-local
+emulation. From the workspace root, for each of the three dataset names:
+
+```sh
+python crates/annex-multivector/benchmark/quality.py \
+  --dataset beir/nfcorpus/test --prepare
+python crates/annex-multivector/benchmark/quality.py \
+  --dataset beir/nfcorpus/test --qdrant-binary /path/to/qdrant \
+  --output benchmark/results/nfcorpus-dev
+# Repeat the same arguments with --freeze-config /path/to/nfcorpus.json,
+# then --partition test --frozen-config /path/to/nfcorpus.json and a fresh output.
+```
+
+Use `--engines annex` for the ANNex-only ablation. Complete the release build
+before freezing; source, binary, dependencies, cache bytes, and settings must
+remain unchanged throughout evaluation. Fingerprints are checked before arrays
+are loaded or servers started. The deterministic split cannot undo historical
+exposure to these public datasets, including prior ANNex experiments.
+
+Qdrant uses explicit BM25 sparse weights with ANNex's tokenizer and parameters,
+then its native sparse search and RRF. LanceDB uses native FTS defaults including
+English stemming, stop words, and ASCII folding; its lexical/hybrid rows are a
+system comparison, not evidence of identical scoring. Qdrant's zero-based RRF
+`k=61` matches ANNex/LanceDB's one-based `k=60`. Query-self documents are excluded
+before ranking in all engines. Native tie orders can still differ.
+
+ANNex and Qdrant use HTTP; LanceDB is embedded. Timings include those different
+interfaces, follow a fixed serial order without warmup, and exclude embedding
+costs. They do not establish an engine speed ranking. Ingest timing and disk
+bytes after build are recorded; durability, batching, and index layouts differ.
+These runs do not measure peak RAM, offered load, generated-answer correctness,
+large-corpus performance, or launch readiness.
+
+Optional real-adapter tests use `QDRANT_TEST_BINARY=/path/to/qdrant` and installed
+LanceDB alongside `ANNEX_TEST_BINARY`. The normal CI suite skips unavailable
+competitors and runs the ANNex adapter against a real server.
+
+nDCG uses linear qrel gains, matching
+[BEIR's evaluator](https://github.com/beir-cellar/beir/blob/main/beir/retrieval/evaluation.py)
+and [trec_eval](https://github.com/usnistgov/trec_eval/blob/main/m_ndcg_cut.c).
+The first comparison's per-query metrics were independently checked against
+`pytrec_eval`; earlier exponential-gain outputs are identified in RESULTS.md.

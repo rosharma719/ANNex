@@ -8,10 +8,10 @@ import urllib.request
 from contextlib import contextmanager
 
 
-def http(base, route, body=None, timeout=600):
+def http(base, route, body=None, timeout=600, *, method=None):
     data = None if body is None else json.dumps(body, allow_nan=False).encode()
     request = urllib.request.Request(
-        base + route, data, {"content-type": "application/json"}
+        base + route, data, {"content-type": "application/json"}, method=method
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Durable hybrid retrieval with named dense/sparse/multivector fields, metadata
+  predicates, BM25/RRF, optional MaxSim reranking and context selection.
+- Independent collection namespaces and named dense ANN graphs.
+- Python/NumPy snapshot search with validated inputs, GIL release, and threaded
+  batches; Linux/macOS CI installs and tests the built wheel.
+- Immutable query generations with retained mappings, sealed vector segments
+  and live-record compaction. Format-3 manifests remain readable by this version
+  alongside formats 1/2; older binaries reject newly written format-3 indexes.
+
 - **Multi-entry L0 seeds** (`SearchRuntimeOptions::num_entry_seeds`): after the
   upper-layer greedy descent, run a small BFS at L1 to collect N candidate entry
   points and seed all of them into the L0 search. Reduces sensitivity to routing
@@ -45,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedding caches verify file checksums. Diagnostic corpus slices preserve
   original relevance denominators and avoid materializing the full source prefix.
 - CI exercises the actual HTTP process alongside the retrieval/transaction oracles.
+- Full-corpus dense/BM25/hybrid comparisons against native Qdrant Server and
+  LanceDB retain every query and freeze configuration before test evaluation.
+- Shared nDCG evaluation now uses BEIR/trec_eval linear relevance gains.
 - Release the directory lock explicitly on index drop so inherited/duplicated
   descriptors cannot delay reopening; the existing lock test covers this case.
 

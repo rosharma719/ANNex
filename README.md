@@ -7,12 +7,12 @@ ANNex is a Rust workspace for vector and late-interaction retrieval.
 | Component | Purpose | Documentation |
 | --- | --- | --- |
 | `annex-core` | HNSW, payload filters, sparse retrieval primitives, snapshots and WAL | [Rust API](crates/annex-core/src/lib.rs), [operations](docs/operations.md) |
-| `annex-multivector` | Persistent token-vector retrieval with MUVERA candidates, compressed MaxSim and an HTTP API | [API and quickstart](crates/annex-multivector/README.md), [durability](docs/multivector-durability.md) |
+| `annex-multivector` | Persistent hybrid retrieval, named vector fields, filtered context selection and an HTTP API | [API and quickstart](crates/annex-multivector/README.md), [durability](docs/multivector-durability.md) |
 | `annex-server` | Dense-vector HTTP benchmark adapter | [source](crates/annex-server/src/bin/dense_server.rs) |
+| `annex-py` | Native Python/NumPy snapshot search and threaded batches | [Python installation and API](python/annex-py/README.md) |
 
-The core library's payload filters and sparse primitives are not yet exposed by
-the multivector API. Embeddings are supplied by the caller. Deployment limits and
-remaining launch work are tracked in the [implementation plan](docs/launch-verification-plan.md).
+Embeddings are supplied by the caller. Deployment limits and remaining launch
+work are tracked in the [implementation plan](docs/launch-verification-plan.md).
 
 ## Build and use
 

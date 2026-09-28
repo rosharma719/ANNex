@@ -4,6 +4,7 @@ members = [
     "crates/annex-core",
     "crates/annex-multivector",
     "crates/annex-server",
+    "python/annex-py",
 ]
 
 [profile.release]

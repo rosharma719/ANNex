@@ -85,6 +85,97 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(result["stats"]["candidate_backend"], "muvera")
             self.assertEqual([hit["id"] for hit in result["matches"]], ["b"])
 
+    def test_collection_hybrid_named_ann_and_compaction_lifecycle(self):
+        def route(name, operation):
+            return f"/v1/collections/{name}/{operation}"
+
+        query = {
+            "prefetch": [
+                {"kind": "dense", "field": "semantic", "vector": [1, 0], "limit": 10},
+                {"kind": "bm25", "text": "E123", "limit": 10},
+            ],
+            "limit": 2,
+        }
+        with annex_server(self.binary, self.root, 2) as base:
+            for name, text in [("a", "E123 repair"), ("b", "different")]:
+                http(
+                    base, "/v1/collections", {"name": name, "config": {"dimension": 2}}
+                )
+                http(
+                    base,
+                    route(name, "vectors/upsert"),
+                    {
+                        "documents": [
+                            {
+                                "id": "shared",
+                                "text": text,
+                                "metadata": {"tenant": name},
+                                "representations": {
+                                    "semantic": {"kind": "dense", "vector": [1, 0]}
+                                },
+                            }
+                        ]
+                    },
+                )
+            self.assertEqual(http(base, "/v1/stats")["documents"], 0)
+            for name in ("a", "b"):
+                result = http(base, route(name, "retrieve"), query)
+                self.assertEqual(result["matches"][0]["metadata"]["tenant"], name)
+            http(
+                base,
+                route("a", "dense/index"),
+                {"field": "semantic", "m": 4, "ef_construct": 16},
+            )
+            result = http(base, route("a", "retrieve"), query)
+            self.assertEqual(result["trace"]["channels"][0]["backend"], "hnsw_dense")
+            http(base, route("a", "compact"), {})
+            self.assertEqual(
+                http(base, route("a", "retrieve"), query)["matches"], result["matches"]
+            )
+            for body in [
+                {**query, "made_up": True},
+                {
+                    **query,
+                    "filter": {"op": "range", "field": "year", "gte": 2, "lte": 1},
+                },
+                {
+                    **query,
+                    "prefetch": [{"kind": "dense", "field": "semantic", "vector": [1]}],
+                },
+                {
+                    **query,
+                    "prefetch": [
+                        {
+                            "kind": "sparse",
+                            "field": "semantic",
+                            "vector": {"indices": [1], "values": []},
+                        }
+                    ],
+                },
+            ]:
+                with self.assertRaisesRegex(RuntimeError, "HTTP 4"):
+                    http(base, route("a", "retrieve"), body)
+            with self.assertRaisesRegex(RuntimeError, "HTTP 4"):
+                http(
+                    base,
+                    "/v1/collections",
+                    {"name": "../escape", "config": {"dimension": 2}},
+                )
+        with annex_server(self.binary, self.root, 2) as base:
+            self.assertEqual(http(base, "/v1/collections")["collections"], ["a", "b"])
+            result = http(base, route("a", "retrieve"), query)
+            self.assertEqual(result["trace"]["channels"][0]["backend"], "exact_dense")
+            http(base, route("a", "vectors/delete"), {"id": "shared"})
+            self.assertEqual(
+                http(
+                    base,
+                    route("a", "retrieve"),
+                    {"prefetch": [{"kind": "bm25", "text": "E123"}]},
+                )["matches"],
+                [],
+            )
+            self.assertEqual(http(base, route("b", "stats"))["documents"], 1)
+
     def test_real_adapters_report_backend_build_cost_and_scalar_order(self):
         docs = [NS(doc_id="a"), NS(doc_id="b")]
         queries = [NS(query_id="q")]

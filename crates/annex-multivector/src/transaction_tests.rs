@@ -83,7 +83,10 @@ fn every_precommit_failure_preserves_memory_disk_and_ann() {
         index.build_fde_ann(4, 16).unwrap();
         let before = index.stats();
         let manifest = fs::read(dir.path().join("manifest.json")).unwrap();
-        let boundaries = (index.objects.len().unwrap(), index.fde_store.len().unwrap());
+        let boundaries = (
+            index.snapshot().stores.objects.len().unwrap(),
+            index.snapshot().stores.fde.len().unwrap(),
+        );
         // Append faults happen on the second document: the first was fully staged.
         FAIL_COMMIT.with(|f| {
             f.set(Some((
@@ -118,8 +121,8 @@ fn every_precommit_failure_preserves_memory_disk_and_ann() {
         assert_eq!(restored.stats().generation, before.generation);
         assert_eq!(
             (
-                restored.objects.len().unwrap(),
-                restored.fde_store.len().unwrap()
+                restored.snapshot().stores.objects.len().unwrap(),
+                restored.snapshot().stores.fde.len().unwrap()
             ),
             boundaries
         );
@@ -286,7 +289,7 @@ fn fde_encoding_version_survives_legacy_reopen_and_future_writes() {
     restored.upsert("new", tokens, json!(1)).unwrap();
     let hits = restored.exact_fde_candidates(&query, 2).unwrap();
     assert!(hits.iter().all(|hit| hit.score == expected));
-    let stored = restored.fde_store.map().unwrap();
+    let stored = restored.snapshot().stores.fde.map().unwrap();
     let state = restored.state.read().unwrap();
     for record in state.documents.values() {
         assert_eq!(
@@ -315,11 +318,14 @@ fn ann_candidates_preserve_raw_inner_product_ranking() {
     let mut b = vec![0.; a.len()];
     b[0] = 1.;
     {
-        let mut state = index.state.write().unwrap();
-        let mut next = state.clone();
-        next.documents.get_mut("a").unwrap().fde_location = index.fde_store.put(&a).unwrap();
-        next.documents.get_mut("b").unwrap().fde_location = index.fde_store.put(&b).unwrap();
-        index.commit(&mut state, next).unwrap();
+        let _writer = index.writer.lock().unwrap();
+        let state = index.snapshot();
+        let mut next = (*state).clone();
+        next.documents.get_mut("a").unwrap().fde_location =
+            index.snapshot().stores.fde.put(&a).unwrap();
+        next.documents.get_mut("b").unwrap().fde_location =
+            index.snapshot().stores.fde.put(&b).unwrap();
+        index.commit(&state, next).unwrap();
     }
     index.build_fde_ann(4, 16).unwrap();
     let state = index.state.read().unwrap();
@@ -794,7 +800,7 @@ fn generation_never_wraps_and_duplicate_batch_ids_are_last_wins() {
     index.upsert_batch(vec![doc("a", 1), doc("a", 2)]).unwrap();
     assert_eq!(index.stats().generation, generation + 1);
     assert_eq!(versions(&index)[0].1, json!(2));
-    index.state.write().unwrap().generation = u64::MAX;
+    Arc::make_mut(&mut index.state.write().unwrap()).generation = u64::MAX;
     assert!(index.upsert_batch(vec![doc("new", 3)]).is_err());
     assert_eq!(index.stats().generation, u64::MAX);
     assert_eq!(index.stats().documents, 2);
@@ -816,4 +822,314 @@ fn missing_manifest_does_not_destroy_existing_segments() {
     fs::remove_file(dir.path().join("manifest.json")).unwrap();
     assert!(MultiVectorIndex::open(dir.path(), config()).is_err());
     assert_eq!(fs::read(object_path).unwrap(), before);
+}
+
+#[test]
+fn sealing_after_failed_append_preserves_committed_map_boundaries() {
+    for stage in [
+        "object_partial_write",
+        "fde_partial_write",
+        "manifest_written",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let index = baseline(directory.path());
+        index.build_fde_ann(4, 16).unwrap();
+        let before = index.snapshot();
+        let expected = versions(&index);
+        let expected_fde = index.exact_fde_candidates(&[vec![1., 0., 0.]], 10).unwrap();
+        FAIL_COMMIT.with(|fault| fault.set(Some((stage, 1))));
+        assert!(
+            index
+                .upsert_batch(vec![doc("a", 1), doc("new", 1)])
+                .is_err(),
+            "{stage}"
+        );
+        index.seal().unwrap();
+        let sealed = index.snapshot();
+        let segment = &sealed.sealed[&before.stores.id.unwrap_or(0)];
+        assert!(
+            segment.bounds.objects as usize <= segment.objects.as_deref().map_or(0, |m| m.len()),
+            "object map shorter than sealed boundary after {stage}"
+        );
+        assert!(
+            segment.bounds.fde as usize <= segment.fde.as_deref().map_or(0, |m| m.len()),
+            "FDE map shorter than sealed boundary after {stage}"
+        );
+        assert_eq!(versions(&index), expected, "{stage}");
+        assert_eq!(
+            index.exact_fde_candidates(&[vec![1., 0., 0.]], 10).unwrap(),
+            expected_fde
+        );
+        assert!(index.hnsw_ready());
+        let envelope: ManifestEnvelope =
+            serde_json::from_slice(&fs::read(directory.path().join("manifest.json")).unwrap())
+                .unwrap();
+        let manifest: Manifest = serde_json::from_str(&envelope.manifest).unwrap();
+        let persisted = &manifest
+            .sealed
+            .iter()
+            .find(|(id, _)| *id == before.stores.id.unwrap_or(0))
+            .unwrap()
+            .1;
+        assert_eq!(persisted.objects, segment.bounds.objects);
+        assert_eq!(persisted.fde, segment.bounds.fde);
+        drop(sealed);
+        drop(before);
+        drop(index);
+        let restored = MultiVectorIndex::open(directory.path(), config()).unwrap();
+        assert_eq!(versions(&restored), expected);
+        restored.upsert_batch(vec![doc("after-seal", 2)]).unwrap();
+        assert_eq!(restored.stats().documents, 3);
+    }
+}
+
+#[test]
+fn sealed_active_legacy_segment_alias_is_rejected_before_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    drop(baseline(directory.path()));
+    let object_path = directory.path().join("objects/vectors.plaid");
+    let fde_path = directory.path().join("fde/fde.bin");
+    let objects = fs::read(&object_path).unwrap();
+    let fdes = fs::read(&fde_path).unwrap();
+    let path = directory.path().join("manifest.json");
+    let mut envelope: ManifestEnvelope = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut manifest: Manifest = serde_json::from_str(&envelope.manifest).unwrap();
+    assert!(manifest.storage_generation.is_none());
+    manifest
+        .sealed
+        .push((0, SegmentBoundaries { objects: 0, fde: 0 }));
+    envelope.manifest = serde_json::to_string(&manifest).unwrap();
+    envelope.checksum_blake3 = blake3::hash(envelope.manifest.as_bytes())
+        .to_hex()
+        .to_string();
+    fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+    assert!(MultiVectorIndex::open(directory.path(), config()).is_err());
+    assert_eq!(
+        fs::read(&object_path).unwrap(),
+        objects,
+        "invalid manifest truncated committed objects"
+    );
+    assert_eq!(
+        fs::read(&fde_path).unwrap(),
+        fdes,
+        "invalid manifest truncated committed FDEs"
+    );
+}
+
+#[test]
+fn compaction_aborts_when_a_writer_publishes_after_its_snapshot() {
+    use std::time::{Duration, Instant};
+
+    let directory = tempfile::tempdir().unwrap();
+    let index = baseline(directory.path());
+    index.build_fde_ann(4, 16).unwrap();
+    // Holding the writer mutex makes publication order deterministic while the
+    // compactor is free to snapshot and copy. Creating its target directory
+    // proves it has already captured the previous document generation.
+    let writer = index.writer.lock().unwrap();
+    std::thread::scope(|scope| {
+        let compaction = scope.spawn(|| index.compact());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let copying = fs::read_dir(directory.path().join("segments"))
+                .is_ok_and(|mut entries| entries.next().is_some());
+            if copying {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "compaction did not begin copying outside the writer mutex"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let current = index.snapshot();
+        let mut next = (*current).clone();
+        // Publish a metadata-only document update through the same commit
+        // protocol used by normal writers, while we already hold their mutex.
+        next.documents.get_mut("a").unwrap().metadata = json!(7);
+        index.commit(&current, next).unwrap();
+        drop(writer);
+        let result = compaction.join().unwrap();
+        assert!(
+            matches!(result, Err(IndexError::Invalid(message)) if message.contains("generation changed during compaction"))
+        );
+    });
+    assert_eq!(
+        versions(&index),
+        vec![("a".into(), json!(7)), ("b".into(), json!(0))]
+    );
+    assert!(index.hnsw_ready());
+    assert!(
+        fs::read_dir(directory.path().join("segments"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "aborted compaction leaked its target segment"
+    );
+    drop(index);
+    assert_eq!(
+        versions(&MultiVectorIndex::open(directory.path(), config()).unwrap()),
+        vec![("a".into(), json!(7)), ("b".into(), json!(0))]
+    );
+}
+
+#[test]
+fn segment_maintenance_crash_child() {
+    let Ok(path) = std::env::var("ANNEX_TEST_MAINTENANCE_ROOT") else {
+        return;
+    };
+    let index = MultiVectorIndex::open(path, config()).unwrap();
+    match std::env::var("ANNEX_TEST_MAINTENANCE_KIND")
+        .unwrap()
+        .as_str()
+    {
+        "compact" => {
+            index.compact().unwrap();
+        }
+        "seal" => index.seal().unwrap(),
+        kind => panic!("unexpected maintenance kind {kind}"),
+    }
+    panic!("child failed to reach requested maintenance crash boundary");
+}
+
+#[test]
+fn segment_maintenance_crashes_recover_one_complete_generation() {
+    for kind in ["seal", "compact"] {
+        for (stage, published) in [
+            ("compact_partial_write", false),
+            ("compaction_copied", false),
+            ("objects_synced", false),
+            ("fde_synced", false),
+            ("manifest_partial_write", false),
+            ("manifest_written", false),
+            ("manifest_synced", false),
+            ("manifest_renamed", true),
+            ("directory_synced", true),
+        ] {
+            if kind == "seal" && matches!(stage, "compact_partial_write" | "compaction_copied") {
+                continue;
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let index = baseline(directory.path());
+            index.seal().unwrap();
+            index.upsert_batch(vec![doc("a", 1), doc("c", 1)]).unwrap();
+            let before = index.stats();
+            let expected = versions(&index);
+            let query = [vec![1., 0., 0.]];
+            let fde = index.exact_fde_candidates(&query, 10).unwrap();
+            let scores: Vec<_> = expected
+                .iter()
+                .map(|(id, _)| (id.clone(), index.score_compressed(&query, id).unwrap()))
+                .collect();
+            drop(index);
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "engine::transaction_tests::segment_maintenance_crash_child",
+                    "--nocapture",
+                ])
+                .env("ANNEX_TEST_MAINTENANCE_ROOT", directory.path())
+                .env("ANNEX_TEST_MAINTENANCE_KIND", kind)
+                .env("ANNEX_TEST_CRASH_STAGE", stage)
+                .output()
+                .unwrap();
+            assert_eq!(
+                child.status.code(),
+                Some(86),
+                "{kind}/{stage}: {}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            let restored = MultiVectorIndex::open(directory.path(), config()).unwrap();
+            assert_eq!(
+                restored.stats().generation,
+                before.generation + u64::from(published),
+                "{kind}/{stage}"
+            );
+            assert_eq!(versions(&restored), expected, "{kind}/{stage}");
+            assert_eq!(
+                restored.exact_fde_candidates(&query, 10).unwrap(),
+                fde,
+                "{kind}/{stage}"
+            );
+            for (id, score) in &scores {
+                assert_eq!(
+                    restored.score_compressed(&query, id).unwrap(),
+                    *score,
+                    "{kind}/{stage}/{id}"
+                );
+            }
+            let expected_segments = if !published {
+                before.storage_segments
+            } else if kind == "compact" {
+                1
+            } else {
+                before.storage_segments + 1
+            };
+            assert_eq!(
+                restored.stats().storage_segments,
+                expected_segments,
+                "{kind}/{stage}"
+            );
+            // Both the recovered append target and another compaction must be usable.
+            restored
+                .upsert_batch(vec![doc("after-maintenance", 3)])
+                .unwrap();
+            restored.compact().unwrap();
+            drop(restored);
+            let reopened = MultiVectorIndex::open(directory.path(), config()).unwrap();
+            assert_eq!(reopened.stats().documents, expected.len() + 1);
+            assert_eq!(reopened.stats().storage_segments, 1);
+        }
+    }
+}
+
+#[test]
+fn compaction_record_copy_rejects_corrupt_or_unchecked_sources_before_appending() {
+    let directory = tempfile::tempdir().unwrap();
+    let index = baseline(directory.path());
+    let state = index.snapshot();
+    let record = &state.documents["a"];
+    let target = tempfile::tempdir().unwrap();
+    let objects = CompressedVectorStore::new(target.path().join("objects")).unwrap();
+    let fdes = FixedVectorStore::new(target.path().join("fde")).unwrap();
+    for (source, location, object_record) in [
+        (state.record_objects(record), record.location, true),
+        (state.record_fde(record), record.fde_location, false),
+    ] {
+        let copy = |source: &[u8], location| {
+            if object_record {
+                objects.copy_record(source, location)
+            } else {
+                fdes.copy_record(source, location)
+            }
+        };
+        let length = || {
+            if object_record {
+                objects.len().unwrap()
+            } else {
+                fdes.len().unwrap()
+            }
+        };
+        // Copy owned test bytes so this never mutates a live memory mapping.
+        let mut corrupt = source.to_vec();
+        corrupt[location.offset as usize + location.length as usize - 1] ^= 1;
+        let error = copy(&corrupt, location).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(length(), 0, "corrupt bytes were appended before validation");
+        let mut unchecked = location;
+        unchecked.checksum = None;
+        assert_eq!(
+            copy(source, unchecked).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            length(),
+            0,
+            "unchecked bytes were appended before validation"
+        );
+        let copied = copy(source, location).unwrap();
+        assert_eq!(copied.checksum, location.checksum);
+        assert_eq!(copied.length, location.length);
+        assert_eq!(length(), location.length);
+    }
 }

@@ -24,10 +24,11 @@ def evaluate(qrels, run, k=10):
     rows = []
     for qid, relevant in qrels.items():
         ranked = run.get(qid, [])[:k]
-        gains = [relevant.get(doc, 0) for doc in ranked]
-        dcg = sum((2**gain - 1) / math.log2(i + 2) for i, gain in enumerate(gains))
-        ideal = sorted(relevant.values(), reverse=True)[:k]
-        idcg = sum((2**gain - 1) / math.log2(i + 2) for i, gain in enumerate(ideal))
+        # BEIR/trec_eval ndcg_cut uses the qrel grade itself as gain.
+        gains = [max(0, relevant.get(doc, 0)) for doc in ranked]
+        dcg = sum(gain / math.log2(i + 2) for i, gain in enumerate(gains))
+        ideal = sorted((max(0, grade) for grade in relevant.values()), reverse=True)[:k]
+        idcg = sum(gain / math.log2(i + 2) for i, gain in enumerate(ideal))
         wanted = {doc for doc, gain in relevant.items() if gain > 0}
         rows.append(
             {
@@ -36,13 +37,26 @@ def evaluate(qrels, run, k=10):
                 f"recall@{k}": len(wanted.intersection(ranked)) / len(wanted)
                 if wanted
                 else 0.0,
+                f"mrr@{k}": next(
+                    (1 / (i + 1) for i, doc in enumerate(ranked) if doc in wanted), 0.0
+                ),
+                **{
+                    f"recall@{depth}": len(
+                        wanted.intersection(run.get(qid, [])[:depth])
+                    )
+                    / len(wanted)
+                    if wanted
+                    else 0.0
+                    for depth in (20, 100)
+                },
             }
         )
     if not rows:
         raise ValueError("cannot evaluate an empty query set")
     result = {
         metric: statistics.fmean(row[metric] for row in rows)
-        for metric in (f"ndcg@{k}", f"recall@{k}")
+        for metric in rows[0]
+        if metric != "qid"
     }
     result["per_query"] = rows
     return result
@@ -157,6 +171,7 @@ def summarize(directory):
         elif kind == "index_ready":
             system["index"] = event["index"]
     output = {}
+    preparation = systems.pop("_preparation", {}).get("stages", {})
     for name, system in systems.items():
         rows = system.pop("rows")
         metrics = evaluate(
@@ -193,6 +208,7 @@ def summarize(directory):
         "queries": len(manifest["qrels"]),
         "protocol": manifest["protocol"],
         "systems": output,
+        "preparation": preparation,
     }
 
 

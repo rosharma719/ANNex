@@ -194,6 +194,14 @@ def cached_ragged(
     return RaggedEmbeddings(values, offsets), _info(path, key, identity, False)
 
 
+def fixed_fingerprint(root, model_id, role, ids, texts, normalized=True):
+    """Validate cache bytes before loading arrays or accepting a frozen run."""
+    identity = _identity(model_id, role, ids, texts, normalized)
+    path, _ = _location(Path(root), "fixed", identity)
+    manifest = _verified_manifest(path, identity, ["values.npy"])
+    return {"identity": identity, "files_sha256": manifest["files_sha256"]}
+
+
 def cached_fixed(root, model_id, role, ids, texts, encoder, normalized, refresh=False):
     identity = _identity(model_id, role, ids, texts, normalized=normalized)
     path, key = _location(Path(root), "fixed", identity)

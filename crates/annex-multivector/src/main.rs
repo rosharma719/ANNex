@@ -9,9 +9,13 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use multivector::{Durability, IndexConfig, IndexError, MultiVectorIndex, UpsertDocument};
+use multivector::{
+    Collections, Durability, IndexConfig, IndexError, MultiVectorIndex, RetrievalDocument,
+    RetrievalResponse, RetrieveRequest,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tower::ServiceExt;
 
 #[derive(Parser)]
 #[command(version)]
@@ -41,16 +45,8 @@ struct Args {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Document {
-    id: String,
-    vectors: Vec<Vec<f32>>,
-    #[serde(default = "null")]
-    metadata: Value,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct UpsertRequest {
-    documents: Vec<Document>,
+    documents: Vec<RetrievalDocument>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,9 +100,6 @@ struct BuildAnnRequest {
 }
 fn ten() -> usize {
     10
-}
-fn null() -> Value {
-    Value::Null
 }
 fn twenty() -> usize {
     20
@@ -167,25 +160,63 @@ async fn upsert(
     let mut values = 0;
     for document in &body.documents {
         bounded("document id bytes", document.id.len(), 4096)?;
-        bounded("document tokens", document.vectors.len(), 8192)?;
+        if !document.vectors.is_empty() {
+            bounded("document tokens", document.vectors.len(), 8192)?;
+        }
         tokens += document.vectors.len();
         values += document.vectors.iter().map(Vec::len).sum::<usize>();
     }
-    bounded("batch tokens", tokens, 131_072)?;
-    bounded("batch vector values", values, 16_777_216)?;
+    if tokens > 0 {
+        bounded("batch tokens", tokens, 131_072)?;
+    }
+    if values > 0 {
+        bounded("batch vector values", values, 16_777_216)?;
+    }
     let count = body.documents.len();
-    index.upsert_batch(
-        body.documents
-            .into_iter()
-            .map(|document| UpsertDocument {
-                id: document.id,
-                vectors: document.vectors,
-                metadata: document.metadata,
-            })
-            .collect(),
-    )?;
+    tokio::task::spawn_blocking(move || index.upsert_records(body.documents))
+        .await
+        .map_err(|e| ApiError(IndexError::Invalid(format!("ingest task failed: {e}"))))??;
     Ok(Json(json!({"upserted": count})))
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DenseAnnRequest {
+    field: String,
+    #[serde(default = "sixteen")]
+    m: usize,
+    #[serde(default = "two_fifty_six")]
+    ef_construct: usize,
+}
+async fn build_dense(
+    State(index): State<Arc<MultiVectorIndex>>,
+    Json(body): Json<DenseAnnRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let nodes = tokio::task::spawn_blocking(move || {
+        index.build_dense_ann(&body.field, body.m, body.ef_construct)
+    })
+    .await
+    .map_err(|e| ApiError(IndexError::Invalid(e.to_string())))??;
+    Ok(Json(json!({"nodes":nodes})))
+}
+
+async fn compact(State(index): State<Arc<MultiVectorIndex>>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        tokio::task::spawn_blocking(move || index.compact())
+            .await
+            .map_err(|e| ApiError(IndexError::Invalid(format!("compaction task failed: {e}"))))??,
+    ))
+}
+
+async fn retrieve(
+    State(index): State<Arc<MultiVectorIndex>>,
+    Json(body): Json<RetrieveRequest>,
+) -> Result<Json<RetrievalResponse>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || index.retrieve(&body))
+        .await
+        .map_err(|e| ApiError(IndexError::Invalid(format!("query task failed: {e}"))))??;
+    Ok(Json(result))
+}
+
 async fn query(
     State(index): State<Arc<MultiVectorIndex>>,
     Json(body): Json<QueryRequest>,
@@ -399,6 +430,67 @@ async fn candidates(
     Ok(Json(json!({"candidates": candidates})))
 }
 
+fn index_router(index: Arc<MultiVectorIndex>) -> Router {
+    Router::new()
+        .route("/healthz", get(health))
+        .route("/v1/stats", get(stats))
+        .route("/v1/train", post(train))
+        .route("/v1/debug/score", post(score))
+        .route("/v1/debug/candidates", post(candidates))
+        .route("/v1/fde/index", post(build_ann))
+        .route("/v1/dense/index", post(build_dense))
+        .route("/v1/vectors/upsert", post(upsert))
+        .route("/v1/vectors/delete", post(delete))
+        .route("/v1/query", post(query))
+        .route("/v1/retrieve", post(retrieve))
+        .route("/v1/compact", post(compact))
+        // ColBERT batches are legitimately large: 100 documents can contain
+        // millions of JSON floats. Keep the limit explicit and configurable at
+        // the reverse proxy in deployed environments.
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
+        .with_state(index)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateCollection {
+    name: String,
+    config: IndexConfig,
+}
+async fn list_collections(State(collections): State<Arc<Collections>>) -> Json<Value> {
+    Json(json!({"collections":collections.names()}))
+}
+async fn create_collection(
+    State(collections): State<Arc<Collections>>,
+    Json(body): Json<CreateCollection>,
+) -> Result<Json<Value>, ApiError> {
+    tokio::task::spawn_blocking(move || collections.create(&body.name, body.config))
+        .await
+        .map_err(|e| ApiError(IndexError::Invalid(e.to_string())))??;
+    Ok(Json(json!({"created":true})))
+}
+async fn collection_request(
+    State(collections): State<Arc<Collections>>,
+    axum::extract::Path((name, operation)): axum::extract::Path<(String, String)>,
+    mut request: axum::extract::Request,
+) -> Response {
+    let Some(index) = collections.get(&name) else {
+        return (StatusCode::NOT_FOUND, "collection not found").into_response();
+    };
+    let suffix = request
+        .uri()
+        .query()
+        .map(|s| format!("?{s}"))
+        .unwrap_or_default();
+    let Ok(uri) = format!("/v1/{operation}{suffix}").parse() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    *request.uri_mut() = uri;
+    match index_router(index).oneshot(request).await {
+        Ok(response) => response,
+        Err(never) => match never {},
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -416,24 +508,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Durability::Buffered
     };
+    let collection_root = args.path.join("collections");
     let index = Arc::new(MultiVectorIndex::open_with_durability(
         args.path, config, durability,
     )?);
-    let app = Router::new()
-        .route("/healthz", get(health))
-        .route("/v1/stats", get(stats))
-        .route("/v1/train", post(train))
-        .route("/v1/debug/score", post(score))
-        .route("/v1/debug/candidates", post(candidates))
-        .route("/v1/fde/index", post(build_ann))
-        .route("/v1/vectors/upsert", post(upsert))
-        .route("/v1/vectors/delete", post(delete))
-        .route("/v1/query", post(query))
-        // ColBERT batches are legitimately large: 100 documents can contain
-        // millions of JSON floats. Keep the limit explicit and configurable at
-        // the reverse proxy in deployed environments.
-        .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
-        .with_state(index);
+    let collections = Arc::new(Collections::open(collection_root, durability)?);
+    let collection_routes = Router::new()
+        .route(
+            "/v1/collections",
+            get(list_collections).post(create_collection),
+        )
+        .route(
+            "/v1/collections/{name}/{*operation}",
+            axum::routing::any(collection_request),
+        )
+        .with_state(collections);
+    let app = index_router(index).merge(collection_routes);
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     println!("multivector listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app)

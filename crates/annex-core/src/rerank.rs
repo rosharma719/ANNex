@@ -16,7 +16,7 @@ use crate::utils::types::PointId;
 /// needing to calibrate their score scales.
 ///
 /// For each doc, the fused score is `sum over lists of 1 / (k + rank)`
-/// where `rank` is 0-indexed within each list. `k=60` is the value from
+/// where `rank` is 1-indexed within each list. `k=60` is the value from
 /// the original TREC paper and is the sensible default; smaller values
 /// weight top-ranks more heavily.
 ///
@@ -27,12 +27,17 @@ pub fn reciprocal_rank_fusion(
     top_k: usize,
     k: f32,
 ) -> Vec<(PointId, f32)> {
-    if top_k == 0 || result_sets.is_empty() {
+    if top_k == 0 || result_sets.is_empty() || !k.is_finite() || k < 0. {
         return Vec::new();
     }
     let mut fused: HashMap<PointId, f32> = HashMap::new();
     for results in result_sets {
-        for (rank, (id, _score)) in results.iter().enumerate() {
+        let mut seen = std::collections::HashSet::new();
+        for (rank, (id, _score)) in results
+            .iter()
+            .filter(|(id, _)| seen.insert(*id))
+            .enumerate()
+        {
             let contribution = 1.0 / (k + rank as f32 + 1.0);
             *fused.entry(*id).or_insert(0.0) += contribution;
         }
@@ -88,38 +93,43 @@ pub fn mmr_select<T, F>(
 where
     F: Fn(&T, &T) -> f32,
 {
-    debug_assert_eq!(candidates.len(), scores.len());
-    if candidates.is_empty() || top_k == 0 {
+    if candidates.len() != scores.len()
+        || top_k == 0
+        || !lambda.is_finite()
+        || scores.iter().any(|x| !x.is_finite())
+    {
         return Vec::new();
     }
-    let lambda = lambda.clamp(0.0, 1.0);
-    let mut selected: Vec<usize> = Vec::with_capacity(top_k.min(candidates.len()));
-    let mut remaining: Vec<usize> = (0..candidates.len()).collect();
-    // First pick is always the top relevance — no diversity penalty applies.
-    let (first_pos, _) = remaining
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| scores[**a].total_cmp(&scores[**b]))
-        .expect("non-empty candidates");
-    selected.push(remaining.remove(first_pos));
-
-    while selected.len() < top_k && !remaining.is_empty() {
-        let (best_pos, _) = remaining
-            .iter()
-            .enumerate()
-            .map(|(i, &cand_idx)| {
-                let rel = scores[cand_idx];
-                let max_sim = selected
-                    .iter()
-                    .map(|&s| similarity(&candidates[cand_idx], &candidates[s]))
-                    .fold(f32::NEG_INFINITY, f32::max);
-                let effective_sim = if max_sim.is_finite() { max_sim } else { 0.0 };
-                let mmr_score = lambda * rel - (1.0 - lambda) * effective_sim;
-                (i, mmr_score)
-            })
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .expect("non-empty remaining");
-        selected.push(remaining.remove(best_pos));
+    let lambda = lambda.clamp(0., 1.);
+    let mut selected = Vec::with_capacity(top_k.min(candidates.len()));
+    let mut used = vec![false; candidates.len()];
+    let mut redundancy = vec![f32::NEG_INFINITY; candidates.len()];
+    while selected.len() < top_k.min(candidates.len()) {
+        let mut best: Option<(usize, f32)> = None;
+        for i in 0..candidates.len() {
+            if used[i] {
+                continue;
+            }
+            let score = if selected.is_empty() {
+                scores[i]
+            } else {
+                lambda * scores[i] - (1. - lambda) * redundancy[i]
+            };
+            if best.is_none_or(|(_, previous)| score > previous) {
+                best = Some((i, score));
+            }
+        }
+        let Some((next, _)) = best else {
+            break;
+        };
+        used[next] = true;
+        selected.push(next);
+        for i in 0..candidates.len() {
+            if !used[i] {
+                let value = similarity(&candidates[i], &candidates[next]);
+                redundancy[i] = redundancy[i].max(if value.is_finite() { value } else { 0. });
+            }
+        }
     }
     selected
 }

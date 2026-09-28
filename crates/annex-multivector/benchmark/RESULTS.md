@@ -22,8 +22,50 @@ the corrections; the [benchmark policy](../../../BENCHMARK_POLICY.md) governs ne
 | LanceDB has no native multivector support | The old adapter mean-pooled tokens. Treat those numbers as a mean-pool ablation, not evidence about native multivector retrieval. |
 | SciFact's remaining deficit was necessarily model behavior | The original encoder used a shorter document limit. Later experiments changed that limit and exposed candidate-pruning losses. |
 | Unsourced latency ranges for PLAID and Vespa | Withdrawn; these were not comparable measurements on the recorded workload. |
+| Early local NFCorpus hybrid numbers used standard BEIR nDCG | The initial runner used exponential gains (`2^grade−1`). BEIR/trec_eval uses the relevance grade directly. New summaries use linear gains; preserved early summaries must not be compared numerically with them. Binary-relevance SciFact/ArguAna scores are unaffected. |
 
 Historic NYT/H&M curves and optimization notes are also exploratory. Their
 original files remain in the same revision. Current commands live in
 [docs/benchmarks.md](../../../docs/benchmarks.md); fresh measurements must include
 their own artifacts rather than copy these tables forward.
+
+## Local quality comparison — 2026-09-28
+
+Implementation `54e9540`, Apple M2 / 16 GiB, full corpora, shared pinned MiniLM
+vectors, exact cosine and 100 candidates per channel. Configurations were frozen
+before all test-partition runs. nDCG uses BEIR/trec_eval linear gains.
+
+| Test-partition system | NFCorpus (162 queries) | SciFact (150) | ArguAna (703) |
+| --- | ---: | ---: | ---: |
+| ANNex dense | 0.31485 | 0.66420 | 0.48305 |
+| ANNex BM25 | 0.31335 | 0.63938 | 0.39781 |
+| ANNex hybrid RRF | 0.34550 | 0.68909 | 0.48205 |
+| Qdrant Server dense | 0.31494 | 0.66420 | 0.48155 |
+| Qdrant Server shared BM25 | 0.31295 | 0.63938 | 0.39605 |
+| Qdrant Server shared BM25 + dense RRF | 0.34411 | 0.68750 | 0.47862 |
+| LanceDB dense | 0.31485 | 0.66420 | 0.48324 |
+| LanceDB native BM25 | 0.32981 | 0.67069 | 0.47698 |
+| LanceDB native hybrid RRF | 0.35055 | 0.72700 | 0.52349 |
+
+ANNex hybrid improves over its dense baseline on NFCorpus and SciFact and is
+slightly worse on ArguAna. LanceDB native hybrid leads all three configurations;
+these results do not establish ANNex superiority. Its stemming, stop words and
+ASCII folding differ from ANNex/Qdrant's shared lexical setup. Native tie orders
+also differ. No engine speed ranking is claimed: ANNex/Qdrant use HTTP and
+LanceDB is embedded, with serial requests and no warmup. Public-data history
+means these frozen partitions cannot be described as untouched holdouts.
+
+All 9,135 test responses and 9,126 development responses succeeded. Test nDCG
+and Recall@10/20/100 agree with independent `pytrec_eval` evaluation within
+1e-12. Per-query outcomes, paired intervals, MRR, latencies, ingest stages,
+frozen configurations, vectors and checksums are retained in the
+[draft evidence release](https://github.com/rosharma719/ANNex/releases/tag/untagged-be93740995d824df1d7f)
+(repository access required until publication). The archive is outside the
+source tree; SHA-256 of `annex-local-quality-20260928.tar.gz`:
+
+```text
+076ba8d319c895a2adfc6244d189027896f52a38e1ea682a5cba32ca8d7c0f75
+```
+
+Earlier development losses and the gain-definition correction are included in
+that archive. Commands and comparator semantics live in [README.md](README.md).

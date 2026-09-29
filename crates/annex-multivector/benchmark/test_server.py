@@ -176,6 +176,51 @@ class ServerTests(unittest.TestCase):
             )
             self.assertEqual(http(base, route("b", "stats"))["documents"], 1)
 
+    def test_collection_analyzer_config_is_persisted_and_validated(self):
+        english = {
+            "dimension": 2,
+            "analyzer": {
+                "stem": True,
+                "stopwords": "english",
+                "ascii_folding": True,
+                "max_token_length": 40,
+            },
+        }
+        document = {
+            "documents": [
+                {
+                    "id": "d",
+                    "text": "The runners are running",
+                    "representations": {"semantic": {"kind": "dense", "vector": [1, 0]}},
+                }
+            ]
+        }
+        stemmed = {"prefetch": [{"kind": "bm25", "text": "running", "limit": 5}]}
+        with annex_server(self.binary, self.root, 2) as base:
+            http(base, "/v1/collections", {"name": "english", "config": english})
+            http(base, "/v1/collections/english/vectors/upsert", document)
+            result = http(base, "/v1/collections/english/retrieve", stemmed)
+            self.assertEqual([m["id"] for m in result["matches"]], ["d"])
+            self.assertEqual(
+                http(
+                    base,
+                    "/v1/collections/english/retrieve",
+                    {"prefetch": [{"kind": "bm25", "text": "the", "limit": 5}]},
+                )["matches"],
+                [],
+            )
+            for bad in [
+                {"dimension": 2, "analyzer": {"max_token_length": 0}},
+                {"dimension": 2, "analyzer": {"stopwords": "klingon"}},
+                {"dimension": 2, "analyzer": {"unknown": True}},
+            ]:
+                with self.assertRaisesRegex(RuntimeError, "HTTP 4"):
+                    http(base, "/v1/collections", {"name": "bad", "config": bad})
+        # Collections reopen from the persisted analyzer without CLI flags.
+        with annex_server(self.binary, self.root, 2) as base:
+            result = http(base, "/v1/collections/english/retrieve", stemmed)
+            self.assertEqual([m["id"] for m in result["matches"]], ["d"])
+
     def test_real_adapters_report_backend_build_cost_and_scalar_order(self):
         docs = [NS(doc_id="a"), NS(doc_id="b")]
         queries = [NS(query_id="q")]

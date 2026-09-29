@@ -116,8 +116,8 @@ fixture scores. CI supplies the binary; local runs without it skip those tests.
 
 ## Dense, lexical, and hybrid quality comparisons
 
-`quality.py` evaluates full NFCorpus (3,633 documents), SciFact (5,183), and
-ArguAna (8,674), with the same pinned MiniLM vectors for every engine. Each
+`quality.py` evaluates five full BEIR corpora: NFCorpus, SciFact, ArguAna, FiQA
+and SciDocs. It uses the same pinned MiniLM vectors for every engine. Each
 engine runs exact cosine, BM25, and RRF with 100 candidates per channel. The
 primary metric is nDCG@10; Recall@10/20/100, MRR@10, and paired bootstrap intervals
 are retained. No strategy is selected per test query or per test corpus.
@@ -144,11 +144,12 @@ remain unchanged throughout evaluation. Fingerprints are checked before arrays
 are loaded or servers started. The deterministic split cannot undo historical
 exposure to these public datasets, including prior ANNex experiments.
 
-Qdrant uses explicit BM25 sparse weights with ANNex's tokenizer and parameters,
-then its native sparse search and RRF. LanceDB uses native FTS defaults including
+Qdrant uses explicit BM25 sparse weights with ANNex's selected analyzer,
+parameters and raw query term frequencies, then its native sparse search and
+RRF. LanceDB uses native FTS defaults including
 English stemming, stop words, and ASCII folding; its lexical/hybrid rows are a
 system comparison, not evidence of identical scoring. Qdrant's zero-based RRF
-`k=61` matches ANNex/LanceDB's one-based `k=60`. Query-self documents are excluded
+`k=11` matches ANNex/LanceDB's one-based `k=10`. Query-self documents are excluded
 before ranking in all engines. Native tie orders can still differ.
 
 ANNex and Qdrant use HTTP; LanceDB is embedded. Timings include those different

@@ -24,6 +24,7 @@ fn config() -> IndexConfig {
         fde_repetitions: 2,
         fde_ksim: 2,
         fde_projected: 2,
+        analyzer: TextAnalyzer::plain(),
     }
 }
 fn train(index: &MultiVectorIndex) {

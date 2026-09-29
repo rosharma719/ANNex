@@ -220,7 +220,8 @@ impl SparseIndex {
     }
 
     /// BM25 uses global live-document statistics, including empty documents.
-    /// Query weights multiply term contributions; use ones for lexical queries.
+    /// Query weights multiply term contributions; lexical callers pass raw
+    /// query term frequencies so repeated query terms contribute repeatedly.
     pub fn search_bm25(
         &self,
         query: &SparseVector,

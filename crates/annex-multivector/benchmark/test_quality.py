@@ -8,10 +8,27 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 
 import numpy as np
-from quality_engines import STRATEGIES, open_engine
+from quality_engines import BM25Weights, STRATEGIES, open_engine, terms
 
 
 class QualityAdapterTests(unittest.TestCase):
+    def test_shared_bm25_preserves_query_term_frequency(self):
+        weights = BM25Weights(["red apple", "blue apple"])
+        once = weights.query("red apple")
+        repeated = weights.query("red red apple")
+        by_id_once = dict(zip(once["indices"], once["values"]))
+        by_id_repeated = dict(zip(repeated["indices"], repeated["values"]))
+        red = weights.ids["red"]
+        apple = weights.ids["apple"]
+        self.assertEqual(by_id_repeated[red], 2 * by_id_once[red])
+        self.assertEqual(by_id_repeated[apple], by_id_once[apple])
+
+    def test_shared_english_analyzer_matches_the_contract(self):
+        self.assertEqual(
+            terms("The runners are running toward the CAFÉs", "english"),
+            ["runner", "run", "toward", "cafe"],
+        )
+
     def check_engine(self, name):
         docs = [
             NS(doc_id="a", text="red apple orchard"),
@@ -37,7 +54,7 @@ class QualityAdapterTests(unittest.TestCase):
                     self.assertEqual(len(ids), len(set(ids)))
                     if strategy == "hybrid_rrf":
                         self.assertAlmostEqual(
-                            result["matches"][0]["score"], 2 / 61, places=7
+                            result["matches"][0]["score"], 2 / 11, places=7
                         )
                     # No lexical matches must not fabricate positive candidates.
                     empty = engine.query(

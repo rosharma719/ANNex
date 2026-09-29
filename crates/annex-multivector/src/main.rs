@@ -11,7 +11,7 @@ use axum::{
 use clap::Parser;
 use multivector::{
     Collections, Durability, IndexConfig, IndexError, MultiVectorIndex, RetrievalDocument,
-    RetrievalResponse, RetrieveRequest,
+    RetrievalResponse, RetrieveRequest, TextAnalyzer,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -39,6 +39,10 @@ struct Args {
     /// Fsync acknowledges durable commits; buffered only promises atomic visibility.
     #[arg(long, default_value = "fsync", value_parser = ["fsync", "buffered"])]
     durability: String,
+    /// Text analysis policy for the lexical field of the default index.
+    /// Collections created over HTTP configure the analyzer in their JSON config.
+    #[arg(long, default_value = "plain", value_parser = ["plain", "english"])]
+    analyzer: String,
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
 }
@@ -112,6 +116,14 @@ fn two_fifty_six() -> usize {
 }
 fn default_candidate_backend() -> String {
     "muvera".into()
+}
+
+/// CLI presets; HTTP collection configs carry the full analyzer object.
+fn analyzer_preset(name: &str) -> TextAnalyzer {
+    match name {
+        "english" => TextAnalyzer::english(),
+        _ => TextAnalyzer::plain(),
+    }
 }
 
 struct ApiError(IndexError);
@@ -502,6 +514,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fde_repetitions: args.fde_repetitions,
         fde_ksim: args.fde_ksim,
         fde_projected: args.fde_projected,
+        analyzer: analyzer_preset(&args.analyzer),
     };
     let durability = if args.durability == "fsync" {
         Durability::Fsync
@@ -548,6 +561,7 @@ mod tests {
             fde_repetitions: 2,
             fde_ksim: 2,
             fde_projected: 2,
+            analyzer: TextAnalyzer::plain(),
         };
         let index = Arc::new(MultiVectorIndex::open(directory.path(), config).unwrap());
         index

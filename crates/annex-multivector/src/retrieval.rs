@@ -72,19 +72,9 @@ pub(super) struct RetrievalState {
     schema: BTreeMap<String, FieldSchema>,
     document_chunks: HashMap<u64, Chunk>,
     chunks: HashMap<String, BTreeMap<u32, BTreeSet<String>>>,
+    analyzer: Analyzer,
 }
 
-/// Unicode alphanumeric words, lowercase, without stemming or stop-word removal.
-fn terms(text: &str) -> BTreeMap<String, f32> {
-    let mut counts = BTreeMap::new();
-    for word in text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-    {
-        *counts.entry(word.to_lowercase()).or_default() += 1.0;
-    }
-    counts
-}
 fn invalid(message: impl Into<String>) -> IndexError {
     IndexError::Invalid(message.into())
 }
@@ -93,7 +83,10 @@ fn sparse_error(error: annex::vector::sparse::SparseError) -> IndexError {
 }
 
 impl RetrievalState {
-    pub(super) fn from_schema(schema: BTreeMap<String, FieldSchema>) -> Result<Self, IndexError> {
+    pub(super) fn from_schema(
+        schema: BTreeMap<String, FieldSchema>,
+        analyzer: Analyzer,
+    ) -> Result<Self, IndexError> {
         if schema.iter().any(|(name, shape)| {
             name.is_empty()
                 || name.len() > 128
@@ -108,6 +101,7 @@ impl RetrievalState {
         }
         Ok(Self {
             schema,
+            analyzer,
             ..Self::default()
         })
     }
@@ -163,7 +157,7 @@ impl RetrievalState {
         }
         if let Some(text) = &fields.text {
             let mut pairs = Vec::new();
-            for (term, count) in terms(text) {
+            for (term, count) in self.analyzer.analyze(text) {
                 let next = u32::try_from(self.vocabulary.len())
                     .map_err(|_| invalid("lexical vocabulary exhausted"))?;
                 pairs.push((*self.vocabulary.entry(term).or_insert(next), count));
@@ -373,11 +367,11 @@ pub enum Fusion {
     },
 }
 fn default_rrf() -> f32 {
-    60.
+    10.
 }
 impl Default for Fusion {
     fn default() -> Self {
-        Self::Rrf { k: 60. }
+        Self::Rrf { k: 10. }
     }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -705,10 +699,15 @@ impl MultiVectorIndex {
                     if text.len() > 65_536 {
                         return Err(invalid("query text exceeds 65536 bytes"));
                     }
-                    let query =
-                        SparseVector::from_pairs(terms(text).keys().filter_map(|term| {
-                            s.retrieval.vocabulary.get(term).map(|&id| (id, 1.0))
-                        }));
+                    // BM25 query weights are raw analyzed query term
+                    // frequencies: repeated query terms contribute repeatedly.
+                    let query = SparseVector::from_pairs(
+                        s.retrieval.analyzer.analyze(text).into_iter().filter_map(
+                            |(term, count)| {
+                                s.retrieval.vocabulary.get(&term).map(|&id| (id, count))
+                            },
+                        ),
+                    );
                     (
                         external(
                             s.retrieval
@@ -1301,6 +1300,107 @@ mod tests {
         assert!(reopened.retrieve(&query).unwrap().matches.is_empty());
     }
 
+    fn analyzer_config(analyzer: TextAnalyzer) -> IndexConfig {
+        IndexConfig {
+            analyzer,
+            ..IndexConfig::new(2)
+        }
+    }
+    fn bm25_only(text: &str) -> RetrieveRequest {
+        serde_json::from_value(json!({
+            "prefetch": [{"kind": "bm25", "text": text, "limit": 10}],
+            "limit": 10
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn bm25_query_term_frequency_weights_repeated_terms() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
+        index
+            .upsert_records(vec![
+                document("alpha", "alpha shared", vec![1., 0.], "t", 0),
+                document("beta", "beta shared", vec![0., 1.], "t", 0),
+            ])
+            .unwrap();
+        // Equal-length documents and equal df tie on a single occurrence of
+        // each term; the stable tie-break puts "alpha" first.
+        let tied = index.retrieve(&bm25_only("alpha beta")).unwrap();
+        assert_eq!(tied.matches[0].id, "alpha");
+        assert_eq!(tied.matches[0].score, tied.matches[1].score);
+        // A repeated query term must double its contribution so "beta" wins.
+        let repeated = index.retrieve(&bm25_only("alpha beta beta")).unwrap();
+        assert_eq!(repeated.matches[0].id, "beta");
+        let beta = repeated.matches.iter().find(|h| h.id == "beta").unwrap();
+        let alpha = repeated.matches.iter().find(|h| h.id == "alpha").unwrap();
+        assert_eq!(beta.score, tied.matches[0].score * 2.0);
+        assert_eq!(alpha.score, tied.matches[0].score);
+    }
+
+    #[test]
+    fn english_analyzer_stems_queries_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let index =
+            MultiVectorIndex::open(dir.path(), analyzer_config(TextAnalyzer::english())).unwrap();
+        index
+            .upsert_records(vec![
+                document("runner", "The runner runs fast", vec![1., 0.], "t", 0),
+                document("walker", "walking quickly", vec![0., 1.], "t", 0),
+            ])
+            .unwrap();
+        // "running" stems to "run", matching the indexed "runs"; "the" is a
+        // stop word on both sides, so it cannot retrieve anything.
+        let ranked = |index: &MultiVectorIndex, text: &str| {
+            index
+                .retrieve(&bm25_only(text))
+                .unwrap()
+                .matches
+                .iter()
+                .map(|h| h.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranked(&index, "running"), ["runner"]);
+        assert!(ranked(&index, "the").is_empty());
+        drop(index);
+        let reopened =
+            MultiVectorIndex::open(dir.path(), analyzer_config(TextAnalyzer::english())).unwrap();
+        assert_eq!(ranked(&reopened, "running"), ["runner"]);
+        drop(reopened);
+        // The analyzer is part of the persisted configuration contract.
+        let Err(mismatch) = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)) else {
+            panic!("reopening with a different analyzer must fail");
+        };
+        assert!(matches!(mismatch, IndexError::Config { .. }));
+    }
+
+    #[test]
+    fn analyzer_config_is_validated_and_legacy_configs_default_to_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let Err(error) = MultiVectorIndex::open(
+            dir.path(),
+            analyzer_config(TextAnalyzer {
+                max_token_length: Some(0),
+                ..TextAnalyzer::plain()
+            }),
+        ) else {
+            panic!("invalid analyzer config must be rejected");
+        };
+        assert!(error.to_string().contains("max_token_length"));
+        let legacy: IndexConfig = serde_json::from_value(json!({
+            "dimension": 2, "centroids": 2, "residual_bits": 2, "probes": 2,
+            "fde_repetitions": 2, "fde_ksim": 2, "fde_projected": 2
+        }))
+        .unwrap();
+        assert_eq!(legacy.analyzer, TextAnalyzer::plain());
+        let custom: TextAnalyzer = serde_json::from_value(json!({
+            "stem": true, "stopwords": "english",
+            "ascii_folding": true, "max_token_length": 32
+        }))
+        .unwrap();
+        assert!(custom.stem && custom.max_token_length == Some(32));
+    }
+
     #[test]
     fn named_field_schema_survives_deleting_every_document_and_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -1666,5 +1766,10 @@ mod tests {
             .upsert_records(vec![document("new", "E123", vec![1., 0.], "a", 2)])
             .unwrap();
         assert_eq!(reopened.stats().documents, 4);
+    }
+
+    #[test]
+    fn global_development_choice_is_the_rrf_default() {
+        assert!(matches!(Fusion::default(), Fusion::Rrf { k } if k == 10.));
     }
 }

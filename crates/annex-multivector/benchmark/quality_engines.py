@@ -6,11 +6,13 @@ These distinctions are part of the frozen contract, not hidden normalization.
 
 from collections import Counter
 from contextlib import contextmanager
+from functools import lru_cache
 import json
 import math
 import socket
 import subprocess
 import time
+import unicodedata
 
 import numpy as np
 from server import annex_server, http
@@ -22,14 +24,44 @@ def document_text(doc):
     return (getattr(doc, "title", "") + " " + doc.text).strip()
 
 
-def terms(text):
+ENGLISH_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if",
+    "in", "into", "is", "it", "no", "not", "of", "on", "or", "such", "that",
+    "the", "their", "then", "there", "these", "they", "this", "to", "was",
+    "will", "with",
+}
+
+
+@lru_cache(maxsize=1)
+def english_stemmer():
+    import snowballstemmer
+
+    return snowballstemmer.stemmer("english")
+
+
+def terms(text, analyzer="plain"):
     # Rust's char::is_alphanumeric split followed by Unicode lowercase.
-    return "".join(c if c.isalnum() else " " for c in text).lower().split()
+    tokens = "".join(c if c.isalnum() else " " for c in text).split()
+    if analyzer == "plain":
+        return [token.lower() for token in tokens]
+    if analyzer != "english":
+        raise ValueError(f"unsupported analyzer: {analyzer}")
+    stemmer = english_stemmer()
+    analyzed = []
+    for word in tokens:
+        token = "".join(
+            c.lower() for c in unicodedata.normalize("NFKD", word)
+            if not unicodedata.combining(c)
+        )[:40]
+        if token and token not in ENGLISH_STOPWORDS:
+            analyzed.append(stemmer.stemWord(token))
+    return analyzed
 
 
 class BM25Weights:
-    def __init__(self, texts):
-        self.documents = [Counter(terms(text)) for text in texts]
+    def __init__(self, texts, analyzer="plain"):
+        self.analyzer = analyzer
+        self.documents = [Counter(terms(text, analyzer)) for text in texts]
         df = Counter(term for doc in self.documents for term in doc)
         self.ids = {term: i for i, term in enumerate(sorted(df))}
         self.idf = {
@@ -51,10 +83,11 @@ class BM25Weights:
         }
 
     def query(self, text):
-        tokens = sorted(set(terms(text)).intersection(self.ids))
+        counts = Counter(terms(text, self.analyzer))
+        tokens = sorted(counts.keys() & self.ids.keys())
         return {
             "indices": [self.ids[t] for t in tokens],
-            "values": [self.idf[t] for t in tokens],
+            "values": [counts[t] * self.idf[t] for t in tokens],
         }
 
 
@@ -110,21 +143,29 @@ def qdrant_server(binary, directory):
 @contextmanager
 def open_engine(name, args, docs, vectors):
     directory = args.output / name
+    rrf_k = getattr(args, "rrf_k", 10)
     if name == "annex":
-        with annex_server(args.binary.resolve(), directory, vectors.shape[1]) as base:
-            yield Annex(base, docs, vectors)
+        analyzer = getattr(args, "annex_analyzer", "plain")
+        extra = () if analyzer == "plain" else ("--analyzer", analyzer)
+        with annex_server(
+            args.binary.resolve(), directory, vectors.shape[1], extra=extra
+        ) as base:
+            yield Annex(base, docs, vectors, rrf_k)
     elif name == "qdrant":
         with qdrant_server(args.qdrant_binary, directory) as base:
-            yield Qdrant(base, docs, vectors)
+            yield Qdrant(
+                base, docs, vectors, getattr(args, "annex_analyzer", "plain"), rrf_k
+            )
     elif name == "lancedb":
-        yield Lance(directory, docs, vectors)
+        yield Lance(directory, docs, vectors, rrf_k)
     else:
         raise ValueError(f"unsupported engine: {name}")
 
 
 class Annex:
-    def __init__(self, base, docs, vectors):
+    def __init__(self, base, docs, vectors, rrf_k=10):
         self.base, self.docs, self.vectors = base, docs, vectors
+        self.rrf_k = rrf_k
 
     def build(self):
         for start in range(0, len(self.docs), 100):
@@ -170,7 +211,7 @@ class Annex:
                     "hybrid_rrf": [dense, lexical],
                 }[strategy],
                 "limit": 100,
-                "fusion": {"kind": "rrf", "k": 60},
+                "fusion": {"kind": "rrf", "k": self.rrf_k},
                 "filter": {
                     "op": "not",
                     "filter": {
@@ -188,12 +229,16 @@ class Annex:
 
 
 class Qdrant:
-    def __init__(self, base, docs, vectors):
+    def __init__(self, base, docs, vectors, analyzer="plain", rrf_k=10):
         self.base, self.docs, self.vectors = base, docs, vectors
+        self.analyzer = analyzer
+        self.rrf_k = rrf_k
         self.by_id = {d.doc_id: i for i, d in enumerate(docs)}
 
     def build(self):
-        self.bm25 = BM25Weights([document_text(d) for d in self.docs])
+        self.bm25 = BM25Weights(
+            [document_text(d) for d in self.docs], self.analyzer
+        )
         http(
             self.base,
             "/collections/quality",
@@ -247,8 +292,11 @@ class Qdrant:
             "filter": filter_,
         }
         if strategy == "hybrid_rrf":
-            # Qdrant ranks from zero; k=61 matches 1/(60 + one-based rank).
-            body = {"prefetch": [dense, lexical], "query": {"rrf": {"k": 61}}}
+            # Qdrant ranks from zero; add one to match one-based RRF ranks.
+            body = {
+                "prefetch": [dense, lexical],
+                "query": {"rrf": {"k": self.rrf_k + 1}},
+            }
         else:
             body = (dense if strategy == "dense" else lexical).copy()
         body.update(limit=100, with_payload=False, with_vector=False)
@@ -264,8 +312,9 @@ class Qdrant:
 
 
 class Lance:
-    def __init__(self, directory, docs, vectors):
+    def __init__(self, directory, docs, vectors, rrf_k=10):
         self.directory, self.docs, self.vectors = directory, docs, vectors
+        self.rrf_k = rrf_k
 
     def build(self):
         import lancedb
@@ -307,7 +356,7 @@ class Lance:
                 .text(query.text)
                 .distance_type("cosine")
                 .bypass_vector_index()
-                .rerank(RRFReranker(K=60))
+                .rerank(RRFReranker(K=self.rrf_k))
             )
             score = "_relevance_score"
         escaped = query.query_id.replace("'", "''")

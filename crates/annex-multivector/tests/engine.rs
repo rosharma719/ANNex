@@ -13,6 +13,7 @@ fn late_interaction_persists_and_ranks() {
         fde_repetitions: 8,
         fde_ksim: 2,
         fde_projected: 2,
+        ..IndexConfig::new(3)
     };
     let index = MultiVectorIndex::open(directory.path(), config.clone()).unwrap();
     index
@@ -231,6 +232,7 @@ fn query_auto_dispatches_to_hnsw_and_keeps_it_ready_after_writes() {
         fde_repetitions: 8,
         fde_ksim: 2,
         fde_projected: 2,
+        ..IndexConfig::new(3)
     };
     let index = MultiVectorIndex::open(directory.path(), config).unwrap();
     index
@@ -278,6 +280,7 @@ fn mutable_ann_config() -> IndexConfig {
         fde_repetitions: 8,
         fde_ksim: 2,
         fde_projected: 2,
+        ..IndexConfig::new(3)
     }
 }
 

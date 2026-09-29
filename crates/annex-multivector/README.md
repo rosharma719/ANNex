@@ -80,8 +80,11 @@ there is no partial-update or source-replacement endpoint.
 
 `POST /v1/retrieve` takes 1–8 `prefetch` channels. Each has a candidate `limit`:
 
-- `bm25`: query `text`, optional `k1` and `b`. Tokenization uses Unicode
-  alphanumeric words, lowercase, without stemming or stop-word removal.
+- `bm25`: query `text`, optional `k1` and `b`. The persisted collection
+  analyzer is applied at ingest and query time. `plain` preserves lowercase
+  Unicode alphanumeric terms; `english` adds accent folding, English stop-word
+  removal, Snowball stemming and a 40-character token limit. Query term
+  frequency is preserved.
 - `sparse`: named `field` and sparse query `vector`.
 - `dense`: named `field`, query `vector`, optional `backend` and `ef_search`.
 - `multivector`: query `vectors`, optional named `field`, `backend`, `ef_search`.
@@ -110,7 +113,7 @@ The same predicate applies to every channel, reranking and neighbor expansion.
 It is caller-supplied filtering, not authorization. The legacy `/v1/query` route
 still rejects filters; use `/v1/retrieve` for scoped retrieval.
 
-`fusion` defaults to `{"kind":"rrf","k":60}`. Weighted fusion uses
+`fusion` defaults to `{"kind":"rrf","k":10}`. Weighted fusion uses
 `{"kind":"weighted","weights":[0.5,0.5]}`, one nonnegative finite weight per
 channel; callers must calibrate score scales. A single RRF channel preserves its
 native scores. Optional `rerank` supplies token `vectors`, candidate `limit`,

@@ -85,6 +85,12 @@ Use `VECTORDB_BENCH_SIZE=1000000` for the same synthetic harness at one million
 vectors. Kernel benchmarks measure kernels, not database throughput. Dedicated
 hardware is required for performance comparisons; CI only checks compilation.
 
+The manual `Dedicated x86 benchmark` workflow runs on a self-hosted runner with
+the `annex-benchmark` label. It requires AVX2 and FMA, validates each explicit
+SIMD path against the scalar oracle, and uploads machine identity plus raw
+Criterion output. Treat those kernel results as diagnostics under the reporting
+policy, not as database or RAG comparisons.
+
 ## RAG retrieval
 
 The [multivector benchmark guide](../crates/annex-multivector/benchmark/README.md)

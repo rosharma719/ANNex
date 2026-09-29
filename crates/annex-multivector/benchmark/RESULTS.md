@@ -69,3 +69,48 @@ source tree; SHA-256 of `annex-local-quality-20260928.tar.gz`:
 
 Earlier development losses and the gain-definition correction are included in
 that archive. Commands and comparator semantics live in [README.md](README.md).
+
+## Lexical policy comparison — 2026-09-29
+
+Implementation `f68f970`, on the same Apple M2 / 16 GiB host. The development
+comparison selected one policy for every corpus: the persisted English analyzer,
+raw query term frequency, equal channel weights and RRF `k=10`. English beat the
+plain analyzer on all five development partitions. A fixed RRF grid
+(`k=0,10,30,60,100,200`) selected 10 by macro-average nDCG@10. No policy was
+selected per corpus or query. New frozen configurations were then written before
+the test runs.
+
+All engines used the same pinned normalized MiniLM vectors, exact cosine, 100
+candidates per channel and RRF `k=10`. ANNex and Qdrant Server received identical
+analyzed BM25 document/query weights; LanceDB used native default FTS. nDCG@10:
+
+| Held-out system | NFCorpus (162) | SciFact (150) | ArguAna (703) | FiQA (324) | SciDocs (500) | Macro |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ANNex dense | 0.31485 | 0.66420 | 0.48305 | 0.37728 | **0.22429** | 0.41273 |
+| ANNex BM25 | 0.32849 | **0.67408** | 0.46676 | **0.24350** | 0.16247 | 0.37506 |
+| **ANNex hybrid** | 0.35742 | 0.72639 | 0.52384 | 0.37977 | 0.21329 | **0.44014** |
+| Qdrant Server hybrid | **0.35797** | 0.72572 | 0.52074 | **0.37983** | **0.21357** | 0.43957 |
+| LanceDB native hybrid | 0.35425 | **0.72762** | **0.52646** | 0.37838 | 0.21324 | 0.43999 |
+
+ANNex has the highest numerical macro average, 0.00015 above LanceDB and 0.00057
+above Qdrant. It wins two corpora against LanceDB, loses two and is effectively
+tied on one. Every per-corpus paired-bootstrap 95% interval between hybrid
+systems includes zero. These results demonstrate parity and a material ANNex
+improvement, not a statistically established quality advantage. In particular,
+SciDocs hybrid remains below dense alone, so unconditional two-channel fusion is
+not universally beneficial.
+
+All 16,551 held-out responses and 11,028 analyzer-development responses
+succeeded. The frozen contracts, manifests, event journals, per-query rankings,
+paired intervals and server logs are in the same
+[draft evidence release](https://github.com/rosharma719/ANNex/releases/tag/untagged-be93740995d824df1d7f).
+SHA-256 of `annex-lexical-quality-20260929.tar.gz`:
+
+```text
+cb7281f820eeb50c37b34308802375e83b3326e2958ed348fbd9e499b6b6f6a5
+```
+
+Latency remains descriptive only because ANNex/Qdrant use HTTP while LanceDB is
+embedded. The next quality target is a globally validated query-adaptive fusion
+or late-interaction reranker, evaluated on new frozen corpora rather than
+retuning these now-observed test partitions.

@@ -1,5 +1,7 @@
 #[path = "agent.rs"]
 mod agent;
+#[path = "regret.rs"]
+pub mod regret;
 #[path = "planner.rs"]
 mod planner;
 #[path = "policy.rs"]
@@ -20,10 +22,11 @@ use annex::{
     vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
 };
 pub use planner::{
-    ConditionalStage, ContextPlan, ContextOperator, EscalationPredicate, FieldStats, FilterStats,
-    FilterStrategy, FusionOperator, LogicalChannel, LogicalChannelKind, LogicalFusion, LogicalPlan,
-    PhysicalOperator, PlanEstimate, PlanReason, PlanStage, PlannerStats, PlannedChannel,
-    QualityPreference, RerankPlan, RepresentationKind, RetrievalObjective, RetrievalPlan,
+    CalibrationSnapshot, CalibrationStats, ConditionalStage, ContextPlan, ContextOperator,
+    EscalationPredicate, FieldStats, FilterStats, FilterStrategy, FusionOperator, LogicalChannel,
+    LogicalChannelKind, LogicalFusion, LogicalPlan, OperatorClass, PhysicalOperator, PlanEstimate,
+    PlanReason, PlanStage, PlannerStats, PlannedChannel, QualityPreference, RerankPlan,
+    RepresentationKind, RetrievalObjective, RetrievalPlan,
 };
 pub use policy::{PlanningMode, PolicyPlan, QueryRepresentations};
 pub use agent::{AgentDecision, AgentIteration, AgentSearch, CorpusFingerprint, StopReason};
@@ -401,6 +404,8 @@ pub struct MultiVectorIndex {
     state: RwLock<Arc<State>>,
     writer: Mutex<()>,
     durability: Durability,
+    /// Runtime calibration stats, updated after each retrieve(). Advisory only.
+    calibration: Mutex<CalibrationStats>,
     // One process/handle owns append offsets and manifest publication at a time.
     _directory_lock: DirectoryLock,
 }
@@ -786,6 +791,7 @@ impl MultiVectorIndex {
                 )
             },
             writer: Mutex::new(()),
+            calibration: Mutex::new(CalibrationStats::new()),
             durability,
             _directory_lock: directory_lock,
             state: RwLock::new(Arc::new(State {
@@ -1951,6 +1957,11 @@ impl MultiVectorIndex {
                 .collect(),
         }
     }
+    /// Frozen calibration snapshot for plan enumeration and regret benchmarks.
+    pub fn calibration_snapshot(&self) -> CalibrationSnapshot {
+        self.calibration.lock().unwrap().snapshot()
+    }
+
     /// Diagnostic score over caller-provided vectors; used to verify scorer parity.
     pub fn score_uncompressed(
         &self,

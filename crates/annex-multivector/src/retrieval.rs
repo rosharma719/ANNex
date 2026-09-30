@@ -975,6 +975,33 @@ impl MultiVectorIndex {
             self.context(&s, ranked, &fused, &eligible, request, agreement)?;
         per_stage_actual_ms.push(context_stage_start.elapsed().as_secs_f64() * 1000.);
 
+        // ── Record calibration observations ───────────────────────────────────
+        // Record each channel's actual elapsed_ms keyed by (operator, dim, corpus).
+        {
+            let mut cal = self.calibration.lock().unwrap();
+            for (ch_idx, ch_json) in channels.iter().enumerate() {
+                if let Some(elapsed_ms) = ch_json["elapsed_ms"].as_f64() {
+                    if let Some(planned) = plan.parallel_channels().get(ch_idx) {
+                        let dim = match &request.prefetch.get(ch_idx) {
+                            Some(Channel::Dense { vector, .. }) => vector.len(),
+                            Some(Channel::Multivector { vectors, .. }) if !vectors.is_empty() => {
+                                vectors[0].len()
+                            }
+                            _ => plan.stats.fde_dimension.max(1),
+                        };
+                        cal.record(
+                            OperatorClass::from_plan(
+                                planned.operator,
+                                dim,
+                                plan.stats.documents,
+                            ),
+                            elapsed_ms,
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(RetrievalResponse {
             matches,
             trace: RetrievalTrace {
@@ -2100,6 +2127,114 @@ mod tests {
         let response = index.retrieve(&query).unwrap();
         // dedup_count ≥ 0 (dedup may or may not fire depending on corpus)
         assert!(response.trace.signals.dedup_count < 100);
+    }
+
+    // ── Phase 2C: calibration stats ──────────────────────────────────────────
+
+    #[test]
+    fn calibration_initially_returns_none_for_unobserved_class() {
+        let stats = CalibrationStats::new();
+        let class = OperatorClass {
+            operator: PhysicalOperator::ExactDense,
+            dim_bucket: 128,
+            corpus_bucket: 1_000,
+        };
+        assert!(stats.estimate_ms(&class).is_none());
+    }
+
+    #[test]
+    fn calibration_returns_estimate_after_min_observations() {
+        let mut stats = CalibrationStats::new();
+        let class = OperatorClass {
+            operator: PhysicalOperator::ExactDense,
+            dim_bucket: 128,
+            corpus_bucket: 1_000,
+        };
+        for _ in 0..CalibrationStats::MIN_OBSERVATIONS {
+            stats.record(class.clone(), 2.5);
+        }
+        let est = stats.estimate_ms(&class).expect("must return estimate after min observations");
+        // EWMA of constant 2.5ms should converge close to 2.5.
+        assert!((est - 2.5).abs() < 0.5, "estimate {est} should be near 2.5");
+    }
+
+    #[test]
+    fn calibration_ewma_tracks_changing_latency() {
+        let mut stats = CalibrationStats::new();
+        let class = OperatorClass {
+            operator: PhysicalOperator::HnswDense,
+            dim_bucket: 256,
+            corpus_bucket: 10_000,
+        };
+        // Warm up with fast observations, then switch to slow.
+        for _ in 0..20 {
+            stats.record(class.clone(), 1.0);
+        }
+        for _ in 0..20 {
+            stats.record(class.clone(), 5.0);
+        }
+        let est = stats.estimate_ms(&class).unwrap();
+        // Should have moved away from 1.0 toward 5.0.
+        assert!(est > 2.0, "EWMA should track toward recent observations: {est}");
+    }
+
+    #[test]
+    fn calibration_stratified_by_operator_class() {
+        let mut stats = CalibrationStats::new();
+        let dense = OperatorClass {
+            operator: PhysicalOperator::ExactDense,
+            dim_bucket: 128,
+            corpus_bucket: 1_000,
+        };
+        let hnsw = OperatorClass {
+            operator: PhysicalOperator::HnswDense,
+            dim_bucket: 128,
+            corpus_bucket: 1_000,
+        };
+        for _ in 0..CalibrationStats::MIN_OBSERVATIONS {
+            stats.record(dense.clone(), 1.0);
+            stats.record(hnsw.clone(), 10.0);
+        }
+        let est_exact = stats.estimate_ms(&dense).unwrap();
+        let est_hnsw = stats.estimate_ms(&hnsw).unwrap();
+        assert!(
+            est_hnsw > est_exact * 3.0,
+            "HNSW ({est_hnsw:.2}ms) should be substantially slower than exact ({est_exact:.2}ms)"
+        );
+    }
+
+    #[test]
+    fn calibration_p90_exceeds_mean_for_variable_latency() {
+        let mut stats = CalibrationStats::new();
+        let class = OperatorClass {
+            operator: PhysicalOperator::ExactFde,
+            dim_bucket: 512,
+            corpus_bucket: 10_000,
+        };
+        // Record mix of fast (1ms) and slow (9ms) observations.
+        for i in 0..20 {
+            stats.record(class.clone(), if i % 5 == 0 { 9.0 } else { 1.0 });
+        }
+        let mean = stats.estimate_ms(&class).unwrap();
+        let p90 = stats.p90_ms(&class).unwrap();
+        assert!(p90 > mean, "p90 ({p90:.2}) should exceed mean ({mean:.2})");
+    }
+
+    #[test]
+    fn retrieve_updates_calibration_observable_on_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query = request();
+        // Run several retrieves to accumulate observations.
+        for _ in 0..CalibrationStats::MIN_OBSERVATIONS {
+            index.retrieve(&query).unwrap();
+        }
+        // Calibration snapshot should have observations for the operators used.
+        let snap = index.calibration_snapshot();
+        assert!(
+            !snap.is_empty(),
+            "calibration snapshot should be non-empty after retrieves"
+        );
     }
 
     // ── Phase 5: iterative evidence planner ──────────────────────────────────

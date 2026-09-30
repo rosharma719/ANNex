@@ -60,7 +60,7 @@ pub struct LogicalPlan {
 
 // ── Physical operators ────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PhysicalOperator {
     Bm25,
@@ -845,6 +845,136 @@ pub(super) fn planner_stats(
         fde_graph_ready: state.fde_ann.is_some(),
         fields,
         filter_stats,
+    }
+}
+
+// ── Phase 2C: CalibrationStats ────────────────────────────────────────────────
+
+/// Stratification key for calibration observations.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct OperatorClass {
+    pub operator: PhysicalOperator,
+    /// Dimension rounded up to power-of-two bucket.
+    pub dim_bucket: usize,
+    /// Corpus size rounded to nearest order-of-magnitude bucket.
+    pub corpus_bucket: usize,
+}
+
+impl OperatorClass {
+    pub fn from_plan(operator: PhysicalOperator, dim: usize, corpus: usize) -> Self {
+        Self {
+            operator,
+            dim_bucket: dim_bucket(dim),
+            corpus_bucket: corpus_bucket(corpus),
+        }
+    }
+}
+
+fn dim_bucket(dim: usize) -> usize {
+    match dim {
+        0..=128 => 128,
+        129..=256 => 256,
+        257..=512 => 512,
+        513..=1024 => 1024,
+        _ => 2048,
+    }
+}
+
+fn corpus_bucket(n: usize) -> usize {
+    match n {
+        0..=999 => 1_000,
+        1_000..=9_999 => 10_000,
+        10_000..=99_999 => 100_000,
+        _ => 1_000_000,
+    }
+}
+
+/// Per-operator-class runtime observation, tracked as EWMA mean + EWMA of
+/// squared deviation. p90 ≈ mean + 1.28 × std_dev (normal approximation).
+/// This is advisory — planner falls back to static coefficients when
+/// `observations < MIN_OBSERVATIONS`.
+#[derive(Clone, Debug)]
+pub struct OperatorCalibration {
+    pub ewma_ms: f64,
+    pub ewma_sq_ms: f64,
+    pub observations: u64,
+    alpha: f64,
+}
+
+impl OperatorCalibration {
+    fn new(first_ms: f64) -> Self {
+        Self {
+            ewma_ms: first_ms,
+            ewma_sq_ms: first_ms * first_ms,
+            observations: 1,
+            alpha: 0.1,
+        }
+    }
+
+    fn update(&mut self, observed_ms: f64) {
+        self.ewma_ms = self.alpha * observed_ms + (1.0 - self.alpha) * self.ewma_ms;
+        self.ewma_sq_ms =
+            self.alpha * observed_ms * observed_ms + (1.0 - self.alpha) * self.ewma_sq_ms;
+        self.observations += 1;
+    }
+
+    pub fn p90_ms(&self) -> f64 {
+        let variance = (self.ewma_sq_ms - self.ewma_ms * self.ewma_ms).max(0.0);
+        self.ewma_ms + 1.28 * variance.sqrt()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CalibrationStats {
+    pub by_class: HashMap<OperatorClass, OperatorCalibration>,
+}
+
+impl CalibrationStats {
+    pub const MIN_OBSERVATIONS: u64 = 5;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&mut self, class: OperatorClass, observed_ms: f64) {
+        match self.by_class.entry(class) {
+            std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().update(observed_ms),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(OperatorCalibration::new(observed_ms));
+            }
+        }
+    }
+
+    pub fn estimate_ms(&self, class: &OperatorClass) -> Option<f64> {
+        self.by_class.get(class).filter(|c| c.observations >= Self::MIN_OBSERVATIONS)
+            .map(|c| c.ewma_ms)
+    }
+
+    pub fn p90_ms(&self, class: &OperatorClass) -> Option<f64> {
+        self.by_class.get(class).filter(|c| c.observations >= Self::MIN_OBSERVATIONS)
+            .map(|c| c.p90_ms())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_class.is_empty()
+    }
+
+    /// Frozen copy for benchmark replay (planning against a stable calibration).
+    pub fn snapshot(&self) -> CalibrationSnapshot {
+        CalibrationSnapshot(self.clone())
+    }
+}
+
+/// Immutable snapshot of calibration stats for reproducible plan enumeration.
+#[derive(Clone, Debug)]
+pub struct CalibrationSnapshot(pub CalibrationStats);
+
+impl CalibrationSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub fn estimate_ms(&self, class: &OperatorClass) -> Option<f64> {
+        self.0.estimate_ms(class)
     }
 }
 

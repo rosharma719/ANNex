@@ -20,3 +20,4 @@ pub use engine::{
     RetrieveRequest, UpsertDocument,
 };
 pub use fde::{maxsim, maxsim_flat};
+pub use engine::regret;

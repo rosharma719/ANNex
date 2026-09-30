@@ -1,3 +1,5 @@
+#[path = "planner.rs"]
+mod planner;
 #[path = "retrieval.rs"]
 mod retrieval;
 use crate::{
@@ -13,6 +15,7 @@ use annex::{
     utils::types::DistanceMetric,
     vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
 };
+pub use planner::{FilterStrategy, PhysicalOperator, PlanReason, PlannedChannel, RetrievalPlan};
 use rayon::prelude::*;
 pub use retrieval::{
     AdaptiveRerank, Channel, Chunk, ContextHit, ContextOptions, Fusion, Predicate, Representation,

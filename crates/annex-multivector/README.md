@@ -31,6 +31,7 @@ Reopening the default index requires the same index configuration.
 | `POST /v1/train` | `vectors`, optional `iterations` |
 | `POST /v1/vectors/upsert` | Atomic `documents` batch; complete replacement by `id` |
 | `POST /v1/vectors/delete` | Delete one `id`; returns `deleted: false` when absent |
+| `POST /v1/plan` | Compile a retrieval request without scoring documents |
 | `POST /v1/retrieve` | Hybrid retrieval and context selection, described below |
 | `POST /v1/dense/index` | Build a named dense graph: `field`, optional `m`, `ef_construct` |
 | `POST /v1/fde/index` | Build the default MUVERA graph: optional `m`, `ef_construct` |
@@ -97,6 +98,13 @@ Filtered retrieval uses exact scoring over eligible documents before channel
 limits; BM25 keeps global live-document IDF and length statistics. Graphs are
 rebuilt explicitly after restart. Writes preserve built graphs through exact
 replacement deltas and tombstones; see the durability contract for maintenance.
+
+`POST /v1/plan` accepts the same body as `/v1/retrieve` and reports the immutable
+physical plan for the current generation: each channel's operator, selection
+reason, limits, filter strategy and eligible-document count. Retrieval traces
+embed that same plan. Reasons distinguish an explicit exact request, a ready or
+missing ANN index, an exact-only operator, and exact scoring required by a
+filter.
 
 `filter` supports scalar `eq`, scalar/array-member `in`, inclusive numeric `range`
 with `gte`/`lte`, and boolean `and`, `or`, `not`. `field` is a metadata key or

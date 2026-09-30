@@ -11,7 +11,7 @@ use axum::{
 use clap::Parser;
 use multivector::{
     Collections, Durability, IndexConfig, IndexError, MultiVectorIndex, RetrievalDocument,
-    RetrievalResponse, RetrieveRequest, TextAnalyzer,
+    RetrievalPlan, RetrievalResponse, RetrieveRequest, TextAnalyzer,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -226,6 +226,16 @@ async fn retrieve(
     let result = tokio::task::spawn_blocking(move || index.retrieve(&body))
         .await
         .map_err(|e| ApiError(IndexError::Invalid(format!("query task failed: {e}"))))??;
+    Ok(Json(result))
+}
+
+async fn plan(
+    State(index): State<Arc<MultiVectorIndex>>,
+    Json(body): Json<RetrieveRequest>,
+) -> Result<Json<RetrievalPlan>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || index.plan(&body))
+        .await
+        .map_err(|e| ApiError(IndexError::Invalid(format!("planning task failed: {e}"))))??;
     Ok(Json(result))
 }
 
@@ -454,6 +464,7 @@ fn index_router(index: Arc<MultiVectorIndex>) -> Router {
         .route("/v1/vectors/upsert", post(upsert))
         .route("/v1/vectors/delete", post(delete))
         .route("/v1/query", post(query))
+        .route("/v1/plan", post(plan))
         .route("/v1/retrieve", post(retrieve))
         .route("/v1/compact", post(compact))
         // ColBERT batches are legitimately large: 100 documents can contain
@@ -600,6 +611,45 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("candidate request failed: {}", error.0));
         assert_eq!(actual.0, json!({"candidates": expected}));
+    }
+
+    #[tokio::test]
+    async fn plan_endpoint_compiles_without_running_retrieval() {
+        let (_directory, index) = fixture();
+        let body: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [{
+                "kind": "multivector",
+                "vectors": [[1.0, 0.0]],
+                "limit": 2
+            }],
+            "limit": 1
+        }))
+        .unwrap();
+        let actual = plan(State(Arc::clone(&index)), Json(body.clone()))
+            .await
+            .unwrap_or_else(|error| panic!("planning failed: {}", error.0));
+        assert_eq!(
+            actual.0.channels[0].operator,
+            multivector::PhysicalOperator::ExactFde
+        );
+        assert_eq!(
+            actual.0.channels[0].reason,
+            multivector::PlanReason::AnnUnavailable
+        );
+        assert_eq!(actual.0.documents, 2);
+
+        index.build_fde_ann(4, 16).unwrap();
+        let actual = plan(State(index), Json(body))
+            .await
+            .unwrap_or_else(|error| panic!("planning failed: {}", error.0));
+        assert_eq!(
+            actual.0.channels[0].operator,
+            multivector::PhysicalOperator::HnswFde
+        );
+        assert_eq!(
+            actual.0.channels[0].reason,
+            multivector::PlanReason::AnnReady
+        );
     }
 
     #[tokio::test]

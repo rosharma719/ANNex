@@ -1,6 +1,6 @@
 [package]
 name = "annex-py"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -15,7 +15,7 @@ default = []
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-annex = { package = "annex-core", path = "../../crates/annex-core" }
+annex = { package = "annex-core", path = "../../crates/annex-core", version = "0.2.0" }
 pyo3 = { version = "0.29", features = ["abi3-py39"] }
 numpy = "0.29"
 

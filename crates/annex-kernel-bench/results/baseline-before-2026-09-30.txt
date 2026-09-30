@@ -1,0 +1,12 @@
+maxsim_flat/dim=128/doc_tokens=200/query_tokens=32
+                        time:   [417.32 µs 424.43 µs 431.61 µs]
+                        thrpt:  [3.7960 Gelem/s 3.8602 Gelem/s 3.9260 Gelem/s]
+maxsim_flat/dim=128/doc_tokens=100/query_tokens=32
+                        time:   [213.07 µs 218.09 µs 223.53 µs]
+                        thrpt:  [3.6648 Gelem/s 3.7562 Gelem/s 3.8448 Gelem/s]
+maxsim_flat/dim=384/doc_tokens=200/query_tokens=32
+                        time:   [1.5199 ms 1.5367 ms 1.5548 ms]
+                        thrpt:  [3.1612 Gelem/s 3.1986 Gelem/s 3.2340 Gelem/s]
+maxsim_naive/dim=128/q=8/d=8
+                        time:   [6.1133 µs 6.2281 µs 6.3680 µs]
+                        thrpt:  [2.5729 Gelem/s 2.6307 Gelem/s 2.6800 Gelem/s]

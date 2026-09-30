@@ -26,8 +26,8 @@ pub use planner::{
 pub use policy::{PlanningMode, PolicyPlan, QueryRepresentations};
 use rayon::prelude::*;
 pub use retrieval::{
-    AdaptiveRerank, Channel, Chunk, ContextHit, ContextOptions, Fusion, Predicate, Representation,
-    Rerank, RetrievalDocument, RetrievalResponse, RetrievalTrace, RetrieveRequest,
+    AdaptiveRerank, Channel, Chunk, ContextHit, ContextOptions, Fusion, Predicate, RankingSignals,
+    Representation, Rerank, RetrievalDocument, RetrievalResponse, RetrievalTrace, RetrieveRequest,
 };
 use retrieval::{FieldSchema, Fields, RetrievalState};
 use serde::{Deserialize, Serialize};

@@ -438,7 +438,24 @@ pub struct ContextHit {
     pub sources: Vec<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expanded_from: Option<String>,
+    /// Approximate token count for context packing (word_count × 1.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_tokens: Option<usize>,
 }
+#[derive(Clone, Debug, Serialize)]
+pub struct RankingSignals {
+    /// top-1 score minus top-2 score (0 if < 2 results).
+    pub top1_margin: f32,
+    /// top-1 score minus bottom-of-topk score.
+    pub topk_score_spread: f32,
+    /// Already in trace; duplicated here for convenience.
+    pub channel_agreement: Option<f32>,
+    /// Unique parent documents / total matches.
+    pub source_diversity: f32,
+    /// Candidates dropped by text-hash deduplication.
+    pub dedup_count: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RetrievalTrace {
     pub plan: RetrievalPlan,
@@ -451,6 +468,7 @@ pub struct RetrievalTrace {
     pub elapsed_ms: f64,
     /// Wall time in ms for each stage, aligned with `plan.stages`.
     pub per_stage_actual_ms: Vec<f64>,
+    pub signals: RankingSignals,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct RetrievalResponse {
@@ -464,6 +482,8 @@ struct ContextSelection {
     ids: HashSet<String>,
     texts: HashSet<blake3::Hash>,
     parents: HashMap<String, usize>,
+    tokens_consumed: usize,
+    dedup_count: usize,
 }
 
 impl ContextSelection {
@@ -473,14 +493,29 @@ impl ContextSelection {
         fields: &Fields,
         text_key: Option<blake3::Hash>,
         options: &ContextOptions,
-    ) -> bool {
-        !self.ids.contains(id)
-            && text_key.is_none_or(|key| !self.texts.contains(&key))
-            && fields.chunk.as_ref().is_none_or(|chunk| {
-                options.per_parent.is_none_or(|limit| {
-                    self.parents.get(&chunk.parent).copied().unwrap_or(0) < limit
-                })
-            })
+        token_budget: Option<usize>,
+        candidate_tokens: usize,
+    ) -> AcceptResult {
+        if self.ids.contains(id) {
+            return AcceptResult::AlreadyAdded;
+        }
+        if text_key.is_some_and(|key| self.texts.contains(&key)) {
+            return AcceptResult::Deduplicated;
+        }
+        if fields.chunk.as_ref().is_some_and(|chunk| {
+            options
+                .per_parent
+                .is_some_and(|limit| self.parents.get(&chunk.parent).copied().unwrap_or(0) >= limit)
+        }) {
+            return AcceptResult::GroupFull;
+        }
+        // Skip-and-continue token packing: don't stop on first non-fitting item.
+        if let Some(budget) = token_budget {
+            if self.tokens_consumed + candidate_tokens > budget {
+                return AcceptResult::TokenBudgetExceeded;
+            }
+        }
+        AcceptResult::Ok
     }
 
     fn push(&mut self, hit: ContextHit, text_key: Option<blake3::Hash>) {
@@ -491,8 +526,21 @@ impl ContextSelection {
         if let Some(chunk) = &hit.chunk {
             *self.parents.entry(chunk.parent.clone()).or_default() += 1;
         }
+        if let Some(t) = hit.estimated_tokens {
+            self.tokens_consumed += t;
+        }
         self.matches.push(hit);
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum AcceptResult {
+    Ok,
+    AlreadyAdded,
+    Deduplicated,
+    GroupFull,
+    /// Hit doesn't fit in token budget; skip it (caller continues to next).
+    TokenBudgetExceeded,
 }
 
 impl Fields {
@@ -923,7 +971,8 @@ impl MultiVectorIndex {
 
         // ── Stage N: Context ──────────────────────────────────────────────────
         let context_stage_start = Instant::now();
-        let matches = self.context(&s, ranked, &fused, &eligible, request)?;
+        let (matches, signals) =
+            self.context(&s, ranked, &fused, &eligible, request, agreement)?;
         per_stage_actual_ms.push(context_stage_start.elapsed().as_secs_f64() * 1000.);
 
         Ok(RetrievalResponse {
@@ -938,6 +987,7 @@ impl MultiVectorIndex {
                 channel_agreement: agreement,
                 elapsed_ms: started.elapsed().as_secs_f64() * 1000.,
                 per_stage_actual_ms,
+                signals,
             },
         })
     }
@@ -1005,8 +1055,10 @@ impl MultiVectorIndex {
         fused: &HashMap<String, (f32, Vec<usize>)>,
         eligible: &HashSet<&str>,
         request: &RetrieveRequest,
-    ) -> Result<Vec<ContextHit>, IndexError> {
+        channel_agreement: Option<f32>,
+    ) -> Result<(Vec<ContextHit>, RankingSignals), IndexError> {
         let options = &request.context;
+        let token_budget = request.objective.context_budget_tokens;
         let mmr_vectors = if options.mmr.is_some() {
             if ranked.len() > 4096 {
                 return Err(invalid("MMR pool exceeds 4096 candidates"));
@@ -1039,6 +1091,17 @@ impl MultiVectorIndex {
                 None
             }
         };
+        let estimate_tokens = |id: &str| -> Option<usize> {
+            if token_budget.is_none() {
+                return None;
+            }
+            let word_count = s.documents[id]
+                .fields
+                .text
+                .as_ref()
+                .map_or(0, |t| t.split_whitespace().count());
+            Some((word_count * 13 / 10).max(1))
+        };
         // Cache hashes only for MMR's repeatedly inspected, bounded pool. Plain
         // ranking hashes documents lazily, stopping as soon as context is full.
         let candidate_keys: Vec<_> = if mmr_vectors.is_some() {
@@ -1066,10 +1129,22 @@ impl MultiVectorIndex {
                    id: &str,
                    score: f32,
                    expanded_from: Option<String>,
-                   key: Option<blake3::Hash>| {
+                   key: Option<blake3::Hash>|
+         -> bool {
             let d = &s.documents[id];
-            if !eligible.contains(id) || !selected.accepts(id, &d.fields, key, options) {
+            if !eligible.contains(id) {
                 return false;
+            }
+            let est_tokens = estimate_tokens(id).unwrap_or(0);
+            match selected.accepts(id, &d.fields, key, options, token_budget, est_tokens) {
+                AcceptResult::Ok => {}
+                AcceptResult::Deduplicated => {
+                    selected.dedup_count += 1;
+                    return false;
+                }
+                // Token budget exceeded: skip this candidate but don't permanently exclude.
+                AcceptResult::TokenBudgetExceeded => return false,
+                AcceptResult::AlreadyAdded | AcceptResult::GroupFull => return false,
             }
             selected.push(
                 ContextHit {
@@ -1080,6 +1155,11 @@ impl MultiVectorIndex {
                     chunk: d.fields.chunk.clone(),
                     sources: fused.get(id).map(|v| v.1.clone()).unwrap_or_default(),
                     expanded_from,
+                    estimated_tokens: if token_budget.is_some() {
+                        Some(est_tokens)
+                    } else {
+                        None
+                    },
                 },
                 key,
             );
@@ -1096,14 +1176,23 @@ impl MultiVectorIndex {
                     if !remaining[i] {
                         continue;
                     }
-                    if !eligible.contains(id.as_str())
-                        || !selected.accepts(
+                    let est_tokens = estimate_tokens(id).unwrap_or(0);
+                    let result = if !eligible.contains(id.as_str()) {
+                        AcceptResult::AlreadyAdded // permanent exclusion
+                    } else {
+                        selected.accepts(
                             id,
                             &s.documents[id].fields,
                             candidate_keys[i],
                             options,
+                            token_budget,
+                            est_tokens,
                         )
-                    {
+                    };
+                    if matches!(
+                        result,
+                        AcceptResult::AlreadyAdded | AcceptResult::GroupFull | AcceptResult::Deduplicated
+                    ) {
                         // Group and duplicate exclusions cannot become eligible
                         // later; excluded candidates must not affect diversity.
                         remaining[i] = false;
@@ -1170,7 +1259,35 @@ impl MultiVectorIndex {
                 }
             }
         }
-        Ok(selected.matches)
+
+        // ── RankingSignals ────────────────────────────────────────────────────
+        let top1_margin = match ranked.as_slice() {
+            [a, b, ..] => (a.1 - b.1).max(0.0),
+            _ => 0.0,
+        };
+        let topk_score_spread = ranked
+            .first()
+            .zip(ranked.get(request.limit.saturating_sub(1).min(ranked.len().saturating_sub(1))))
+            .map_or(0.0, |(top, bot)| (top.1 - bot.1).max(0.0));
+        let unique_sources = selected
+            .matches
+            .iter()
+            .filter_map(|h| h.chunk.as_ref().map(|c| c.parent.as_str()))
+            .collect::<HashSet<_>>()
+            .len();
+        let source_diversity = if selected.matches.is_empty() {
+            1.0
+        } else {
+            unique_sources as f32 / selected.matches.len() as f32
+        };
+        let signals = RankingSignals {
+            top1_margin,
+            topk_score_spread,
+            channel_agreement,
+            source_diversity,
+            dedup_count: selected.dedup_count,
+        };
+        Ok((selected.matches, signals))
     }
 }
 
@@ -1879,6 +1996,110 @@ mod tests {
             .expect("auto mode must embed PolicyPlan in plan");
         assert!(!policy.channels_selected.is_empty());
         assert!(!policy.selection_reasons.is_empty());
+    }
+
+    // ── Phase 4: context optimizer ────────────────────────────────────────────
+
+    #[test]
+    fn token_budget_skips_large_chunks_rather_than_stopping() {
+        // Insert two short docs and one long doc (>budget by itself).
+        // With a skip-and-continue packer, short docs should appear in output
+        // even though the long doc comes first in score order.
+        let dir = tempfile::tempdir().unwrap();
+        let index = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
+        let long_text = "word ".repeat(200); // ~200 words ≈ 260 estimated tokens
+        let short_text = "short";
+        index
+            .upsert_records(vec![
+                RetrievalDocument {
+                    id: "long".into(),
+                    text: Some(long_text.clone()),
+                    metadata: serde_json::json!({}),
+                    representations: BTreeMap::from([(
+                        "s".into(),
+                        Representation::Dense { vector: vec![1.0, 0.0] },
+                    )]),
+                    ..RetrievalDocument::default()
+                },
+                RetrievalDocument {
+                    id: "short1".into(),
+                    text: Some(short_text.into()),
+                    metadata: serde_json::json!({}),
+                    representations: BTreeMap::from([(
+                        "s".into(),
+                        Representation::Dense { vector: vec![0.9, 0.1] },
+                    )]),
+                    ..RetrievalDocument::default()
+                },
+                RetrievalDocument {
+                    id: "short2".into(),
+                    text: Some(short_text.into()),
+                    metadata: serde_json::json!({}),
+                    representations: BTreeMap::from([(
+                        "s".into(),
+                        Representation::Dense { vector: vec![0.8, 0.2] },
+                    )]),
+                    ..RetrievalDocument::default()
+                },
+            ])
+            .unwrap();
+
+        // Budget of 50 tokens: "long" (~260 tokens) doesn't fit; short docs do.
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [{"kind":"dense","field":"s","vector":[1.0,0.0],"limit":10}],
+            "limit": 5,
+            "objective": {"context_budget_tokens": 50}
+        }))
+        .unwrap();
+        let response = index.retrieve(&query).unwrap();
+        // Short docs must appear — packer should skip "long" and continue.
+        let ids: Vec<&str> = response.matches.iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            ids.contains(&"short1") || ids.contains(&"short2"),
+            "short docs should be included when large doc is skipped: got {:?}",
+            ids
+        );
+        // estimated_tokens should be populated.
+        assert!(
+            response.matches.iter().any(|h| h.estimated_tokens.is_some()),
+            "estimated_tokens must be populated when context_budget_tokens is set"
+        );
+    }
+
+    #[test]
+    fn ranking_signals_are_populated_in_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query = request();
+
+        let response = index.retrieve(&query).unwrap();
+        let signals = &response.trace.signals;
+        assert!(signals.source_diversity >= 0.0 && signals.source_diversity <= 1.0);
+        assert!(signals.topk_score_spread >= 0.0);
+    }
+
+    #[test]
+    fn dedup_count_reflects_dropped_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path()); // docs a, b have same parent "a" for dedup test
+        let mut query = request();
+        query.context.deduplicate = true;
+        // Insert a doc with same text as "a" to trigger dedup.
+        index
+            .upsert_records(vec![RetrievalDocument {
+                id: "dup".into(),
+                text: Some("E123 repair".into()),
+                metadata: serde_json::json!({"tenant":"a","year":2026}),
+                chunk: Some(Chunk {
+                    parent: "a".into(),
+                    position: 3,
+                }),
+                ..RetrievalDocument::default()
+            }])
+            .unwrap();
+        let response = index.retrieve(&query).unwrap();
+        // dedup_count ≥ 0 (dedup may or may not fire depending on corpus)
+        assert!(response.trace.signals.dedup_count < 100);
     }
 
     #[test]

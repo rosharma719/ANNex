@@ -50,6 +50,11 @@ pub struct SearchRuntimeOptions {
     /// where most candidates are rejected. Requires quantize_all() to be called first.
     /// Overrides `VECTORDB_SQ8_SCREEN`.
     pub sq8_screen: Option<bool>,
+    /// Use SQ8 traversal without a float32 rerank pass (cosine only). The integer dot
+    /// scores are rescaled to the real cosine-distance domain on return. Lower latency
+    /// than the rerank path at the cost of approximate scoring. Overrides
+    /// `VECTORDB_SQ8_SCORE_ONLY`.
+    pub sq8_score_only: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug)]

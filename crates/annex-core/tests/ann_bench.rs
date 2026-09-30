@@ -75,9 +75,7 @@ fn ann_build_snapshot() {
         read_npy(format!("{data_dir}/base.npy")).expect("failed to read base.npy");
     let dim = base.ncols();
     let n = base.nrows();
-    eprintln!(
-        "ann_build_snapshot: {n}×{dim} {metric:?} M={m} M0={m0} ef_construct={ef_construct}"
-    );
+    eprintln!("ann_build_snapshot: {n}×{dim} {metric:?} M={m} M0={m0} ef_construct={ef_construct}");
 
     let mut segment = Segment::new(HNSWIndex::new(metric, m, 64, max_level, dim));
     segment.hnsw_mut().set_m0(m0);
@@ -103,9 +101,14 @@ fn ann_build_snapshot() {
     }
     eprintln!("Build complete in {:.1}s", t0.elapsed().as_secs_f64());
 
-    segment.save_to_path(&snap_path).expect("failed to save snapshot");
+    segment
+        .save_to_path(&snap_path)
+        .expect("failed to save snapshot");
     let size = fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0);
-    eprintln!("Snapshot: {snap_path}  ({:.0} MiB)", size as f64 / (1 << 20) as f64);
+    eprintln!(
+        "Snapshot: {snap_path}  ({:.0} MiB)",
+        size as f64 / (1 << 20) as f64
+    );
 }
 
 /// Sweep ef_search values and emit one JSON line per ef.
@@ -149,7 +152,10 @@ fn ann_pareto_sweep() {
     }
 
     // Cache warm
-    let warm = SearchRuntimeOptions { ef_search: Some(64), ..Default::default() };
+    let warm = SearchRuntimeOptions {
+        ef_search: Some(64),
+        ..Default::default()
+    };
     for q in &qs {
         let _ = index.search_with_options(q, top_k, &warm);
     }
@@ -165,7 +171,10 @@ fn ann_pareto_sweep() {
         let mut hits = 0usize;
         for (i, q) in qs.iter().enumerate() {
             let r = index.search_with_options(q, top_k, &opts).unwrap();
-            hits += r.iter().filter(|x| truth[i][..top_k].contains(&x.id)).count();
+            hits += r
+                .iter()
+                .filter(|x| truth[i][..top_k].contains(&x.id))
+                .count();
         }
         let recall = hits as f64 / (count * top_k) as f64;
 
@@ -175,7 +184,11 @@ fn ann_pareto_sweep() {
         for _ in 0..rounds {
             for q in &qs {
                 let t0 = Instant::now();
-                black_box(index.search_with_options(black_box(q), top_k, &opts).unwrap());
+                black_box(
+                    index
+                        .search_with_options(black_box(q), top_k, &opts)
+                        .unwrap(),
+                );
                 times.push(t0.elapsed().as_secs_f64() * 1000.0);
             }
         }

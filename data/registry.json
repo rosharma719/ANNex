@@ -1,0 +1,77 @@
+{
+  "nytimes-256-angular": {
+    "name": "NYT-256-Angular",
+    "description": "New York Times article embeddings, 256-D cosine/angular",
+    "dims": 256,
+    "metric": "angular",
+    "n_base": 290000,
+    "n_queries": 10000,
+    "n_gt": 1000,
+    "source_url": "https://ann-benchmarks.com/nytimes-256-angular.hdf5",
+    "checksums": {
+      "base.npy": "sha256:bf7f90dbdf193831a5daefde6e3c2cf2cd237833d5da7951dc78f48b31292fdf",
+      "queries.npy": "sha256:93693022d4682f0e622fa2196979a302b2ebf015d57166e60ecd13a4f6692ad0",
+      "ground_truth.json": "sha256:e46647a1635d77c12920d5d3111c9d66eda6d821a043a9bacfd1b1b4ddc7e8b3"
+    }
+  },
+  "sift-128-euclidean": {
+    "name": "SIFT-1M",
+    "description": "SIFT image descriptors, 128-D Euclidean, 1M base vectors",
+    "dims": 128,
+    "metric": "euclidean",
+    "n_base": 1000000,
+    "n_queries": 10000,
+    "n_gt": 100,
+    "source_url": "https://ann-benchmarks.com/sift-128-euclidean.hdf5",
+    "checksums": {
+      "base.npy": "sha256:4921953796bc066d3a4be1c6b26e32a27b8931080f21afe30824a63e65cb768d",
+      "queries.npy": "sha256:88e61604b7ad2efee410551fbf6fd800594f4008ac599e2f75fe5a58f569f7b9",
+      "ground_truth.json": "sha256:2294c456299f45f545d702ad67d23ce38809343758aec993e9bdc339899ad792"
+    }
+  },
+  "glove-100-angular": {
+    "name": "GloVe-100-Angular",
+    "description": "GloVe word vectors, 100-D cosine/angular, 1.2M base vectors",
+    "dims": 100,
+    "metric": "angular",
+    "n_base": 1183514,
+    "n_queries": 10000,
+    "n_gt": 100,
+    "source_url": "https://ann-benchmarks.com/glove-100-angular.hdf5",
+    "checksums": {
+      "base.npy": "sha256:1b9996a96818d3d9e828a31c48f6a8dc5641721820aae484bb62323777ef0763",
+      "queries.npy": "sha256:dac3a7045fb447327cd02181fb9e2884e96c181e4982c48c701827237061b3bd",
+      "ground_truth.json": "sha256:dad7c5798ee7f4b790b56e709dec2d25239bef53e727ac32f034217469605ebb"
+    }
+  },
+  "lastfm-64-dot": {
+    "name": "LastFM-64-Dot",
+    "description": "LastFM audio features, 64-D dot product, covers the inner-product metric",
+    "dims": 64,
+    "metric": "dot",
+    "n_base": 292385,
+    "n_queries": 50000,
+    "n_gt": 100,
+    "source_url": "https://ann-benchmarks.com/lastfm-64-dot.hdf5",
+    "checksums": {
+      "base.npy": "sha256:5818c88e494b561eb00cf527d9accd81eb6f56d83b70ea9cfe7d80aa350ec1aa",
+      "queries.npy": "sha256:4b7a61ad41e45dd705ab6b5f07e068c0956d45607119f81500663760990b833d",
+      "ground_truth.json": "sha256:f627228d5f3a357578af2e995b36f6cb6ee0478d863f14cdee2c56d9ac47223f"
+    }
+  },
+  "mnist-784-euclidean": {
+    "name": "MNIST-784-Euclidean",
+    "description": "MNIST digit images, 784-D Euclidean, tests high-dimensional behaviour at small scale",
+    "dims": 784,
+    "metric": "euclidean",
+    "n_base": 60000,
+    "n_queries": 10000,
+    "n_gt": 100,
+    "source_url": "https://ann-benchmarks.com/mnist-784-euclidean.hdf5",
+    "checksums": {
+      "base.npy": "sha256:40a5cc0baa868719b12bb27606620aa2b8502061f388f829555825a6ae30e938",
+      "queries.npy": "sha256:3af50ba2e59a6936d4c5f6a126b8ec22db5aa5a48cc1438d1d53b66ff3d61e82",
+      "ground_truth.json": "sha256:9516651fa450e6fafe0c407dd8281611f5398a1ad72b9ae776fe2cc3d897f775"
+    }
+  }
+}

@@ -1,6 +1,7 @@
 target/
-# All datasets
-data/
+# All datasets (large files); registry.json is the committed exception
+data/*
+!data/registry.json
 # Local logs
 logs/
 .DS_Store

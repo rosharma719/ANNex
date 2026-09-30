@@ -110,6 +110,10 @@ impl RetrievalState {
         &self.schema
     }
 
+    pub(super) fn has_sparse_field(&self, field: &str) -> bool {
+        self.sparse.contains_key(field)
+    }
+
     pub(super) fn dense_dimension(&self, field: &str) -> Result<usize, IndexError> {
         match self.schema.get(field) {
             Some(FieldSchema::Dense { dimension }) => Ok(*dimension),
@@ -235,7 +239,7 @@ pub enum Predicate {
     },
 }
 impl Predicate {
-    fn validate(&self, depth: usize) -> Result<(), IndexError> {
+    pub(super) fn validate(&self, depth: usize) -> Result<(), IndexError> {
         if depth > 16 {
             return Err(invalid("filter nesting exceeds 16"));
         }
@@ -275,7 +279,7 @@ impl Predicate {
         }
         Ok(())
     }
-    fn matches(&self, metadata: &Value) -> bool {
+    pub(super) fn matches(&self, metadata: &Value) -> bool {
         let value = |field: &str| {
             if field.starts_with('/') {
                 metadata.pointer(field)
@@ -429,6 +433,7 @@ pub struct ContextHit {
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct RetrievalTrace {
+    pub plan: RetrievalPlan,
     pub generation: u64,
     pub eligible_documents: usize,
     pub channels: Vec<Value>,
@@ -591,7 +596,7 @@ impl Fields {
         Ok(())
     }
 }
-fn validate_matrix(vectors: &[Vector]) -> Result<(), IndexError> {
+pub(super) fn validate_matrix(vectors: &[Vector]) -> Result<(), IndexError> {
     let dimension = vectors.first().map_or(0, Vec::len);
     if vectors.is_empty()
         || vectors.len() > 8192
@@ -641,22 +646,7 @@ impl MultiVectorIndex {
     }
     pub fn retrieve(&self, request: &RetrieveRequest) -> Result<RetrievalResponse, IndexError> {
         let started = Instant::now();
-        if request.prefetch.is_empty()
-            || request.prefetch.len() > 8
-            || request.limit == 0
-            || request.limit > 10_000
-            || request.context.neighbors > 8
-            || request.context.per_parent == Some(0)
-            || request
-                .context
-                .mmr
-                .is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))
-        {
-            return Err(invalid("invalid retrieval or context budgets"));
-        }
-        if let Some(filter) = &request.filter {
-            filter.validate(0)?;
-        }
+        planner::validate_request(request)?;
         let s = self.snapshot();
         let eligible: HashSet<_> = s
             .documents
@@ -669,19 +659,13 @@ impl MultiVectorIndex {
             })
             .map(|(id, _)| id.as_str())
             .collect();
+        let plan = self.compile_plan(&s, request, eligible.len())?;
         let mut channels = Vec::new();
         let mut lists = Vec::new();
-        for channel in &request.prefetch {
+        for (channel_index, channel) in request.prefetch.iter().enumerate() {
             let at = Instant::now();
-            let limit = match channel {
-                Channel::Bm25 { limit, .. }
-                | Channel::Sparse { limit, .. }
-                | Channel::Dense { limit, .. }
-                | Channel::Multivector { limit, .. } => *limit,
-            };
-            if limit == 0 || limit > 100_000 {
-                return Err(invalid("channel limit must be in 1..=100000"));
-            }
+            let planned = &plan.channels[channel_index];
+            let limit = planned.limit;
             let allowed = |number| {
                 s.retrieval
                     .ids
@@ -694,11 +678,8 @@ impl MultiVectorIndex {
                     .collect::<Vec<_>>()
             };
             let tie_break = |a, b| s.retrieval.ids[&a].cmp(&s.retrieval.ids[&b]);
-            let (scores, backend) = match channel {
+            let scores = match channel {
                 Channel::Bm25 { text, k1, b, .. } => {
-                    if text.len() > 65_536 {
-                        return Err(invalid("query text exceeds 65536 bytes"));
-                    }
                     // BM25 query weights are raw analyzed query term
                     // frequencies: repeated query terms contribute repeatedly.
                     let query = SparseVector::from_pairs(
@@ -708,14 +689,11 @@ impl MultiVectorIndex {
                             },
                         ),
                     );
-                    (
-                        external(
-                            s.retrieval
-                                .lexical
-                                .search_bm25_filtered_by(&query, limit, *k1, *b, allowed, tie_break)
-                                .map_err(sparse_error)?,
-                        ),
-                        "bm25",
+                    external(
+                        s.retrieval
+                            .lexical
+                            .search_bm25_filtered_by(&query, limit, *k1, *b, allowed, tie_break)
+                            .map_err(sparse_error)?,
                     )
                 }
                 Channel::Sparse { field, vector, .. } => {
@@ -724,115 +702,67 @@ impl MultiVectorIndex {
                         .sparse
                         .get(field)
                         .ok_or_else(|| invalid(format!("unknown sparse field {field:?}")))?;
-                    (
-                        external(
-                            index
-                                .search_dot_filtered_by(vector, limit, allowed, tie_break)
-                                .map_err(sparse_error)?,
-                        ),
-                        "sparse_dot",
+                    external(
+                        index
+                            .search_dot_filtered_by(vector, limit, allowed, tie_break)
+                            .map_err(sparse_error)?,
                     )
                 }
                 Channel::Dense {
                     field,
                     vector,
-                    backend,
                     ef_search,
                     ..
                 } => {
-                    validate_matrix(std::slice::from_ref(vector))?;
-                    if s.retrieval.dense_dimension(field)? != vector.len()
-                        || !["auto", "exact", "hnsw"].contains(&backend.as_str())
-                        || *ef_search == 0
-                        || *ef_search > 65_536
-                    {
-                        return Err(invalid("invalid dense query dimension or backend"));
-                    }
-                    if request.filter.is_none()
-                        && backend != "exact"
-                        && s.named_ann.contains_key(field)
-                    {
-                        (
-                            self.ann_scores(
-                                &s,
-                                &s.named_ann[field],
-                                &normalize(vector),
-                                limit,
-                                *ef_search,
-                            )?,
-                            "hnsw_dense",
-                        )
+                    if planned.operator == PhysicalOperator::HnswDense {
+                        self.ann_scores(
+                            &s,
+                            &s.named_ann[field],
+                            &normalize(vector),
+                            limit,
+                            *ef_search,
+                        )?
                     } else {
-                        if backend == "hnsw" && !s.named_ann.contains_key(field) {
-                            return Err(invalid("dense ANN not built"));
-                        }
-                        (
-                            self.named_scores(
-                                &s,
-                                field,
-                                std::slice::from_ref(vector),
-                                false,
-                                &eligible,
-                                limit,
-                            )?,
-                            "exact_dense",
-                        )
+                        self.named_scores(
+                            &s,
+                            field,
+                            std::slice::from_ref(vector),
+                            false,
+                            &eligible,
+                            limit,
+                        )?
                     }
                 }
                 Channel::Multivector {
                     field: Some(field),
                     vectors,
-                    backend,
                     ..
-                } => {
-                    if backend != "auto" && backend != "exact" {
-                        return Err(invalid("named multivectors support exact or auto"));
-                    }
-                    (
-                        self.named_scores(&s, field, vectors, true, &eligible, limit)?,
-                        "exact_maxsim",
-                    )
-                }
+                } => self.named_scores(&s, field, vectors, true, &eligible, limit)?,
                 Channel::Multivector {
                     field: None,
                     vectors,
-                    backend,
                     ef_search,
                     ..
                 } => {
-                    self.validate(vectors)?;
-                    if vectors.len() > 1024
-                        || *ef_search == 0
-                        || *ef_search > 65_536
-                        || !["auto", "exact", "hnsw"].contains(&backend.as_str())
-                    {
-                        return Err(invalid("invalid multivector backend or budget"));
-                    }
                     let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
-                    if request.filter.is_none() && backend != "exact" && s.fde_ann.is_some() {
-                        (
-                            self.ann_fde_scores(
-                                &s,
-                                &self.fde.encode_query(&normalized),
-                                limit,
-                                *ef_search,
-                            )?,
-                            "hnsw_fde",
-                        )
+                    if planned.operator == PhysicalOperator::HnswFde {
+                        self.ann_fde_scores(
+                            &s,
+                            &self.fde.encode_query(&normalized),
+                            limit,
+                            *ef_search,
+                        )?
                     } else {
-                        if backend == "hnsw" && s.fde_ann.is_none() {
-                            return Err(invalid("FDE ANN not built"));
-                        }
-                        let scores = self.exact_fde_scores_filtered(
+                        self.exact_fde_scores_filtered(
                             &s,
                             &normalized,
                             Some(limit),
                             Some(&eligible),
-                        )?;
-                        (scores, "exact_fde")
+                        )?
                     }
                 }
             };
+            let backend = planned.operator.as_str();
             channels.push(serde_json::json!({"backend": backend,"candidates": scores.len(),"elapsed_ms": at.elapsed().as_secs_f64()*1000.}));
             lists.push(scores);
         }
@@ -864,21 +794,6 @@ impl MultiVectorIndex {
             None
         };
         let mut fused: HashMap<String, (f32, Vec<usize>)> = HashMap::new();
-        match &request.fusion {
-            Fusion::Rrf { k } if !k.is_finite() || *k < 0. => {
-                return Err(invalid("RRF k must be finite and nonnegative"));
-            }
-            Fusion::Weighted { weights }
-                if weights.len() != lists.len()
-                    || weights.iter().any(|w| !w.is_finite() || *w < 0.)
-                    || weights.iter().all(|w| *w == 0.) =>
-            {
-                return Err(invalid(
-                    "weighted fusion requires one nonnegative finite weight per channel",
-                ));
-            }
-            _ => (),
-        }
         for (channel, list) in lists.iter().enumerate() {
             for (rank, (id, score)) in list.iter().enumerate() {
                 let contribution = match &request.fusion {
@@ -908,23 +823,10 @@ impl MultiVectorIndex {
         let fused_candidates = ranked.len();
         let mut reranked = 0;
         if let Some(rerank) = &request.rerank {
-            if rerank.limit < request.limit || rerank.limit > 100_000 {
-                return Err(invalid(
-                    "rerank limit must cover result limit and be <=100000",
-                ));
-            }
             let budget = if let Some(policy) = &rerank.adaptive {
-                if policy.min_candidates < request.limit
-                    || policy.min_candidates > rerank.limit
-                    || !policy.agreement_threshold.is_finite()
-                    || !(0.0..=1.0).contains(&policy.agreement_threshold)
-                    || agreement.is_none()
+                if agreement.expect("planner requires multiple channels")
+                    >= policy.agreement_threshold
                 {
-                    return Err(invalid(
-                        "invalid adaptive rerank policy; needs multiple channels",
-                    ));
-                }
-                if agreement.unwrap() >= policy.agreement_threshold {
                     policy.min_candidates
                 } else {
                     rerank.limit
@@ -960,6 +862,7 @@ impl MultiVectorIndex {
         Ok(RetrievalResponse {
             matches,
             trace: RetrievalTrace {
+                plan,
                 generation: s.generation,
                 eligible_documents: eligible.len(),
                 channels,
@@ -1246,6 +1149,41 @@ mod tests {
             ])
             .unwrap();
         index
+    }
+
+    #[test]
+    fn planner_selects_available_operators_and_execution_reports_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut query = request();
+        query.filter = None;
+        query
+            .prefetch
+            .retain(|channel| matches!(channel, Channel::Dense { .. }));
+
+        let exact = index.plan(&query).unwrap();
+        assert_eq!(exact.channels[0].operator, PhysicalOperator::ExactDense);
+        assert_eq!(exact.channels[0].reason, PlanReason::AnnUnavailable);
+
+        index.build_dense_ann("semantic", 4, 16).unwrap();
+        let ann = index.plan(&query).unwrap();
+        assert_eq!(ann.channels[0].operator, PhysicalOperator::HnswDense);
+        assert_eq!(ann.channels[0].reason, PlanReason::AnnReady);
+        let response = index.retrieve(&query).unwrap();
+        assert_eq!(response.trace.plan, ann);
+        assert_eq!(
+            response.trace.channels[0]["backend"],
+            ann.channels[0].operator.as_str()
+        );
+
+        query.filter = Some(Predicate::Eq {
+            field: "tenant".into(),
+            value: json!("a"),
+        });
+        let filtered = index.plan(&query).unwrap();
+        assert_eq!(filtered.channels[0].operator, PhysicalOperator::ExactDense);
+        assert_eq!(filtered.channels[0].reason, PlanReason::FilterRequiresExact);
+        assert_eq!(filtered.eligible_documents, 2);
     }
     #[test]
     fn hybrid_filters_before_top_k_and_preserves_named_fields_on_reopen() {

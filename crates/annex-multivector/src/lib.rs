@@ -10,8 +10,10 @@ mod muvera;
 mod storage;
 
 pub use engine::{
-    AdaptiveRerank, CandidateHit, Channel, Chunk, ContextHit, ContextOptions, Durability, Fusion,
-    Hit, IndexConfig, IndexError, IndexStats, MultiVectorIndex, Predicate, Representation, Rerank,
-    RetrievalDocument, RetrievalResponse, RetrievalTrace, RetrieveRequest, UpsertDocument,
+    AdaptiveRerank, CandidateHit, Channel, Chunk, ContextHit, ContextOptions, Durability,
+    FilterStrategy, Fusion, Hit, IndexConfig, IndexError, IndexStats, MultiVectorIndex,
+    PhysicalOperator, PlanReason, PlannedChannel, Predicate, Representation, Rerank,
+    RetrievalDocument, RetrievalPlan, RetrievalResponse, RetrievalTrace, RetrieveRequest,
+    UpsertDocument,
 };
 pub use fde::{maxsim, maxsim_flat};

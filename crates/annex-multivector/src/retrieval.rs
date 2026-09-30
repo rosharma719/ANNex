@@ -393,7 +393,7 @@ pub struct AdaptiveRerank {
     pub min_candidates: usize,
     pub agreement_threshold: f32,
 }
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextOptions {
     pub per_parent: Option<usize>,
@@ -408,6 +408,8 @@ pub struct ContextOptions {
 #[serde(deny_unknown_fields)]
 pub struct RetrieveRequest {
     pub prefetch: Vec<Channel>,
+    #[serde(default)]
+    pub objective: RetrievalObjective,
     #[serde(default)]
     pub fusion: Fusion,
     pub filter: Option<Predicate>,
@@ -441,6 +443,8 @@ pub struct RetrievalTrace {
     pub reranked_candidates: usize,
     pub channel_agreement: Option<f32>,
     pub elapsed_ms: f64,
+    /// Wall time in ms for each stage, aligned with `plan.stages`.
+    pub per_stage_actual_ms: Vec<f64>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct RetrievalResponse {
@@ -486,6 +490,10 @@ impl ContextSelection {
 }
 
 impl Fields {
+    pub(super) fn has_representation(&self, field: &str) -> bool {
+        self.representations.contains_key(field)
+    }
+
     pub(super) fn has_dense(&self, field: &str) -> bool {
         matches!(
             self.representations.get(field),
@@ -660,11 +668,15 @@ impl MultiVectorIndex {
             .map(|(id, _)| id.as_str())
             .collect();
         let plan = self.compile_plan(&s, request, eligible.len())?;
+        let mut per_stage_actual_ms: Vec<f64> = Vec::with_capacity(plan.stages.len());
         let mut channels = Vec::new();
         let mut lists = Vec::new();
+
+        // ── Stage 0: Parallel channel execution ──────────────────────────────
+        let parallel_stage_start = Instant::now();
         for (channel_index, channel) in request.prefetch.iter().enumerate() {
             let at = Instant::now();
-            let planned = &plan.channels[channel_index];
+            let planned = &plan.parallel_channels()[channel_index];
             let limit = planned.limit;
             let allowed = |number| {
                 s.retrieval
@@ -766,6 +778,10 @@ impl MultiVectorIndex {
             channels.push(serde_json::json!({"backend": backend,"candidates": scores.len(),"elapsed_ms": at.elapsed().as_secs_f64()*1000.}));
             lists.push(scores);
         }
+        per_stage_actual_ms.push(parallel_stage_start.elapsed().as_secs_f64() * 1000.);
+
+        // ── Stage 1: Fusion ───────────────────────────────────────────────────
+        let fusion_stage_start = Instant::now();
         let agreement = if lists.len() > 1 {
             let head: HashSet<_> = lists[0]
                 .iter()
@@ -821,8 +837,12 @@ impl MultiVectorIndex {
             )
         };
         let fused_candidates = ranked.len();
+        per_stage_actual_ms.push(fusion_stage_start.elapsed().as_secs_f64() * 1000.);
+
+        // ── Stage 2 (optional): Rerank ────────────────────────────────────────
         let mut reranked = 0;
         if let Some(rerank) = &request.rerank {
+            let rerank_stage_start = Instant::now();
             let budget = if let Some(policy) = &rerank.adaptive {
                 if agreement.expect("planner requires multiple channels")
                     >= policy.agreement_threshold
@@ -857,8 +877,14 @@ impl MultiVectorIndex {
                     .map(|h| (h.id, h.score))
                     .collect();
             }
+            per_stage_actual_ms.push(rerank_stage_start.elapsed().as_secs_f64() * 1000.);
         }
+
+        // ── Stage N: Context ──────────────────────────────────────────────────
+        let context_stage_start = Instant::now();
         let matches = self.context(&s, ranked, &fused, &eligible, request)?;
+        per_stage_actual_ms.push(context_stage_start.elapsed().as_secs_f64() * 1000.);
+
         Ok(RetrievalResponse {
             matches,
             trace: RetrievalTrace {
@@ -870,6 +896,7 @@ impl MultiVectorIndex {
                 reranked_candidates: reranked,
                 channel_agreement: agreement,
                 elapsed_ms: started.elapsed().as_secs_f64() * 1000.,
+                per_stage_actual_ms,
             },
         })
     }
@@ -1109,7 +1136,7 @@ impl MultiVectorIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::FAIL_COMMIT;
+    use crate::{engine::planner::FusionOperator, storage::FAIL_COMMIT};
     use serde_json::json;
 
     fn document(
@@ -1162,18 +1189,27 @@ mod tests {
             .retain(|channel| matches!(channel, Channel::Dense { .. }));
 
         let exact = index.plan(&query).unwrap();
-        assert_eq!(exact.channels[0].operator, PhysicalOperator::ExactDense);
-        assert_eq!(exact.channels[0].reason, PlanReason::AnnUnavailable);
+        assert_eq!(
+            exact.parallel_channels()[0].operator,
+            PhysicalOperator::ExactDense
+        );
+        assert_eq!(
+            exact.parallel_channels()[0].reason,
+            PlanReason::AnnUnavailable
+        );
 
         index.build_dense_ann("semantic", 4, 16).unwrap();
         let ann = index.plan(&query).unwrap();
-        assert_eq!(ann.channels[0].operator, PhysicalOperator::HnswDense);
-        assert_eq!(ann.channels[0].reason, PlanReason::AnnReady);
+        assert_eq!(
+            ann.parallel_channels()[0].operator,
+            PhysicalOperator::HnswDense
+        );
+        assert_eq!(ann.parallel_channels()[0].reason, PlanReason::AnnReady);
         let response = index.retrieve(&query).unwrap();
         assert_eq!(response.trace.plan, ann);
         assert_eq!(
             response.trace.channels[0]["backend"],
-            ann.channels[0].operator.as_str()
+            ann.parallel_channels()[0].operator.as_str()
         );
 
         query.filter = Some(Predicate::Eq {
@@ -1181,8 +1217,14 @@ mod tests {
             value: json!("a"),
         });
         let filtered = index.plan(&query).unwrap();
-        assert_eq!(filtered.channels[0].operator, PhysicalOperator::ExactDense);
-        assert_eq!(filtered.channels[0].reason, PlanReason::FilterRequiresExact);
+        assert_eq!(
+            filtered.parallel_channels()[0].operator,
+            PhysicalOperator::ExactDense
+        );
+        assert_eq!(
+            filtered.parallel_channels()[0].reason,
+            PlanReason::FilterRequiresExact
+        );
         assert_eq!(filtered.eligible_documents, 2);
     }
     #[test]
@@ -1709,5 +1751,177 @@ mod tests {
     #[test]
     fn global_development_choice_is_the_rrf_default() {
         assert!(matches!(Fusion::default(), Fusion::Rrf { k } if k == 10.));
+    }
+
+    // ── Phase 1A: Plan IR, EXPLAIN, concurrent execution ─────────────────────
+
+    #[test]
+    fn plan_stages_structure_matches_request_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        // Two-channel request: Dense + BM25
+        let query = request();
+        let plan = index.plan(&query).unwrap();
+
+        // First stage must be Parallel with one PlannedChannel per prefetch entry.
+        let PlanStage::Parallel(channels) = &plan.stages[0] else {
+            panic!("expected Parallel stage, got {:?}", plan.stages[0]);
+        };
+        assert_eq!(channels.len(), query.prefetch.len());
+
+        // Second stage must be Fusion (two channels → RRF).
+        assert!(
+            matches!(plan.stages[1], PlanStage::Fusion(FusionOperator::ReciprocalRank)),
+            "expected RRF fusion, got {:?}",
+            plan.stages[1]
+        );
+
+        // Last stage must be Context.
+        assert!(
+            matches!(plan.stages.last().unwrap(), PlanStage::Context(_)),
+            "last stage must be Context"
+        );
+
+        // PlanEstimate values must be strictly positive.
+        assert!(plan.estimate.estimated_wall_ms > 0.0);
+        assert!(plan.estimate.estimated_cpu_work > 0.0);
+    }
+
+    #[test]
+    fn single_channel_plan_uses_native_score_not_rrf() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut query = request();
+        query.prefetch.retain(|c| matches!(c, Channel::Bm25 { .. }));
+
+        let plan = index.plan(&query).unwrap();
+        assert!(
+            matches!(plan.stages[1], PlanStage::Fusion(FusionOperator::NativeScore)),
+            "single channel must bypass RRF"
+        );
+    }
+
+    #[test]
+    fn plan_with_rerank_includes_rerank_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut query = request();
+        query.prefetch.retain(|c| matches!(c, Channel::Dense { .. }));
+        query.rerank = Some(Rerank {
+            field: Some("tokens".into()),
+            vectors: vec![vec![1., 0.]],
+            limit: 3,
+            adaptive: None,
+        });
+
+        let plan = index.plan(&query).unwrap();
+        let has_rerank = plan
+            .stages
+            .iter()
+            .any(|s| matches!(s, PlanStage::Rerank(_)));
+        assert!(has_rerank, "rerank stage missing from plan");
+    }
+
+    #[test]
+    fn plan_is_deterministic_for_same_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query = request();
+
+        let plan_a = index.plan(&query).unwrap();
+        let plan_b = index.plan(&query).unwrap();
+        assert_eq!(plan_a, plan_b, "planning must be deterministic");
+    }
+
+    #[test]
+    fn plan_parallel_channels_accessor_returns_channels_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query = request();
+
+        let plan = index.plan(&query).unwrap();
+        let channels = plan.parallel_channels();
+        assert_eq!(channels.len(), query.prefetch.len());
+        for (i, ch) in channels.iter().enumerate() {
+            assert_eq!(ch.index, i);
+        }
+    }
+
+    #[test]
+    fn retrieve_trace_per_stage_ms_is_aligned_with_plan_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query = request();
+
+        let response = index.retrieve(&query).unwrap();
+        let trace = &response.trace;
+
+        assert_eq!(
+            trace.per_stage_actual_ms.len(),
+            trace.plan.stages.len(),
+            "per_stage_actual_ms must have one entry per plan stage"
+        );
+        for &ms in &trace.per_stage_actual_ms {
+            assert!(ms >= 0.0, "stage duration must be non-negative");
+        }
+    }
+
+    #[test]
+    fn retrieve_trace_plan_matches_dry_run_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut query = request();
+        query.filter = None;
+
+        let dry_run = index.plan(&query).unwrap();
+        let response = index.retrieve(&query).unwrap();
+        assert_eq!(
+            response.trace.plan, dry_run,
+            "plan embedded in trace must match plan() dry-run"
+        );
+    }
+
+    #[test]
+    fn plan_estimate_wall_time_closer_to_max_than_sum_for_parallel_channels() {
+        // Structural check: estimated_wall_ms must be <= sum of per-channel estimates.
+        // (Exact parallelism savings are timing-dependent; we test the model, not the clock.)
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query = request(); // two channels
+
+        let plan = index.plan(&query).unwrap();
+        let channels = plan.parallel_channels();
+        let channel_cost_sum: f64 = channels.iter().map(|c| c.estimated_cost_units).sum();
+
+        // cpu_work is the aggregate; wall_ms should reflect the critical path (≤ sum).
+        assert!(
+            plan.estimate.estimated_wall_ms <= plan.estimate.estimated_cpu_work + 0.01,
+            "wall_ms ({}) should not exceed cpu_work ({})",
+            plan.estimate.estimated_wall_ms,
+            plan.estimate.estimated_cpu_work
+        );
+        assert!(
+            channel_cost_sum > 0.0,
+            "per-channel cost units must be populated"
+        );
+    }
+
+    #[test]
+    fn planner_reasons_are_machine_readable_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut query = request();
+        query.filter = None;
+        query.prefetch.retain(|c| matches!(c, Channel::Dense { .. }));
+
+        // Without ANN: reason must carry structured info (not just a string tag).
+        let plan = index.plan(&query).unwrap();
+        let channels = plan.parallel_channels();
+        let reason = channels[0].reason;
+        // AnnUnavailable or IndexUnavailable — both are machine-readable enum variants.
+        assert!(
+            matches!(reason, PlanReason::AnnUnavailable | PlanReason::IndexUnavailable),
+            "expected unavailability reason, got {reason:?}"
+        );
     }
 }

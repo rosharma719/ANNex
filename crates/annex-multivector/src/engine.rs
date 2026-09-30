@@ -15,7 +15,12 @@ use annex::{
     utils::types::DistanceMetric,
     vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
 };
-pub use planner::{FilterStrategy, PhysicalOperator, PlanReason, PlannedChannel, RetrievalPlan};
+pub use planner::{
+    ConditionalStage, ContextPlan, ContextOperator, EscalationPredicate, FieldStats, FilterStrategy,
+    FusionOperator, LogicalChannel, LogicalChannelKind, LogicalFusion, LogicalPlan,
+    PhysicalOperator, PlanEstimate, PlanReason, PlanStage, PlannerStats, PlannedChannel,
+    QualityPreference, RerankPlan, RepresentationKind, RetrievalObjective, RetrievalPlan,
+};
 use rayon::prelude::*;
 pub use retrieval::{
     AdaptiveRerank, Channel, Chunk, ContextHit, ContextOptions, Fusion, Predicate, Representation,

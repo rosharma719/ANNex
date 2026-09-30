@@ -629,25 +629,25 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("planning failed: {}", error.0));
         assert_eq!(
-            actual.0.channels[0].operator,
+            actual.0.parallel_channels()[0].operator,
             multivector::PhysicalOperator::ExactFde
         );
         assert_eq!(
-            actual.0.channels[0].reason,
+            actual.0.parallel_channels()[0].reason,
             multivector::PlanReason::AnnUnavailable
         );
-        assert_eq!(actual.0.documents, 2);
+        assert_eq!(actual.0.stats.documents, 2);
 
         index.build_fde_ann(4, 16).unwrap();
         let actual = plan(State(index), Json(body))
             .await
             .unwrap_or_else(|error| panic!("planning failed: {}", error.0));
         assert_eq!(
-            actual.0.channels[0].operator,
+            actual.0.parallel_channels()[0].operator,
             multivector::PhysicalOperator::HnswFde
         );
         assert_eq!(
-            actual.0.channels[0].reason,
+            actual.0.parallel_channels()[0].reason,
             multivector::PlanReason::AnnReady
         );
     }

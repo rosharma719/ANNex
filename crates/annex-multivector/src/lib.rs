@@ -11,9 +11,12 @@ mod storage;
 
 pub use engine::{
     AdaptiveRerank, CandidateHit, Channel, Chunk, ContextHit, ContextOptions, Durability,
-    FilterStrategy, Fusion, Hit, IndexConfig, IndexError, IndexStats, MultiVectorIndex,
-    PhysicalOperator, PlanReason, PlannedChannel, Predicate, Representation, Rerank,
-    RetrievalDocument, RetrievalPlan, RetrievalResponse, RetrievalTrace, RetrieveRequest,
-    UpsertDocument,
+    EscalationPredicate, ConditionalStage, ContextOperator, ContextPlan, FieldStats,
+    FilterStrategy, FusionOperator, Fusion, Hit, IndexConfig, IndexError, IndexStats,
+    LogicalChannel, LogicalChannelKind, LogicalFusion, LogicalPlan, MultiVectorIndex,
+    PhysicalOperator, PlanEstimate, PlanReason, PlanStage, PlannerStats, PlannedChannel,
+    Predicate, QualityPreference, Representation, Rerank, RerankPlan, RepresentationKind,
+    RetrievalDocument, RetrievalObjective, RetrievalPlan, RetrievalResponse, RetrievalTrace,
+    RetrieveRequest, UpsertDocument,
 };
 pub use fde::{maxsim, maxsim_flat};

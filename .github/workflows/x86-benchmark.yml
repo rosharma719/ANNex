@@ -31,7 +31,7 @@ jobs:
             cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || true
           } > x86-results/environment.txt
       - name: Validate explicit SIMD paths
-        run: cargo test --locked --release -p annex-core x86_simd_kernels_match_scalar_across_shapes -- --nocapture |& tee x86-results/correctness.txt
+        run: cargo test --locked --release -p annex x86_simd_kernels_match_scalar_across_shapes -- --nocapture |& tee x86-results/correctness.txt
       - name: Measure kernels
         run: cargo bench --locked -p annex-multivector --bench kernels -- --noplot |& tee x86-results/kernels.txt
       - name: Preserve raw evidence

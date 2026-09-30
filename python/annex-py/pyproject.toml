@@ -7,8 +7,21 @@ name = "ANNexDB"
 version = "0.2.0"
 requires-python = ">=3.9"
 description = "Python bindings for the ANNex vector search engine."
+readme = "README.md"
+keywords = ["vector-search", "hnsw", "ann", "rag", "embeddings"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Database :: Database Engines/Servers",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 license = { text = "MIT OR Apache-2.0" }
 dependencies = ["numpy>=1.23"]
+
+[project.urls]
+Homepage = "https://github.com/rosharma719/ANNex"
+Repository = "https://github.com/rosharma719/ANNex"
+Issues = "https://github.com/rosharma719/ANNex/issues"
 
 [tool.maturin]
 features = ["extension-module"]

@@ -64,6 +64,7 @@ jobs:
         run: |
           python -m pip install 'maturin>=1.8,<2'
           cargo run -p annex-py --example make_test_fixture -- "$RUNNER_TEMP/annex-fixture.bin"
+          rm -f target/wheels/annex_py-*.whl
           maturin build --manifest-path python/annex-py/Cargo.toml --release --compatibility linux
           python -m pip install target/wheels/annex_py-*.whl
           ANNEX_TEST_SNAPSHOT="$RUNNER_TEMP/annex-fixture.bin" python -m unittest discover -s python/annex-py/tests -v

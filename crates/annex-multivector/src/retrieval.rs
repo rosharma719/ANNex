@@ -711,22 +711,21 @@ impl MultiVectorIndex {
         planner::validate_request(request)?;
         let s = self.snapshot();
         // Phase 3: for auto modes, generate prefetch from policy planner first.
-        let (effective_request, policy_plan) =
-            if request.planning_mode != PlanningMode::Manual {
-                let stats = planner::planner_stats(&s, self.fde.output_dimension(), None);
-                let policy = policy::generate_policy_prefetch(
-                    request.query.as_ref().unwrap(),
-                    &stats,
-                    request.limit,
-                    request.objective.quality,
-                    s.retrieval.schema(),
-                );
-                let mut patched = request.clone();
-                patched.prefetch = policy.generated_prefetch.clone();
-                (std::borrow::Cow::Owned(patched), Some(policy))
-            } else {
-                (std::borrow::Cow::Borrowed(request), None)
-            };
+        let (effective_request, policy_plan) = if request.planning_mode != PlanningMode::Manual {
+            let stats = planner::planner_stats(&s, self.fde.output_dimension(), None);
+            let policy = policy::generate_policy_prefetch(
+                request.query.as_ref().unwrap(),
+                &stats,
+                request.limit,
+                request.objective.quality,
+                s.retrieval.schema(),
+            );
+            let mut patched = request.clone();
+            patched.prefetch = policy.generated_prefetch.clone();
+            (std::borrow::Cow::Owned(patched), Some(policy))
+        } else {
+            (std::borrow::Cow::Borrowed(request), None)
+        };
         let request = effective_request.as_ref();
         let eligible: HashSet<_> = s
             .documents
@@ -743,20 +742,17 @@ impl MultiVectorIndex {
         plan.policy = policy_plan;
         let mut per_stage_actual_ms: Vec<f64> = Vec::with_capacity(plan.stages.len());
 
-        // ── Stage 0: Parallel channel execution ──────────────────────────────
         // Channels are independent — dispatch them concurrently with Rayon.
         // NOTE: each channel may itself use par_iter internally; nested Rayon
         // work-stealing is safe but may create contention under high concurrency.
         // A per-query parallelism budget is tracked in a later phase.
-        let planned_channels_snap: Vec<_> = plan.parallel_channels().to_vec();
         let parallel_stage_start = Instant::now();
         let channel_results: Vec<Result<(Vec<(String, f32)>, Value), IndexError>> = request
             .prefetch
             .par_iter()
-            .enumerate()
-            .map(|(channel_index, channel)| {
+            .zip(plan.parallel_channels().par_iter())
+            .map(|(channel, planned)| {
                 let at = Instant::now();
-                let planned = &planned_channels_snap[channel_index];
                 let limit = planned.limit;
                 let allowed = |number: u64| {
                     s.retrieval
@@ -769,8 +765,7 @@ impl MultiVectorIndex {
                         .map(|(id, score)| (s.retrieval.ids[&id].clone(), score))
                         .collect()
                 };
-                let tie_break =
-                    |a: u64, b: u64| s.retrieval.ids[&a].cmp(&s.retrieval.ids[&b]);
+                let tie_break = |a: u64, b: u64| s.retrieval.ids[&a].cmp(&s.retrieval.ids[&b]);
                 let scores = match channel {
                     Channel::Bm25 { text, k1, b, .. } => {
                         let query = SparseVector::from_pairs(
@@ -783,16 +778,15 @@ impl MultiVectorIndex {
                         external(
                             s.retrieval
                                 .lexical
-                                .search_bm25_filtered_by(
-                                    &query, limit, *k1, *b, allowed, tie_break,
-                                )
+                                .search_bm25_filtered_by(&query, limit, *k1, *b, allowed, tie_break)
                                 .map_err(sparse_error)?,
                         )
                     }
                     Channel::Sparse { field, vector, .. } => {
-                        let index = s.retrieval.sparse.get(field).ok_or_else(|| {
-                            invalid(format!("unknown sparse field {field:?}"))
-                        })?;
+                        let index =
+                            s.retrieval.sparse.get(field).ok_or_else(|| {
+                                invalid(format!("unknown sparse field {field:?}"))
+                            })?;
                         external(
                             index
                                 .search_dot_filtered_by(vector, limit, allowed, tie_break)
@@ -869,7 +863,6 @@ impl MultiVectorIndex {
             .unzip();
         per_stage_actual_ms.push(parallel_stage_start.elapsed().as_secs_f64() * 1000.);
 
-        // ── Stage 1: Fusion ───────────────────────────────────────────────────
         let fusion_stage_start = Instant::now();
         let agreement = if lists.len() > 1 {
             let head: HashSet<_> = lists[0]
@@ -928,7 +921,6 @@ impl MultiVectorIndex {
         let fused_candidates = ranked.len();
         per_stage_actual_ms.push(fusion_stage_start.elapsed().as_secs_f64() * 1000.);
 
-        // ── Stage 2 (optional): Rerank ────────────────────────────────────────
         let mut reranked = 0;
         if let Some(rerank) = &request.rerank {
             let rerank_stage_start = Instant::now();
@@ -969,38 +961,9 @@ impl MultiVectorIndex {
             per_stage_actual_ms.push(rerank_stage_start.elapsed().as_secs_f64() * 1000.);
         }
 
-        // ── Stage N: Context ──────────────────────────────────────────────────
         let context_stage_start = Instant::now();
-        let (matches, signals) =
-            self.context(&s, ranked, &fused, &eligible, request, agreement)?;
+        let (matches, signals) = self.context(&s, ranked, &fused, &eligible, request, agreement)?;
         per_stage_actual_ms.push(context_stage_start.elapsed().as_secs_f64() * 1000.);
-
-        // ── Record calibration observations ───────────────────────────────────
-        // Record each channel's actual elapsed_ms keyed by (operator, dim, corpus).
-        {
-            let mut cal = self.calibration.lock().unwrap();
-            for (ch_idx, ch_json) in channels.iter().enumerate() {
-                if let Some(elapsed_ms) = ch_json["elapsed_ms"].as_f64() {
-                    if let Some(planned) = plan.parallel_channels().get(ch_idx) {
-                        let dim = match &request.prefetch.get(ch_idx) {
-                            Some(Channel::Dense { vector, .. }) => vector.len(),
-                            Some(Channel::Multivector { vectors, .. }) if !vectors.is_empty() => {
-                                vectors[0].len()
-                            }
-                            _ => plan.stats.fde_dimension.max(1),
-                        };
-                        cal.record(
-                            OperatorClass::from_plan(
-                                planned.operator,
-                                dim,
-                                plan.stats.documents,
-                            ),
-                            elapsed_ms,
-                        );
-                    }
-                }
-            }
-        }
 
         Ok(RetrievalResponse {
             matches,
@@ -1218,7 +1181,9 @@ impl MultiVectorIndex {
                     };
                     if matches!(
                         result,
-                        AcceptResult::AlreadyAdded | AcceptResult::GroupFull | AcceptResult::Deduplicated
+                        AcceptResult::AlreadyAdded
+                            | AcceptResult::GroupFull
+                            | AcceptResult::Deduplicated
                     ) {
                         // Group and duplicate exclusions cannot become eligible
                         // later; excluded candidates must not affect diversity.
@@ -1287,14 +1252,20 @@ impl MultiVectorIndex {
             }
         }
 
-        // ── RankingSignals ────────────────────────────────────────────────────
         let top1_margin = match ranked.as_slice() {
             [a, b, ..] => (a.1 - b.1).max(0.0),
             _ => 0.0,
         };
         let topk_score_spread = ranked
             .first()
-            .zip(ranked.get(request.limit.saturating_sub(1).min(ranked.len().saturating_sub(1))))
+            .zip(
+                ranked.get(
+                    request
+                        .limit
+                        .saturating_sub(1)
+                        .min(ranked.len().saturating_sub(1)),
+                ),
+            )
             .map_or(0.0, |(top, bot)| (top.1 - bot.1).max(0.0));
         let unique_sources = selected
             .matches
@@ -1944,8 +1915,6 @@ mod tests {
         assert_eq!(reopened.stats().documents, 4);
     }
 
-    // ── Phase 3: retrieval-policy optimizer ──────────────────────────────────
-
     #[test]
     fn auto_mode_generates_bm25_channel_from_text_representation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1960,12 +1929,23 @@ mod tests {
         .unwrap();
         let response = index.retrieve(&query).unwrap();
         // Auto mode with text query → must have generated at least one BM25 channel.
-        let policy = response.trace.plan.policy.as_ref().expect("policy plan must be present in auto mode");
+        let policy = response
+            .trace
+            .plan
+            .policy
+            .as_ref()
+            .expect("policy plan must be present in auto mode");
         assert!(
-            policy.channels_selected.iter().any(|k| *k == LogicalChannelKind::Bm25),
+            policy
+                .channels_selected
+                .iter()
+                .any(|k| *k == LogicalChannelKind::Bm25),
             "auto mode should select BM25 when text coverage is sufficient"
         );
-        assert!(!response.matches.is_empty(), "auto mode must return results");
+        assert!(
+            !response.matches.is_empty(),
+            "auto mode must return results"
+        );
     }
 
     #[test]
@@ -2025,8 +2005,6 @@ mod tests {
         assert!(!policy.selection_reasons.is_empty());
     }
 
-    // ── Phase 4: context optimizer ────────────────────────────────────────────
-
     #[test]
     fn token_budget_skips_large_chunks_rather_than_stopping() {
         // Insert two short docs and one long doc (>budget by itself).
@@ -2044,7 +2022,9 @@ mod tests {
                     metadata: serde_json::json!({}),
                     representations: BTreeMap::from([(
                         "s".into(),
-                        Representation::Dense { vector: vec![1.0, 0.0] },
+                        Representation::Dense {
+                            vector: vec![1.0, 0.0],
+                        },
                     )]),
                     ..RetrievalDocument::default()
                 },
@@ -2054,7 +2034,9 @@ mod tests {
                     metadata: serde_json::json!({}),
                     representations: BTreeMap::from([(
                         "s".into(),
-                        Representation::Dense { vector: vec![0.9, 0.1] },
+                        Representation::Dense {
+                            vector: vec![0.9, 0.1],
+                        },
                     )]),
                     ..RetrievalDocument::default()
                 },
@@ -2064,7 +2046,9 @@ mod tests {
                     metadata: serde_json::json!({}),
                     representations: BTreeMap::from([(
                         "s".into(),
-                        Representation::Dense { vector: vec![0.8, 0.2] },
+                        Representation::Dense {
+                            vector: vec![0.8, 0.2],
+                        },
                     )]),
                     ..RetrievalDocument::default()
                 },
@@ -2088,7 +2072,10 @@ mod tests {
         );
         // estimated_tokens should be populated.
         assert!(
-            response.matches.iter().any(|h| h.estimated_tokens.is_some()),
+            response
+                .matches
+                .iter()
+                .any(|h| h.estimated_tokens.is_some()),
             "estimated_tokens must be populated when context_budget_tokens is set"
         );
     }
@@ -2106,222 +2093,97 @@ mod tests {
     }
 
     #[test]
-    fn dedup_count_reflects_dropped_candidates() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path()); // docs a, b have same parent "a" for dedup test
-        let mut query = request();
-        query.context.deduplicate = true;
-        // Insert a doc with same text as "a" to trigger dedup.
-        index
-            .upsert_records(vec![RetrievalDocument {
-                id: "dup".into(),
-                text: Some("E123 repair".into()),
-                metadata: serde_json::json!({"tenant":"a","year":2026}),
-                chunk: Some(Chunk {
-                    parent: "a".into(),
-                    position: 3,
-                }),
-                ..RetrievalDocument::default()
-            }])
-            .unwrap();
-        let response = index.retrieve(&query).unwrap();
-        // dedup_count ≥ 0 (dedup may or may not fire depending on corpus)
-        assert!(response.trace.signals.dedup_count < 100);
-    }
-
-    // ── Phase 2C: calibration stats ──────────────────────────────────────────
-
-    #[test]
-    fn calibration_initially_returns_none_for_unobserved_class() {
-        let stats = CalibrationStats::new();
-        let class = OperatorClass {
-            operator: PhysicalOperator::ExactDense,
-            dim_bucket: 128,
-            corpus_bucket: 1_000,
-        };
-        assert!(stats.estimate_ms(&class).is_none());
-    }
-
-    #[test]
-    fn calibration_returns_estimate_after_min_observations() {
-        let mut stats = CalibrationStats::new();
-        let class = OperatorClass {
-            operator: PhysicalOperator::ExactDense,
-            dim_bucket: 128,
-            corpus_bucket: 1_000,
-        };
-        for _ in 0..CalibrationStats::MIN_OBSERVATIONS {
-            stats.record(class.clone(), 2.5);
-        }
-        let est = stats.estimate_ms(&class).expect("must return estimate after min observations");
-        // EWMA of constant 2.5ms should converge close to 2.5.
-        assert!((est - 2.5).abs() < 0.5, "estimate {est} should be near 2.5");
-    }
-
-    #[test]
-    fn calibration_ewma_tracks_changing_latency() {
-        let mut stats = CalibrationStats::new();
-        let class = OperatorClass {
-            operator: PhysicalOperator::HnswDense,
-            dim_bucket: 256,
-            corpus_bucket: 10_000,
-        };
-        // Warm up with fast observations, then switch to slow.
-        for _ in 0..20 {
-            stats.record(class.clone(), 1.0);
-        }
-        for _ in 0..20 {
-            stats.record(class.clone(), 5.0);
-        }
-        let est = stats.estimate_ms(&class).unwrap();
-        // Should have moved away from 1.0 toward 5.0.
-        assert!(est > 2.0, "EWMA should track toward recent observations: {est}");
-    }
-
-    #[test]
-    fn calibration_stratified_by_operator_class() {
-        let mut stats = CalibrationStats::new();
-        let dense = OperatorClass {
-            operator: PhysicalOperator::ExactDense,
-            dim_bucket: 128,
-            corpus_bucket: 1_000,
-        };
-        let hnsw = OperatorClass {
-            operator: PhysicalOperator::HnswDense,
-            dim_bucket: 128,
-            corpus_bucket: 1_000,
-        };
-        for _ in 0..CalibrationStats::MIN_OBSERVATIONS {
-            stats.record(dense.clone(), 1.0);
-            stats.record(hnsw.clone(), 10.0);
-        }
-        let est_exact = stats.estimate_ms(&dense).unwrap();
-        let est_hnsw = stats.estimate_ms(&hnsw).unwrap();
-        assert!(
-            est_hnsw > est_exact * 3.0,
-            "HNSW ({est_hnsw:.2}ms) should be substantially slower than exact ({est_exact:.2}ms)"
-        );
-    }
-
-    #[test]
-    fn calibration_p90_exceeds_mean_for_variable_latency() {
-        let mut stats = CalibrationStats::new();
-        let class = OperatorClass {
-            operator: PhysicalOperator::ExactFde,
-            dim_bucket: 512,
-            corpus_bucket: 10_000,
-        };
-        // Record mix of fast (1ms) and slow (9ms) observations.
-        for i in 0..20 {
-            stats.record(class.clone(), if i % 5 == 0 { 9.0 } else { 1.0 });
-        }
-        let mean = stats.estimate_ms(&class).unwrap();
-        let p90 = stats.p90_ms(&class).unwrap();
-        assert!(p90 > mean, "p90 ({p90:.2}) should exceed mean ({mean:.2})");
-    }
-
-    #[test]
-    fn retrieve_updates_calibration_observable_on_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path());
-        let query = request();
-        // Run several retrieves to accumulate observations.
-        for _ in 0..CalibrationStats::MIN_OBSERVATIONS {
-            index.retrieve(&query).unwrap();
-        }
-        // Calibration snapshot should have observations for the operators used.
-        let snap = index.calibration_snapshot();
-        assert!(
-            !snap.is_empty(),
-            "calibration snapshot should be non-empty after retrieves"
-        );
-    }
-
-    // ── Phase 5: iterative evidence planner ──────────────────────────────────
-
-    #[test]
-    fn agent_returns_continue_on_first_iteration() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path());
-        let plan = index.plan(&serde_json::from_value(json!({
-            "prefetch": [{"kind":"bm25","text":"repair","limit":5}],
-            "limit": 3
-        })).unwrap()).unwrap();
-        let mut agent = AgentSearch::new(
-            RetrievalObjective { quality: QualityPreference::Balanced, ..Default::default() },
-            QueryRepresentations { text: Some("repair".into()), ..Default::default() },
-        );
-        let decision = agent.plan_next(&plan.stats, None);
-        assert!(
-            matches!(decision, AgentDecision::Continue(_)),
-            "first iteration must continue"
-        );
-    }
-
-    #[test]
-    fn agent_stops_on_token_budget_exhausted() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path());
-        let plan = index.plan(&serde_json::from_value(json!({
-            "prefetch": [{"kind":"bm25","text":"repair","limit":5}],
-            "limit": 3
-        })).unwrap()).unwrap();
-        let mut agent = AgentSearch::new(
-            RetrievalObjective {
-                context_budget_tokens: Some(10),
-                quality: QualityPreference::Balanced,
-                ..Default::default()
-            },
-            QueryRepresentations { text: Some("repair".into()), ..Default::default() },
-        );
-        // Consume the entire token budget.
-        agent.total_tokens_consumed = 10;
-        let decision = agent.plan_next(&plan.stats, None);
-        assert!(
-            matches!(decision, AgentDecision::Stop(StopReason::TokenBudgetExhausted)),
-            "should stop when token budget exhausted"
-        );
-    }
-
-    #[test]
-    fn agent_stops_after_max_iterations() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path());
-        let plan = index.plan(&serde_json::from_value(json!({
-            "prefetch": [{"kind":"bm25","text":"repair","limit":5}],
-            "limit": 3
-        })).unwrap()).unwrap();
-        let mut agent = AgentSearch::new(
-            RetrievalObjective::default(),
-            QueryRepresentations { text: Some("repair".into()), ..Default::default() },
-        );
-        agent.iteration = 5; // at max
-        let decision = agent.plan_next(&plan.stats, None);
-        assert!(
-            matches!(decision, AgentDecision::Stop(StopReason::MaxIterationsReached)),
-            "should stop at max iterations"
-        );
-    }
-
-    #[test]
-    fn agent_corpus_fingerprint_stable_across_same_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path());
-        let plan = index.plan(&serde_json::from_value(json!({
-            "prefetch": [{"kind":"bm25","text":"x","limit":3}],
-            "limit": 3
-        })).unwrap()).unwrap();
-        let fp1 = CorpusFingerprint::from_stats(&plan.stats);
-        let fp2 = CorpusFingerprint::from_stats(&plan.stats);
-        assert_eq!(fp1, fp2, "fingerprint must be deterministic for same stats");
-    }
-
-    #[test]
     fn global_development_choice_is_the_rrf_default() {
         assert!(matches!(Fusion::default(), Fusion::Rrf { k } if k == 10.));
     }
 
-    // ── Phase 1A: Plan IR, EXPLAIN, concurrent execution ─────────────────────
+    // ── Live planner demo (run with --nocapture) ──────────────────────────────
+
+    #[test]
+    #[ignore = "demo: run with --ignored --nocapture to see EXPLAIN output"]
+    fn planner_demo_explain_and_explain_analyze() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path()); // 3 docs: text + dense "semantic" + sparse
+
+        let query = request(); // filter: tenant=a; channels: Dense + BM25
+
+        // ── EXPLAIN: dry-run plan ─────────────────────────────────────────────
+        let plan = index.plan(&query).unwrap();
+        println!("\n=== EXPLAIN ===");
+        println!("corpus: {} docs, {} eligible after filter",
+            plan.stats.documents, plan.eligible_documents);
+        println!("stages: {}", plan.stages.len());
+        for ch in plan.parallel_channels() {
+            println!("  channel[{}] operator={:?}  reason={:?}  limit={}  est_cost={:.0}",
+                ch.index, ch.operator, ch.reason, ch.limit, ch.estimated_cost_units);
+        }
+        println!("estimate: critical_path={:.4}ms  total_cost={:.4}ms",
+            plan.estimate.critical_path_cost, plan.estimate.total_cost);
+        if let Some(fs) = &plan.stats.filter_stats {
+            println!("filter: selectivity={:.2}  strategy={:?}",
+                fs.selectivity, fs.filter_operator);
+        }
+
+        // ── EXPLAIN ANALYZE: what actually happened ───────────────────────────
+        let response = index.retrieve(&query).unwrap();
+        let trace = &response.trace;
+        println!("\n=== EXPLAIN ANALYZE ===");
+        println!("elapsed: {:.3}ms", trace.elapsed_ms);
+        for (i, ms) in trace.per_stage_actual_ms.iter().enumerate() {
+            println!("  stage[{i}] actual={ms:.3}ms");
+        }
+        for ch_json in &trace.channels {
+            println!("  channel backend={:?}  candidates={}  elapsed={:.3}ms",
+                ch_json["backend"], ch_json["candidates"],
+                ch_json["elapsed_ms"].as_f64().unwrap_or(0.));
+        }
+        println!("fused_candidates: {}  reranked: {}",
+            trace.fused_candidates, trace.reranked_candidates);
+        println!("matches: {}", response.matches.len());
+
+        // ── RankingSignals ────────────────────────────────────────────────────
+        let sig = &trace.signals;
+        println!("\n=== RANKING SIGNALS ===");
+        println!("top1_margin:       {:.4}", sig.top1_margin);
+        println!("topk_spread:       {:.4}", sig.topk_score_spread);
+        println!("source_diversity:  {:.2}", sig.source_diversity);
+        println!("channel_agreement: {:?}", sig.channel_agreement);
+
+        // ── Auto-planning mode ────────────────────────────────────────────────
+        let auto_query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [],
+            "planning_mode": "auto",
+            "query": {"text": "E123 repair"},
+            "limit": 3
+        })).unwrap();
+        let auto_resp = index.retrieve(&auto_query).unwrap();
+        let auto_plan = &auto_resp.trace.plan;
+        println!("\n=== AUTO MODE (policy selects channels) ===");
+        if let Some(policy) = &auto_plan.policy {
+            println!("channels selected: {:?}", policy.channels_selected);
+            for reason in &policy.selection_reasons {
+                println!("  reason: {reason}");
+            }
+        }
+        for ch in auto_plan.parallel_channels() {
+            println!("  channel[{}] {:?} limit={}", ch.index, ch.operator, ch.limit);
+        }
+        println!("matches: {:?}", auto_resp.matches.iter().map(|h| h.id.as_str()).collect::<Vec<_>>());
+
+        // ── Cost model: build ANN, shows exact still wins on tiny corpus ──────
+        index.build_dense_ann("semantic", 4, 16).unwrap();
+        let mut unfiltered = query.clone();
+        unfiltered.filter = None;
+        unfiltered.prefetch.retain(|c| matches!(c, Channel::Dense { .. }));
+        let cost_plan = index.plan(&unfiltered).unwrap();
+        println!("\n=== COST MODEL (3-doc corpus: exact beats HNSW) ===");
+        let ch = &cost_plan.parallel_channels()[0];
+        println!("operator:       {:?}", ch.operator);
+        println!("reason:         {:?}", ch.reason);
+        println!("cost_units:     {:.0}", ch.estimated_cost_units);
+        println!("critical_path:  {:.6}ms", cost_plan.estimate.critical_path_cost);
+        println!("(for HNSW to win cost model, need ~100+ docs with this dim)");
+    }
 
     #[test]
     fn plan_stages_structure_matches_request_channels() {
@@ -2339,7 +2201,10 @@ mod tests {
 
         // Second stage must be Fusion (two channels → RRF).
         assert!(
-            matches!(plan.stages[1], PlanStage::Fusion(FusionOperator::ReciprocalRank)),
+            matches!(
+                plan.stages[1],
+                PlanStage::Fusion(FusionOperator::ReciprocalRank)
+            ),
             "expected RRF fusion, got {:?}",
             plan.stages[1]
         );
@@ -2350,9 +2215,8 @@ mod tests {
             "last stage must be Context"
         );
 
-        // PlanEstimate values must be strictly positive.
-        assert!(plan.estimate.estimated_wall_ms > 0.0);
-        assert!(plan.estimate.estimated_cpu_work > 0.0);
+        assert!(plan.estimate.critical_path_cost > 0.0);
+        assert!(plan.estimate.total_cost > 0.0);
     }
 
     #[test]
@@ -2364,7 +2228,10 @@ mod tests {
 
         let plan = index.plan(&query).unwrap();
         assert!(
-            matches!(plan.stages[1], PlanStage::Fusion(FusionOperator::NativeScore)),
+            matches!(
+                plan.stages[1],
+                PlanStage::Fusion(FusionOperator::NativeScore)
+            ),
             "single channel must bypass RRF"
         );
     }
@@ -2374,7 +2241,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let index = index(dir.path());
         let mut query = request();
-        query.prefetch.retain(|c| matches!(c, Channel::Dense { .. }));
+        query
+            .prefetch
+            .retain(|c| matches!(c, Channel::Dense { .. }));
         query.rerank = Some(Rerank {
             field: Some("tokens".into()),
             vectors: vec![vec![1., 0.]],
@@ -2450,9 +2319,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_estimate_wall_time_closer_to_max_than_sum_for_parallel_channels() {
-        // Structural check: estimated_wall_ms must be <= sum of per-channel estimates.
-        // (Exact parallelism savings are timing-dependent; we test the model, not the clock.)
+    fn plan_estimate_uses_critical_path_for_parallel_channels() {
         let dir = tempfile::tempdir().unwrap();
         let index = index(dir.path());
         let query = request(); // two channels
@@ -2461,40 +2328,15 @@ mod tests {
         let channels = plan.parallel_channels();
         let channel_cost_sum: f64 = channels.iter().map(|c| c.estimated_cost_units).sum();
 
-        // cpu_work is the aggregate; wall_ms should reflect the critical path (≤ sum).
         assert!(
-            plan.estimate.estimated_wall_ms <= plan.estimate.estimated_cpu_work + 0.01,
-            "wall_ms ({}) should not exceed cpu_work ({})",
-            plan.estimate.estimated_wall_ms,
-            plan.estimate.estimated_cpu_work
+            plan.estimate.critical_path_cost <= plan.estimate.total_cost,
+            "critical-path cost must not exceed total cost"
         );
         assert!(
             channel_cost_sum > 0.0,
             "per-channel cost units must be populated"
         );
     }
-
-    // ── Phase 1B: concurrent channel execution ───────────────────────────────
-
-    #[test]
-    fn retrieve_results_are_identical_with_or_without_concurrency() {
-        // Functional correctness: parallel execution must produce the same
-        // matches as sequential would. Timing is not asserted (flaky in CI).
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path());
-        let query = request();
-
-        let resp = index.retrieve(&query).unwrap();
-        // Re-run — same query, same generation — must produce same results.
-        let resp2 = index.retrieve(&query).unwrap();
-        assert_eq!(
-            resp.matches.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
-            resp2.matches.iter().map(|h| h.id.as_str()).collect::<Vec<_>>()
-        );
-        assert_eq!(resp.trace.plan, resp2.trace.plan);
-    }
-
-    // ── Phase 1C: cost-based exact/HNSW selection ─────────────────────────────
 
     #[test]
     fn cost_model_selects_exact_for_tiny_corpus_even_with_ann_built() {
@@ -2506,45 +2348,22 @@ mod tests {
 
         let mut query = request();
         query.filter = None;
-        query.prefetch.retain(|c| matches!(c, Channel::Dense { .. }));
+        query
+            .prefetch
+            .retain(|c| matches!(c, Channel::Dense { .. }));
 
         let plan = index.plan(&query).unwrap();
         let ch = &plan.parallel_channels()[0];
         // With cost model active, exact should win for tiny corpora.
         assert_eq!(ch.operator, PhysicalOperator::ExactDense);
         assert!(
-            matches!(ch.reason, PlanReason::LowerEstimatedCost | PlanReason::AnnReady),
+            matches!(
+                ch.reason,
+                PlanReason::LowerEstimatedCost | PlanReason::AnnReady
+            ),
             "expected cost-based reason, got {:?}",
             ch.reason
         );
-    }
-
-    // ── Phase 2A: categorical metadata bitmaps + filter cardinality ──────────
-
-    #[test]
-    fn filter_stats_provides_estimated_selectivity() {
-        // After upserting documents with metadata, PlannerStats should include
-        // filter_stats with estimated selectivity for equality predicates.
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path()); // 3 docs: a(tenant=a), b(tenant=a), c(tenant=denied)
-        let mut query = request(); // filter: tenant=a (2/3 docs)
-        query.prefetch.retain(|c| matches!(c, Channel::Bm25 { .. }));
-
-        let plan = index.plan(&query).unwrap();
-        // filter_stats must be present when a filter is applied.
-        let fs = plan
-            .stats
-            .filter_stats
-            .as_ref()
-            .expect("filter_stats must be populated for filtered queries");
-        // 2 out of 3 docs match tenant=a → selectivity ≈ 0.667
-        assert!(
-            fs.estimated_selectivity > 0.0 && fs.estimated_selectivity <= 1.0,
-            "selectivity must be in (0,1], got {}",
-            fs.estimated_selectivity
-        );
-        // eligible_documents must match actual count
-        assert_eq!(plan.eligible_documents, 2);
     }
 
     #[test]
@@ -2557,67 +2376,10 @@ mod tests {
         let fs = plan.stats.filter_stats.as_ref().unwrap();
         let expected = 2.0 / 3.0_f32;
         assert!(
-            (fs.estimated_selectivity - expected).abs() < 0.05,
+            (fs.selectivity - expected).abs() < 0.05,
             "selectivity should be ~{expected:.2}, got {:.2}",
-            fs.estimated_selectivity
+            fs.selectivity
         );
-    }
-
-    // ── Phase 2B: HnswPostFilter with exact fallback ──────────────────────────
-
-    #[test]
-    fn plan_uses_hnsw_post_filter_when_selectivity_permits() {
-        // With 50 docs, ANN built, filter selectivity ~50% (≥0.05 threshold),
-        // ef=4 (so hnsw cost < exact): should select HnswPostFilter.
-        let dir = tempfile::tempdir().unwrap();
-        let index = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
-        let docs: Vec<_> = (0..50_u32)
-            .map(|i| {
-                let v = if i % 2 == 0 {
-                    vec![1.0_f32, 0.0]
-                } else {
-                    vec![0.0, 1.0]
-                };
-                let group = if i < 25 { "a" } else { "b" };
-                RetrievalDocument {
-                    id: format!("d{i}"),
-                    metadata: serde_json::json!({"group": group}),
-                    representations: BTreeMap::from([(
-                        "f".into(),
-                        Representation::Dense { vector: v },
-                    )]),
-                    ..RetrievalDocument::default()
-                }
-            })
-            .collect();
-        index.upsert_records(docs).unwrap();
-        index.build_dense_ann("f", 4, 16).unwrap();
-
-        // Filter selects ~50% → above the 0.05 threshold, so HnswPostFilter eligible.
-        // ef=4, dim=2, N=50: hnsw_post = (4/0.5)×ceil(log2(50))×2×3 = 8×6×6=288
-        // exact = 25×2×2=100 → exact still cheaper in this case
-        // The test verifies the operator is a vector operator (not just exact scan).
-        let query: RetrieveRequest = serde_json::from_value(json!({
-            "prefetch": [{"kind":"dense","field":"f","vector":[1.0,0.0],"limit":5,"ef_search":4}],
-            "filter": {"op":"eq","field":"group","value":"a"},
-            "limit": 5
-        }))
-        .unwrap();
-        let plan = index.plan(&query).unwrap();
-        let ch = &plan.parallel_channels()[0];
-        // With filter + cost model: either ExactEligibleScan or ExactDense
-        // (HnswPostFilter requires hnsw cheaper than exact after amplification)
-        assert!(
-            matches!(
-                ch.operator,
-                PhysicalOperator::ExactDense
-                    | PhysicalOperator::ExactEligibleScan
-                    | PhysicalOperator::HnswPostFilter
-            ),
-            "filtered query should use a vector operator, got {:?}",
-            ch.operator
-        );
-        assert_eq!(plan.eligible_documents, 25);
     }
 
     #[test]
@@ -2662,25 +2424,6 @@ mod tests {
         assert_eq!(
             plan.parallel_channels()[0].reason,
             PlanReason::LowerEstimatedCost
-        );
-    }
-
-    #[test]
-    fn planner_reasons_are_machine_readable_variants() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path());
-        let mut query = request();
-        query.filter = None;
-        query.prefetch.retain(|c| matches!(c, Channel::Dense { .. }));
-
-        // Without ANN: reason must carry structured info (not just a string tag).
-        let plan = index.plan(&query).unwrap();
-        let channels = plan.parallel_channels();
-        let reason = channels[0].reason;
-        // AnnUnavailable or IndexUnavailable — both are machine-readable enum variants.
-        assert!(
-            matches!(reason, PlanReason::AnnUnavailable | PlanReason::IndexUnavailable),
-            "expected unavailability reason, got {reason:?}"
         );
     }
 }

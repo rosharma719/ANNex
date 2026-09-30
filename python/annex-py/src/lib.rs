@@ -295,7 +295,7 @@ impl Index {
 }
 
 #[pymodule]
-fn annex_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn annexdb(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Index>()?;
     Ok(())
 }

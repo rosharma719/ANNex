@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`SearchRuntimeOptions::sq8_score_only`** (env: `VECTORDB_SQ8_SCORE_ONLY`): SQ8-quantized
+  L0 traversal without a subsequent float32 rerank pass. Cosine metric only — the integer dot
+  product maps to cosine similarity by a fixed 127.5² scale with no equivalent for Euclidean.
+  Traverses at `ef` (no extended pool), rescales results to the real cosine-distance domain, and
+  returns approximate scores at lower latency than the rerank path. Has no effect unless
+  `quantize_all()` has been called on the index.
+
+### Added
+
 - Durable hybrid retrieval with named dense/sparse/multivector fields, metadata
   predicates, BM25/RRF, optional MaxSim reranking and context selection.
 - Independent collection namespaces and named dense ANN graphs.

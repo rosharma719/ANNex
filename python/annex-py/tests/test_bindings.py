@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-import annex_py
+import annexdb
 
 os.environ.setdefault("VECTORDB_EXACT_FALLBACK_ENABLED", "true")
 os.environ.setdefault("VECTORDB_EXACT_FALLBACK_THRESHOLD", "1000")
@@ -39,7 +39,7 @@ class IndexTests(unittest.TestCase):
         snapshot = os.environ.get("ANNEX_TEST_SNAPSHOT")
         if not snapshot:
             raise unittest.SkipTest("ANNEX_TEST_SNAPSHOT is not set")
-        cls.index = annex_py.Index(snapshot)
+        cls.index = annexdb.Index(snapshot)
 
     def test_load_and_search(self):
         self.assertEqual(len(self.index), len(POINTS))
@@ -55,7 +55,7 @@ class IndexTests(unittest.TestCase):
         np.testing.assert_allclose(scores, expected_scores, rtol=0, atol=1e-6)
 
     def test_quantized_index_loads_and_searches(self):
-        quantized = annex_py.Index(os.environ["ANNEX_TEST_SNAPSHOT"], quantize=True)
+        quantized = annexdb.Index(os.environ["ANNEX_TEST_SNAPSHOT"], quantize=True)
         query = np.array([0.25, 0.5], dtype=np.float32)
         ids, scores = quantized.search(query, k=4, sq8_screen=True)
         expected_ids, expected_scores = exact(query, 4)
@@ -137,9 +137,9 @@ class IndexTests(unittest.TestCase):
 from concurrent.futures import ThreadPoolExecutor
 import os
 import numpy as np
-import annex_py
+import annexdb
 
-index = annex_py.Index(os.environ["ANNEX_TEST_SNAPSHOT"])
+index = annexdb.Index(os.environ["ANNEX_TEST_SNAPSHOT"])
 queries = np.array(
     [[0.25, 0.5], [1.25, 1.75], [-1.5, -0.5], [3.5, -1.0], [-2.0, 2.0]],
     dtype=np.float32,

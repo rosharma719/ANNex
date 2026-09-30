@@ -1,3 +1,5 @@
+#[path = "agent.rs"]
+mod agent;
 #[path = "planner.rs"]
 mod planner;
 #[path = "policy.rs"]
@@ -24,6 +26,7 @@ pub use planner::{
     QualityPreference, RerankPlan, RepresentationKind, RetrievalObjective, RetrievalPlan,
 };
 pub use policy::{PlanningMode, PolicyPlan, QueryRepresentations};
+pub use agent::{AgentDecision, AgentIteration, AgentSearch, CorpusFingerprint, StopReason};
 use rayon::prelude::*;
 pub use retrieval::{
     AdaptiveRerank, Channel, Chunk, ContextHit, ContextOptions, Fusion, Predicate, RankingSignals,

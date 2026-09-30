@@ -2102,6 +2102,85 @@ mod tests {
         assert!(response.trace.signals.dedup_count < 100);
     }
 
+    // ── Phase 5: iterative evidence planner ──────────────────────────────────
+
+    #[test]
+    fn agent_returns_continue_on_first_iteration() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let plan = index.plan(&serde_json::from_value(json!({
+            "prefetch": [{"kind":"bm25","text":"repair","limit":5}],
+            "limit": 3
+        })).unwrap()).unwrap();
+        let mut agent = AgentSearch::new(
+            RetrievalObjective { quality: QualityPreference::Balanced, ..Default::default() },
+            QueryRepresentations { text: Some("repair".into()), ..Default::default() },
+        );
+        let decision = agent.plan_next(&plan.stats, None);
+        assert!(
+            matches!(decision, AgentDecision::Continue(_)),
+            "first iteration must continue"
+        );
+    }
+
+    #[test]
+    fn agent_stops_on_token_budget_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let plan = index.plan(&serde_json::from_value(json!({
+            "prefetch": [{"kind":"bm25","text":"repair","limit":5}],
+            "limit": 3
+        })).unwrap()).unwrap();
+        let mut agent = AgentSearch::new(
+            RetrievalObjective {
+                context_budget_tokens: Some(10),
+                quality: QualityPreference::Balanced,
+                ..Default::default()
+            },
+            QueryRepresentations { text: Some("repair".into()), ..Default::default() },
+        );
+        // Consume the entire token budget.
+        agent.total_tokens_consumed = 10;
+        let decision = agent.plan_next(&plan.stats, None);
+        assert!(
+            matches!(decision, AgentDecision::Stop(StopReason::TokenBudgetExhausted)),
+            "should stop when token budget exhausted"
+        );
+    }
+
+    #[test]
+    fn agent_stops_after_max_iterations() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let plan = index.plan(&serde_json::from_value(json!({
+            "prefetch": [{"kind":"bm25","text":"repair","limit":5}],
+            "limit": 3
+        })).unwrap()).unwrap();
+        let mut agent = AgentSearch::new(
+            RetrievalObjective::default(),
+            QueryRepresentations { text: Some("repair".into()), ..Default::default() },
+        );
+        agent.iteration = 5; // at max
+        let decision = agent.plan_next(&plan.stats, None);
+        assert!(
+            matches!(decision, AgentDecision::Stop(StopReason::MaxIterationsReached)),
+            "should stop at max iterations"
+        );
+    }
+
+    #[test]
+    fn agent_corpus_fingerprint_stable_across_same_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let plan = index.plan(&serde_json::from_value(json!({
+            "prefetch": [{"kind":"bm25","text":"x","limit":3}],
+            "limit": 3
+        })).unwrap()).unwrap();
+        let fp1 = CorpusFingerprint::from_stats(&plan.stats);
+        let fp2 = CorpusFingerprint::from_stats(&plan.stats);
+        assert_eq!(fp1, fp2, "fingerprint must be deterministic for same stats");
+    }
+
     #[test]
     fn global_development_choice_is_the_rrf_default() {
         assert!(matches!(Fusion::default(), Fusion::Rrf { k } if k == 10.));

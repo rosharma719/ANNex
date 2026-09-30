@@ -11,7 +11,7 @@ Output:
     - Pareto frontier table (recall@20 vs p50 latency)
     - Full results CSV: bench/nyt256/results_all.csv
 """
-import argparse, json, csv, sys
+import argparse, json, csv, sys, datetime
 from pathlib import Path
 
 def load(path):
@@ -36,6 +36,30 @@ def label(r):
     ef  = r.get("ef", "")
     return f"{lib} {cfg} ef={ef}".strip()
 
+def _update_manifest(n_rows: int) -> None:
+    p = Path("bench/nyt256/manifest.json")
+    m = json.loads(p.read_text()) if p.exists() else {}
+    m["combined"] = {"timestamp": datetime.datetime.now().isoformat(timespec="seconds"), "rows": n_rows}
+    p.write_text(json.dumps(m, indent=2) + "\n")
+
+
+def _print_manifest_status() -> None:
+    p = Path("bench/nyt256/manifest.json")
+    if not p.exists():
+        return
+    m = json.loads(p.read_text())
+    print("Provenance:")
+    if "annexdb" in m:
+        a = m["annexdb"]
+        print(f"  annexdb    {a.get('timestamp','')}  {a.get('commit','')} ({a.get('branch','')})  {a.get('rust','')}")
+    if "competitors" in m:
+        c = m["competitors"]
+        ts = c.pop("timestamp", "")
+        print(f"  competitors {ts}  " + "  ".join(f"{k}={v}" for k, v in c.items()))
+        c["timestamp"] = ts  # restore
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--annexdb",     default="bench/nyt256/results_annexdb.jsonl")
@@ -59,6 +83,8 @@ def main():
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         w.writerows(all_rows)
+    _update_manifest(len(all_rows))
+    _print_manifest_status()
     print(f"Full results: {args.csv_out} ({len(all_rows)} rows)\n")
 
     # Pareto frontier

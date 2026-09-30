@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Single-query hnswlib comparison on the same NYT vectors and truth as ANNex.
 
+Kept for recall-investigation reproduction (see docs/recall-investigation.md).
+For the main Pareto benchmark use bench/nyt256/run_competitors.py instead.
+
 Install numpy and hnswlib in an isolated environment, then run this script.
 Build and timing must not overlap other workloads. Use --build-only to separate
 construction from measurement. This is a reference implementation comparison,

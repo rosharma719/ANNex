@@ -56,3 +56,20 @@ done
 
 echo "Results written to $OUT"
 echo "Run bench/nyt256/evaluate.py to generate the comparison table."
+
+# Update manifest with provenance for this run
+M_VALS="$M_VALUES" EF_VALS="$EF_SEARCH_LIST" python3 - <<'PYEOF'
+import json, subprocess, datetime, os
+from pathlib import Path
+p = Path("bench/nyt256/manifest.json")
+m = json.loads(p.read_text()) if p.exists() else {}
+m["annexdb"] = {
+    "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+    "commit": subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode().strip(),
+    "branch": subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"]).decode().strip(),
+    "rust": subprocess.check_output(["rustc", "--version"]).decode().strip(),
+    "m_values": os.environ["M_VALS"],
+    "ef_values": os.environ["EF_VALS"],
+}
+p.write_text(json.dumps(m, indent=2) + "\n")
+PYEOF

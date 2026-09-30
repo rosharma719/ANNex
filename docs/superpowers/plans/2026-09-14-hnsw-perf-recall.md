@@ -1227,4 +1227,4 @@ Tasks 2–5 are independent. Recommended parallel branch strategy:
 - `perf/lid-insert` — Task 5
 - Task 1 runs on `perf/recall-frontier` (current branch) since it's benchmark-only
 
-After each PR is benchmarked and confirmed, merge to master. The frontier benchmark accumulates comparison JSON in `docs/recall-investigation-results.json`.
+After each PR is benchmarked and confirmed, merge to master. The frontier benchmark accumulates comparison JSON in `bench/nyt256/recall-investigation-results.json`.

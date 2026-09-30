@@ -1,0 +1,50 @@
+{"lib": "hnswlib", "config": "M=16 efc=300", "ef": 32, "recall": 0.769, "qps": 4265.11, "p50_ms": 0.2186, "p95_ms": 0.3728, "p99_ms": 0.458}
+{"lib": "hnswlib", "config": "M=16 efc=300", "ef": 64, "recall": 0.83455, "qps": 2379.9, "p50_ms": 0.3806, "p95_ms": 0.6485, "p99_ms": 1.0285}
+{"lib": "hnswlib", "config": "M=16 efc=300", "ef": 128, "recall": 0.86845, "qps": 1399.71, "p50_ms": 0.6808, "p95_ms": 1.0087, "p99_ms": 1.3978}
+{"lib": "hnswlib", "config": "M=16 efc=300", "ef": 256, "recall": 0.8975, "qps": 708.12, "p50_ms": 1.2894, "p95_ms": 2.3091, "p99_ms": 4.2899}
+{"lib": "hnswlib", "config": "M=16 efc=300", "ef": 512, "recall": 0.9237, "qps": 400.65, "p50_ms": 2.4827, "p95_ms": 3.3783, "p99_ms": 4.2056}
+{"lib": "hnswlib", "config": "M=32 efc=300", "ef": 32, "recall": 0.83535, "qps": 2171.99, "p50_ms": 0.4142, "p95_ms": 0.7873, "p99_ms": 1.3042}
+{"lib": "hnswlib", "config": "M=32 efc=300", "ef": 64, "recall": 0.87565, "qps": 1483.59, "p50_ms": 0.6733, "p95_ms": 0.993, "p99_ms": 1.2163}
+{"lib": "hnswlib", "config": "M=32 efc=300", "ef": 128, "recall": 0.9044, "qps": 784.37, "p50_ms": 1.2649, "p95_ms": 1.7969, "p99_ms": 2.1962}
+{"lib": "hnswlib", "config": "M=32 efc=300", "ef": 256, "recall": 0.9314, "qps": 415.89, "p50_ms": 2.4072, "p95_ms": 3.3372, "p99_ms": 5.1543}
+{"lib": "hnswlib", "config": "M=32 efc=300", "ef": 512, "recall": 0.9549, "qps": 215.41, "p50_ms": 4.7268, "p95_ms": 6.2398, "p99_ms": 8.6047}
+{"lib": "usearch", "config": "M=16 efc=300", "ef": 32, "recall": 0.7682, "qps": 4025.22, "p50_ms": 0.1931, "p95_ms": 0.3937, "p99_ms": 0.816}
+{"lib": "usearch", "config": "M=16 efc=300", "ef": 64, "recall": 0.8267, "qps": 3168.48, "p50_ms": 0.3013, "p95_ms": 0.4837, "p99_ms": 0.6298}
+{"lib": "usearch", "config": "M=16 efc=300", "ef": 128, "recall": 0.8672, "qps": 1697.15, "p50_ms": 0.5513, "p95_ms": 0.8733, "p99_ms": 1.3068}
+{"lib": "usearch", "config": "M=16 efc=300", "ef": 256, "recall": 0.90185, "qps": 841.29, "p50_ms": 1.1042, "p95_ms": 1.8489, "p99_ms": 3.0341}
+{"lib": "usearch", "config": "M=16 efc=300", "ef": 512, "recall": 0.92615, "qps": 464.61, "p50_ms": 2.0957, "p95_ms": 2.9883, "p99_ms": 4.2039}
+{"lib": "usearch", "config": "M=32 efc=300", "ef": 32, "recall": 0.8301, "qps": 3290.92, "p50_ms": 0.2823, "p95_ms": 0.4508, "p99_ms": 0.5479}
+{"lib": "usearch", "config": "M=32 efc=300", "ef": 64, "recall": 0.8707, "qps": 1787.13, "p50_ms": 0.5254, "p95_ms": 0.8405, "p99_ms": 1.1627}
+{"lib": "usearch", "config": "M=32 efc=300", "ef": 128, "recall": 0.90235, "qps": 860.04, "p50_ms": 1.0919, "p95_ms": 1.8509, "p99_ms": 2.6943}
+{"lib": "usearch", "config": "M=32 efc=300", "ef": 256, "recall": 0.92975, "qps": 583.98, "p50_ms": 1.7412, "p95_ms": 2.3366, "p99_ms": 2.7917}
+{"lib": "usearch", "config": "M=32 efc=300", "ef": 512, "recall": 0.95645, "qps": 283.08, "p50_ms": 3.5788, "p95_ms": 4.7583, "p99_ms": 6.0922}
+{"lib": "faiss-hnsw", "config": "M=16 efc=300", "ef": 32, "recall": 0.7787, "qps": 8088.38, "p50_ms": 0.1075, "p95_ms": 0.1817, "p99_ms": 0.2435}
+{"lib": "faiss-hnsw", "config": "M=16 efc=300", "ef": 64, "recall": 0.8356, "qps": 5045.37, "p50_ms": 0.1902, "p95_ms": 0.2876, "p99_ms": 0.3548}
+{"lib": "faiss-hnsw", "config": "M=16 efc=300", "ef": 128, "recall": 0.86955, "qps": 2778.46, "p50_ms": 0.3472, "p95_ms": 0.4982, "p99_ms": 0.7011}
+{"lib": "faiss-hnsw", "config": "M=16 efc=300", "ef": 256, "recall": 0.90105, "qps": 1386.6, "p50_ms": 0.7001, "p95_ms": 0.9943, "p99_ms": 1.3997}
+{"lib": "faiss-hnsw", "config": "M=16 efc=300", "ef": 512, "recall": 0.93005, "qps": 719.13, "p50_ms": 1.3895, "p95_ms": 1.7764, "p99_ms": 2.1272}
+{"lib": "faiss-hnsw", "config": "M=32 efc=300", "ef": 32, "recall": 0.84235, "qps": 4613.09, "p50_ms": 0.2017, "p95_ms": 0.3602, "p99_ms": 0.5403}
+{"lib": "faiss-hnsw", "config": "M=32 efc=300", "ef": 64, "recall": 0.88005, "qps": 2908.62, "p50_ms": 0.3363, "p95_ms": 0.4843, "p99_ms": 0.5929}
+{"lib": "faiss-hnsw", "config": "M=32 efc=300", "ef": 128, "recall": 0.9117, "qps": 1184.11, "p50_ms": 0.696, "p95_ms": 1.4945, "p99_ms": 3.6888}
+{"lib": "faiss-hnsw", "config": "M=32 efc=300", "ef": 256, "recall": 0.9384, "qps": 854.62, "p50_ms": 1.2035, "p95_ms": 1.539, "p99_ms": 1.7462}
+{"lib": "faiss-hnsw", "config": "M=32 efc=300", "ef": 512, "recall": 0.9612, "qps": 419.88, "p50_ms": 2.4221, "p95_ms": 3.0479, "p99_ms": 4.4438}
+{"lib": "faiss-ivfpq", "config": "IVF4096 PQ32x8", "ef": 8, "recall": 0.54205, "qps": 7369.02, "p50_ms": 0.1279, "p95_ms": 0.1873, "p99_ms": 0.3093}
+{"lib": "faiss-ivfpq", "config": "IVF4096 PQ32x8", "ef": 16, "recall": 0.55225, "qps": 7442.27, "p50_ms": 0.1315, "p95_ms": 0.1512, "p99_ms": 0.1896}
+{"lib": "faiss-ivfpq", "config": "IVF4096 PQ32x8", "ef": 32, "recall": 0.5611, "qps": 6736.88, "p50_ms": 0.1458, "p95_ms": 0.168, "p99_ms": 0.1882}
+{"lib": "faiss-ivfpq", "config": "IVF4096 PQ32x8", "ef": 64, "recall": 0.56935, "qps": 4226.35, "p50_ms": 0.1987, "p95_ms": 0.3456, "p99_ms": 0.5638}
+{"lib": "faiss-ivfpq", "config": "IVF4096 PQ32x8", "ef": 128, "recall": 0.5749, "qps": 3923.52, "p50_ms": 0.2497, "p95_ms": 0.295, "p99_ms": 0.365}
+{"lib": "faiss-ivfpq", "config": "IVF4096 PQ32x8", "ef": 256, "recall": 0.5795, "qps": 2633.08, "p50_ms": 0.3628, "p95_ms": 0.4308, "p99_ms": 0.5039}
+{"lib": "faiss-ivfpq", "config": "IVF4096 PQ32x8", "ef": 512, "recall": 0.5839, "qps": 1669.03, "p50_ms": 0.5783, "p95_ms": 0.673, "p99_ms": 0.7862}
+{"lib": "faiss-ivfpq", "config": "IVF4096 PQ32x8", "ef": 1024, "recall": 0.58615, "qps": 996.47, "p50_ms": 0.9807, "p95_ms": 1.1235, "p99_ms": 1.2629}
+{"lib": "faiss-ivfpq-rr", "config": "IVF4096 PQ32x8 refine k=5", "ef": 64, "recall": 0.7867, "qps": 4320.39, "p50_ms": 0.2095, "p95_ms": 0.2636, "p99_ms": 0.4884}
+{"lib": "faiss-ivfpq-rr", "config": "IVF4096 PQ32x8 refine k=5", "ef": 128, "recall": 0.8027, "qps": 3067.32, "p50_ms": 0.3007, "p95_ms": 0.4544, "p99_ms": 0.8231}
+{"lib": "faiss-ivfpq-rr", "config": "IVF4096 PQ32x8 refine k=5", "ef": 256, "recall": 0.81595, "qps": 2197.09, "p50_ms": 0.4169, "p95_ms": 0.5544, "p99_ms": 0.9819}
+{"lib": "faiss-ivfpq-rr", "config": "IVF4096 PQ32x8 refine k=5", "ef": 512, "recall": 0.82755, "qps": 1520.01, "p50_ms": 0.6285, "p95_ms": 0.7718, "p99_ms": 0.9961}
+{"lib": "faiss-ivfpq-rr", "config": "IVF4096 PQ32x8 refine k=10", "ef": 64, "recall": 0.8138, "qps": 4075.92, "p50_ms": 0.239, "p95_ms": 0.2916, "p99_ms": 0.3304}
+{"lib": "faiss-ivfpq-rr", "config": "IVF4096 PQ32x8 refine k=10", "ef": 128, "recall": 0.83685, "qps": 2619.95, "p50_ms": 0.3374, "p95_ms": 0.5546, "p99_ms": 0.9379}
+{"lib": "faiss-ivfpq-rr", "config": "IVF4096 PQ32x8 refine k=10", "ef": 256, "recall": 0.8558, "qps": 2247.1, "p50_ms": 0.4328, "p95_ms": 0.5317, "p99_ms": 0.6391}
+{"lib": "faiss-ivfpq-rr", "config": "IVF4096 PQ32x8 refine k=10", "ef": 512, "recall": 0.87295, "qps": 1417.96, "p50_ms": 0.6591, "p95_ms": 0.8163, "p99_ms": 1.0952}
+{"lib": "faiss-ivfpq-rr", "config": "IVF4096 PQ32x8 refine k=20", "ef": 64, "recall": 0.82335, "qps": 3189.4, "p50_ms": 0.3049, "p95_ms": 0.3778, "p99_ms": 0.4668}
+{"lib": "faiss-ivfpq-rr", "config": "IVF4096 PQ32x8 refine k=20", "ef": 128, "recall": 0.85115, "qps": 2435.31, "p50_ms": 0.3839, "p95_ms": 0.4852, "p99_ms": 0.668}
+{"lib": "faiss-ivfpq-rr", "config": "IVF4096 PQ32x8 refine k=20", "ef": 256, "recall": 0.8759, "qps": 1862.32, "p50_ms": 0.5149, "p95_ms": 0.6384, "p99_ms": 0.8398}
+{"lib": "faiss-ivfpq-rr", "config": "IVF4096 PQ32x8 refine k=20", "ef": 512, "recall": 0.8982, "qps": 1307.76, "p50_ms": 0.7293, "p95_ms": 0.8976, "p99_ms": 1.1063}

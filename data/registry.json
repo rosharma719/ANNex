@@ -1,0 +1,47 @@
+{
+  "nytimes-256-angular": {
+    "name": "NYT-256-Angular",
+    "description": "New York Times article embeddings, 256-D cosine/angular",
+    "dims": 256,
+    "metric": "angular",
+    "n_base": 290000,
+    "n_queries": 10000,
+    "n_gt": 1000,
+    "source_url": "https://ann-benchmarks.com/nytimes-256-angular.hdf5",
+    "checksums": {
+      "base.npy": "sha256:bf7f90dbdf193831a5daefde6e3c2cf2cd237833d5da7951dc78f48b31292fdf",
+      "queries.npy": "sha256:93693022d4682f0e622fa2196979a302b2ebf015d57166e60ecd13a4f6692ad0",
+      "ground_truth.json": "sha256:e46647a1635d77c12920d5d3111c9d66eda6d821a043a9bacfd1b1b4ddc7e8b3"
+    }
+  },
+  "sift-128-euclidean": {
+    "name": "SIFT-1M",
+    "description": "SIFT image descriptors, 128-D Euclidean, 1M base vectors",
+    "dims": 128,
+    "metric": "euclidean",
+    "n_base": 1000000,
+    "n_queries": 10000,
+    "n_gt": 100,
+    "source_url": "https://ann-benchmarks.com/sift-128-euclidean.hdf5",
+    "checksums": {
+      "base.npy": "sha256:4921953796bc066d3a4be1c6b26e32a27b8931080f21afe30824a63e65cb768d",
+      "queries.npy": "sha256:88e61604b7ad2efee410551fbf6fd800594f4008ac599e2f75fe5a58f569f7b9",
+      "ground_truth.json": "sha256:2294c456299f45f545d702ad67d23ce38809343758aec993e9bdc339899ad792"
+    }
+  },
+  "glove-100-angular": {
+    "name": "GloVe-100-Angular",
+    "description": "GloVe word vectors, 100-D cosine/angular, 1.2M base vectors",
+    "dims": 100,
+    "metric": "angular",
+    "n_base": 1183514,
+    "n_queries": 10000,
+    "n_gt": 100,
+    "source_url": "https://ann-benchmarks.com/glove-100-angular.hdf5",
+    "checksums": {
+      "base.npy": "sha256:1b9996a96818d3d9e828a31c48f6a8dc5641721820aae484bb62323777ef0763",
+      "queries.npy": "sha256:dac3a7045fb447327cd02181fb9e2884e96c181e4982c48c701827237061b3bd",
+      "ground_truth.json": "sha256:dad7c5798ee7f4b790b56e709dec2d25239bef53e727ac32f034217469605ebb"
+    }
+  }
+}

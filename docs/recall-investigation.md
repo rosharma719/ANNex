@@ -86,7 +86,7 @@ Held-out reference results:
 
 ## Reproduction and artifacts
 
-Machine-readable medians: [recall-investigation-results.json](recall-investigation-results.json). Local raw logs: `logs/recall-investigation/`. Experimental snapshots are ignored by git and remain in `data/nytimes-256-angular/`.
+Machine-readable medians: [`bench/nyt256/recall-investigation-results.json`](../bench/nyt256/recall-investigation-results.json). Local raw logs: `logs/recall-investigation/`. Experimental snapshots are ignored by git and remain in `data/nytimes-256-angular/`.
 
 ```sh
 # Warmed ANNex frontier (default: original snapshot, queries 0–999, 3 rounds).

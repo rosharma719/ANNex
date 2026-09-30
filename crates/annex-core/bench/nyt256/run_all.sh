@@ -1,24 +1,11 @@
 #!/usr/bin/env bash
-# Run the full NYT-256 Pareto benchmark: build indexes, sweep ANNex + competitors, merge.
-#
-# Usage:
-#   ./bench/nyt256/run_all.sh
-#   M_VALUES="16 32" ./bench/nyt256/run_all.sh   # custom M values
-#   ./bench/nyt256/run_all.sh --skip-competitors  # ANNex only (faster iteration)
 set -euo pipefail
-
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
-
-SKIP_COMPETITORS=0
-for arg in "$@"; do
-    [[ "$arg" == "--skip-competitors" ]] && SKIP_COMPETITORS=1
-done
-
-./bench/nyt256/run_annexdb.sh
-
-if [[ "$SKIP_COMPETITORS" -eq 0 ]]; then
-    python3 bench/nyt256/run_competitors.py
+"$ROOT/scripts/run_annex_benchmark.sh" nyt256 data/nytimes-256-angular cosine 20
+if [[ "${1:-}" != "--skip-competitors" ]]; then
+    python3 scripts/bench_competitors.py --data-dir data/nytimes-256-angular --metric cosine \
+        --dims 256 --k 20 --out crates/annex-core/bench/nyt256/results_competitors.jsonl
 fi
-
-python3 bench/nyt256/evaluate.py
+python3 scripts/evaluate_ann_benchmark.py --bench-dir crates/annex-core/bench/nyt256 \
+    --title "NYTimes-256 Angular" --k 20

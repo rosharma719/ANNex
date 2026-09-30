@@ -60,7 +60,7 @@ pub fn dot(left: &[f32], right: &[f32]) -> f32 {
 unsafe fn dot_neon_multiple_of_16(a: *const f32, b: *const f32, len: usize) -> f32 {
     unsafe {
         use std::arch::aarch64::*;
-        debug_assert!(len % 16 == 0);
+        debug_assert!(len.is_multiple_of(16));
         let mut acc0 = vdupq_n_f32(0.0);
         let mut acc1 = vdupq_n_f32(0.0);
         let mut acc2 = vdupq_n_f32(0.0);
@@ -146,7 +146,7 @@ pub fn maxsim(query: &[Vector], document: &[Vector]) -> f32 {
 pub fn maxsim_flat(query: &[Vector], document: &[f32], dimension: usize) -> f32 {
     #[cfg(target_arch = "aarch64")]
     {
-        if dimension > 0 && dimension % 16 == 0 && dimension <= 4096 {
+        if dimension > 0 && dimension.is_multiple_of(16) && dimension <= 4096 {
             return maxsim_flat_neon(query, document, dimension);
         }
     }
@@ -184,7 +184,7 @@ fn maxsim_flat_neon(query: &[Vector], document: &[f32], dimension: usize) -> f32
                 debug_assert_eq!(q.len(), 128);
                 let qp = q.as_ptr();
                 let mut best = f32::NEG_INFINITY;
-                for doc in document.chunks_exact(128) {
+                for doc in document.as_chunks::<128>().0 {
                     let s = unsafe { dot_neon_128(qp, doc.as_ptr()) };
                     if s > best {
                         best = s;

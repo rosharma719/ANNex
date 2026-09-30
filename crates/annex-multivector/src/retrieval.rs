@@ -122,17 +122,17 @@ impl RetrievalState {
     }
     pub(super) fn remove(&mut self, id: &str) {
         if let Some(number) = self.by_id.remove(id) {
-            if let Some(chunk) = self.document_chunks.remove(&number) {
-                if let Some(positions) = self.chunks.get_mut(&chunk.parent) {
-                    if let Some(ids) = positions.get_mut(&chunk.position) {
-                        ids.remove(id);
-                        if ids.is_empty() {
-                            positions.remove(&chunk.position);
-                        }
+            if let Some(chunk) = self.document_chunks.remove(&number)
+                && let Some(positions) = self.chunks.get_mut(&chunk.parent)
+            {
+                if let Some(ids) = positions.get_mut(&chunk.position) {
+                    ids.remove(id);
+                    if ids.is_empty() {
+                        positions.remove(&chunk.position);
                     }
-                    if positions.is_empty() {
-                        self.chunks.remove(&chunk.parent);
-                    }
+                }
+                if positions.is_empty() {
+                    self.chunks.remove(&chunk.parent);
                 }
             }
             self.ids.remove(&number);
@@ -317,7 +317,7 @@ fn default_b() -> f32 {
 fn default_ef() -> usize {
     256
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Channel {
     Bm25 {
@@ -393,7 +393,7 @@ pub struct AdaptiveRerank {
     pub min_candidates: usize,
     pub agreement_threshold: f32,
 }
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextOptions {
     pub per_parent: Option<usize>,
@@ -407,7 +407,15 @@ pub struct ContextOptions {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetrieveRequest {
+    #[serde(default)]
     pub prefetch: Vec<Channel>,
+    #[serde(default)]
+    pub planning_mode: PlanningMode,
+    /// Query representations for auto-planning (required when planning_mode != Manual).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<QueryRepresentations>,
+    #[serde(default)]
+    pub objective: RetrievalObjective,
     #[serde(default)]
     pub fusion: Fusion,
     pub filter: Option<Predicate>,
@@ -430,7 +438,24 @@ pub struct ContextHit {
     pub sources: Vec<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expanded_from: Option<String>,
+    /// Approximate token count for context packing (word_count × 1.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_tokens: Option<usize>,
 }
+#[derive(Clone, Debug, Serialize)]
+pub struct RankingSignals {
+    /// top-1 score minus top-2 score (0 if < 2 results).
+    pub top1_margin: f32,
+    /// top-1 score minus bottom-of-topk score.
+    pub topk_score_spread: f32,
+    /// Already in trace; duplicated here for convenience.
+    pub channel_agreement: Option<f32>,
+    /// Unique parent documents / total matches.
+    pub source_diversity: f32,
+    /// Candidates dropped by text-hash deduplication.
+    pub dedup_count: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RetrievalTrace {
     pub plan: RetrievalPlan,
@@ -441,6 +466,9 @@ pub struct RetrievalTrace {
     pub reranked_candidates: usize,
     pub channel_agreement: Option<f32>,
     pub elapsed_ms: f64,
+    /// Wall time in ms for each stage, aligned with `plan.stages`.
+    pub per_stage_actual_ms: Vec<f64>,
+    pub signals: RankingSignals,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct RetrievalResponse {
@@ -454,6 +482,8 @@ struct ContextSelection {
     ids: HashSet<String>,
     texts: HashSet<blake3::Hash>,
     parents: HashMap<String, usize>,
+    tokens_consumed: usize,
+    dedup_count: usize,
 }
 
 impl ContextSelection {
@@ -463,14 +493,29 @@ impl ContextSelection {
         fields: &Fields,
         text_key: Option<blake3::Hash>,
         options: &ContextOptions,
-    ) -> bool {
-        !self.ids.contains(id)
-            && text_key.is_none_or(|key| !self.texts.contains(&key))
-            && fields.chunk.as_ref().is_none_or(|chunk| {
-                options.per_parent.is_none_or(|limit| {
-                    self.parents.get(&chunk.parent).copied().unwrap_or(0) < limit
-                })
-            })
+        token_budget: Option<usize>,
+        candidate_tokens: usize,
+    ) -> AcceptResult {
+        if self.ids.contains(id) {
+            return AcceptResult::AlreadyAdded;
+        }
+        if text_key.is_some_and(|key| self.texts.contains(&key)) {
+            return AcceptResult::Deduplicated;
+        }
+        if fields.chunk.as_ref().is_some_and(|chunk| {
+            options
+                .per_parent
+                .is_some_and(|limit| self.parents.get(&chunk.parent).copied().unwrap_or(0) >= limit)
+        }) {
+            return AcceptResult::GroupFull;
+        }
+        // Skip-and-continue token packing: don't stop on first non-fitting item.
+        if let Some(budget) = token_budget
+            && self.tokens_consumed.saturating_add(candidate_tokens) > budget
+        {
+            return AcceptResult::TokenBudgetExceeded;
+        }
+        AcceptResult::Ok
     }
 
     fn push(&mut self, hit: ContextHit, text_key: Option<blake3::Hash>) {
@@ -481,11 +526,32 @@ impl ContextSelection {
         if let Some(chunk) = &hit.chunk {
             *self.parents.entry(chunk.parent.clone()).or_default() += 1;
         }
+        if let Some(t) = hit.estimated_tokens {
+            self.tokens_consumed += t;
+        }
         self.matches.push(hit);
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum AcceptResult {
+    Ok,
+    AlreadyAdded,
+    Deduplicated,
+    GroupFull,
+    /// Hit doesn't fit in token budget; skip it (caller continues to next).
+    TokenBudgetExceeded,
+}
+
 impl Fields {
+    pub(super) fn has_text(&self) -> bool {
+        self.text.is_some()
+    }
+
+    pub(super) fn has_representation(&self, field: &str) -> bool {
+        self.representations.contains_key(field)
+    }
+
     pub(super) fn has_dense(&self, field: &str) -> bool {
         matches!(
             self.representations.get(field),
@@ -521,10 +587,10 @@ impl Fields {
                 "document ID, text or representation count exceeds limits",
             ));
         }
-        if let Some(chunk) = &document.chunk {
-            if chunk.parent.is_empty() || chunk.parent.len() > 4096 {
-                return Err(invalid("invalid chunk parent"));
-            }
+        if let Some(chunk) = &document.chunk
+            && (chunk.parent.is_empty() || chunk.parent.len() > 4096)
+        {
+            return Err(invalid("invalid chunk parent"));
         }
         let mut fields = Self {
             text: document.text.clone(),
@@ -648,6 +714,8 @@ impl MultiVectorIndex {
         let started = Instant::now();
         planner::validate_request(request)?;
         let s = self.snapshot();
+        let (effective_request, policy_plan) = self.prepare_request(&s, request);
+        let request = effective_request.as_ref();
         let eligible: HashSet<_> = s
             .documents
             .iter()
@@ -659,113 +727,133 @@ impl MultiVectorIndex {
             })
             .map(|(id, _)| id.as_str())
             .collect();
-        let plan = self.compile_plan(&s, request, eligible.len())?;
-        let mut channels = Vec::new();
-        let mut lists = Vec::new();
-        for (channel_index, channel) in request.prefetch.iter().enumerate() {
-            let at = Instant::now();
-            let planned = &plan.channels[channel_index];
-            let limit = planned.limit;
-            let allowed = |number| {
-                s.retrieval
-                    .ids
-                    .get(&number)
-                    .is_some_and(|id| eligible.contains(id.as_str()))
-            };
-            let external = |hits: Vec<(u64, f32)>| {
-                hits.into_iter()
-                    .map(|(id, score)| (s.retrieval.ids[&id].clone(), score))
-                    .collect::<Vec<_>>()
-            };
-            let tie_break = |a, b| s.retrieval.ids[&a].cmp(&s.retrieval.ids[&b]);
-            let scores = match channel {
-                Channel::Bm25 { text, k1, b, .. } => {
-                    // BM25 query weights are raw analyzed query term
-                    // frequencies: repeated query terms contribute repeatedly.
-                    let query = SparseVector::from_pairs(
-                        s.retrieval.analyzer.analyze(text).into_iter().filter_map(
-                            |(term, count)| {
-                                s.retrieval.vocabulary.get(&term).map(|&id| (id, count))
-                            },
-                        ),
-                    );
-                    external(
-                        s.retrieval
-                            .lexical
-                            .search_bm25_filtered_by(&query, limit, *k1, *b, allowed, tie_break)
-                            .map_err(sparse_error)?,
-                    )
-                }
-                Channel::Sparse { field, vector, .. } => {
-                    let index = s
-                        .retrieval
-                        .sparse
-                        .get(field)
-                        .ok_or_else(|| invalid(format!("unknown sparse field {field:?}")))?;
-                    external(
-                        index
-                            .search_dot_filtered_by(vector, limit, allowed, tie_break)
-                            .map_err(sparse_error)?,
-                    )
-                }
-                Channel::Dense {
-                    field,
-                    vector,
-                    ef_search,
-                    ..
-                } => {
-                    if planned.operator == PhysicalOperator::HnswDense {
-                        self.ann_scores(
-                            &s,
-                            &s.named_ann[field],
-                            &normalize(vector),
-                            limit,
-                            *ef_search,
-                        )?
-                    } else {
-                        self.named_scores(
-                            &s,
-                            field,
-                            std::slice::from_ref(vector),
-                            false,
-                            &eligible,
-                            limit,
-                        )?
+        let mut plan = self.compile_plan(&s, request, eligible.len())?;
+        plan.policy = policy_plan;
+        let mut per_stage_actual_ms: Vec<f64> = Vec::with_capacity(plan.stages.len());
+
+        // Channels are independent — dispatch them concurrently with Rayon.
+        // NOTE: each channel may itself use par_iter internally; nested Rayon
+        // work-stealing is safe but may create contention under high concurrency.
+        // A per-query parallelism budget is tracked in a later phase.
+        let parallel_stage_start = Instant::now();
+        type ChannelResult = Result<(Vec<(String, f32)>, Value), IndexError>;
+        let channel_results: Vec<ChannelResult> = request
+            .prefetch
+            .par_iter()
+            .zip(plan.parallel_channels().par_iter())
+            .map(|(channel, planned)| {
+                let at = Instant::now();
+                let limit = planned.limit;
+                let allowed = |number: u64| {
+                    s.retrieval
+                        .ids
+                        .get(&number)
+                        .is_some_and(|id| eligible.contains(id.as_str()))
+                };
+                let external = |hits: Vec<(u64, f32)>| -> Vec<(String, f32)> {
+                    hits.into_iter()
+                        .map(|(id, score)| (s.retrieval.ids[&id].clone(), score))
+                        .collect()
+                };
+                let tie_break = |a: u64, b: u64| s.retrieval.ids[&a].cmp(&s.retrieval.ids[&b]);
+                let scores = match channel {
+                    Channel::Bm25 { text, k1, b, .. } => {
+                        let query = SparseVector::from_pairs(
+                            s.retrieval.analyzer.analyze(text).into_iter().filter_map(
+                                |(term, count)| {
+                                    s.retrieval.vocabulary.get(&term).map(|&id| (id, count))
+                                },
+                            ),
+                        );
+                        external(
+                            s.retrieval
+                                .lexical
+                                .search_bm25_filtered_by(&query, limit, *k1, *b, allowed, tie_break)
+                                .map_err(sparse_error)?,
+                        )
                     }
-                }
-                Channel::Multivector {
-                    field: Some(field),
-                    vectors,
-                    ..
-                } => self.named_scores(&s, field, vectors, true, &eligible, limit)?,
-                Channel::Multivector {
-                    field: None,
-                    vectors,
-                    ef_search,
-                    ..
-                } => {
-                    let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
-                    if planned.operator == PhysicalOperator::HnswFde {
-                        self.ann_fde_scores(
-                            &s,
-                            &self.fde.encode_query(&normalized),
-                            limit,
-                            *ef_search,
-                        )?
-                    } else {
-                        self.exact_fde_scores_filtered(
-                            &s,
-                            &normalized,
-                            Some(limit),
-                            Some(&eligible),
-                        )?
+                    Channel::Sparse { field, vector, .. } => {
+                        let index =
+                            s.retrieval.sparse.get(field).ok_or_else(|| {
+                                invalid(format!("unknown sparse field {field:?}"))
+                            })?;
+                        external(
+                            index
+                                .search_dot_filtered_by(vector, limit, allowed, tie_break)
+                                .map_err(sparse_error)?,
+                        )
                     }
-                }
-            };
-            let backend = planned.operator.as_str();
-            channels.push(serde_json::json!({"backend": backend,"candidates": scores.len(),"elapsed_ms": at.elapsed().as_secs_f64()*1000.}));
-            lists.push(scores);
-        }
+                    Channel::Dense {
+                        field,
+                        vector,
+                        ef_search,
+                        ..
+                    } => {
+                        if planned.operator == PhysicalOperator::HnswDense {
+                            self.ann_scores(
+                                &s,
+                                &s.named_ann[field],
+                                &normalize(vector),
+                                limit,
+                                *ef_search,
+                            )?
+                        } else {
+                            self.named_scores(
+                                &s,
+                                field,
+                                std::slice::from_ref(vector),
+                                false,
+                                &eligible,
+                                limit,
+                            )?
+                        }
+                    }
+                    Channel::Multivector {
+                        field: Some(field),
+                        vectors,
+                        ..
+                    } => self.named_scores(&s, field, vectors, true, &eligible, limit)?,
+                    Channel::Multivector {
+                        field: None,
+                        vectors,
+                        ef_search,
+                        ..
+                    } => {
+                        let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
+                        if planned.operator == PhysicalOperator::HnswFde {
+                            self.ann_fde_scores(
+                                &s,
+                                &self.fde.encode_query(&normalized),
+                                limit,
+                                *ef_search,
+                            )?
+                        } else {
+                            self.exact_fde_scores_filtered(
+                                &s,
+                                &normalized,
+                                Some(limit),
+                                Some(&eligible),
+                            )?
+                        }
+                    }
+                };
+                let backend = planned.operator.as_str();
+                let entry = serde_json::json!({
+                    "backend": backend,
+                    "candidates": scores.len(),
+                    "elapsed_ms": at.elapsed().as_secs_f64() * 1000.
+                });
+                Ok((scores, entry))
+            })
+            .collect();
+        let (mut lists, channels): (Vec<_>, Vec<_>) = channel_results
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .unzip();
+        per_stage_actual_ms.push(parallel_stage_start.elapsed().as_secs_f64() * 1000.);
+
+        let fusion_stage_start = Instant::now();
         let agreement = if lists.len() > 1 {
             let head: HashSet<_> = lists[0]
                 .iter()
@@ -821,8 +909,11 @@ impl MultiVectorIndex {
             )
         };
         let fused_candidates = ranked.len();
+        per_stage_actual_ms.push(fusion_stage_start.elapsed().as_secs_f64() * 1000.);
+
         let mut reranked = 0;
         if let Some(rerank) = &request.rerank {
+            let rerank_stage_start = Instant::now();
             let budget = if let Some(policy) = &rerank.adaptive {
                 if agreement.expect("planner requires multiple channels")
                     >= policy.agreement_threshold
@@ -857,8 +948,13 @@ impl MultiVectorIndex {
                     .map(|h| (h.id, h.score))
                     .collect();
             }
+            per_stage_actual_ms.push(rerank_stage_start.elapsed().as_secs_f64() * 1000.);
         }
-        let matches = self.context(&s, ranked, &fused, &eligible, request)?;
+
+        let context_stage_start = Instant::now();
+        let (matches, signals) = self.context(&s, ranked, &fused, &eligible, request, agreement)?;
+        per_stage_actual_ms.push(context_stage_start.elapsed().as_secs_f64() * 1000.);
+
         Ok(RetrievalResponse {
             matches,
             trace: RetrievalTrace {
@@ -870,6 +966,8 @@ impl MultiVectorIndex {
                 reranked_candidates: reranked,
                 channel_agreement: agreement,
                 elapsed_ms: started.elapsed().as_secs_f64() * 1000.,
+                per_stage_actual_ms,
+                signals,
             },
         })
     }
@@ -937,8 +1035,10 @@ impl MultiVectorIndex {
         fused: &HashMap<String, (f32, Vec<usize>)>,
         eligible: &HashSet<&str>,
         request: &RetrieveRequest,
-    ) -> Result<Vec<ContextHit>, IndexError> {
+        channel_agreement: Option<f32>,
+    ) -> Result<(Vec<ContextHit>, RankingSignals), IndexError> {
         let options = &request.context;
+        let token_budget = request.objective.context_budget_tokens;
         let mmr_vectors = if options.mmr.is_some() {
             if ranked.len() > 4096 {
                 return Err(invalid("MMR pool exceeds 4096 candidates"));
@@ -971,6 +1071,15 @@ impl MultiVectorIndex {
                 None
             }
         };
+        let estimate_tokens = |id: &str| -> Option<usize> {
+            token_budget?;
+            let word_count = s.documents[id]
+                .fields
+                .text
+                .as_ref()
+                .map_or(0, |t| t.split_whitespace().count());
+            Some((word_count * 13 / 10).max(1))
+        };
         // Cache hashes only for MMR's repeatedly inspected, bounded pool. Plain
         // ranking hashes documents lazily, stopping as soon as context is full.
         let candidate_keys: Vec<_> = if mmr_vectors.is_some() {
@@ -998,10 +1107,22 @@ impl MultiVectorIndex {
                    id: &str,
                    score: f32,
                    expanded_from: Option<String>,
-                   key: Option<blake3::Hash>| {
+                   key: Option<blake3::Hash>|
+         -> bool {
             let d = &s.documents[id];
-            if !eligible.contains(id) || !selected.accepts(id, &d.fields, key, options) {
+            if !eligible.contains(id) {
                 return false;
+            }
+            let est_tokens = estimate_tokens(id).unwrap_or(0);
+            match selected.accepts(id, &d.fields, key, options, token_budget, est_tokens) {
+                AcceptResult::Ok => {}
+                AcceptResult::Deduplicated => {
+                    selected.dedup_count += 1;
+                    return false;
+                }
+                // Token budget exceeded: skip this candidate but don't permanently exclude.
+                AcceptResult::TokenBudgetExceeded => return false,
+                AcceptResult::AlreadyAdded | AcceptResult::GroupFull => return false,
             }
             selected.push(
                 ContextHit {
@@ -1012,6 +1133,11 @@ impl MultiVectorIndex {
                     chunk: d.fields.chunk.clone(),
                     sources: fused.get(id).map(|v| v.1.clone()).unwrap_or_default(),
                     expanded_from,
+                    estimated_tokens: if token_budget.is_some() {
+                        Some(est_tokens)
+                    } else {
+                        None
+                    },
                 },
                 key,
             );
@@ -1028,14 +1154,25 @@ impl MultiVectorIndex {
                     if !remaining[i] {
                         continue;
                     }
-                    if !eligible.contains(id.as_str())
-                        || !selected.accepts(
+                    let est_tokens = estimate_tokens(id).unwrap_or(0);
+                    let result = if !eligible.contains(id.as_str()) {
+                        AcceptResult::AlreadyAdded // permanent exclusion
+                    } else {
+                        selected.accepts(
                             id,
                             &s.documents[id].fields,
                             candidate_keys[i],
                             options,
+                            token_budget,
+                            est_tokens,
                         )
-                    {
+                    };
+                    if matches!(
+                        result,
+                        AcceptResult::AlreadyAdded
+                            | AcceptResult::GroupFull
+                            | AcceptResult::Deduplicated
+                    ) {
                         // Group and duplicate exclusions cannot become eligible
                         // later; excluded candidates must not affect diversity.
                         remaining[i] = false;
@@ -1082,34 +1219,68 @@ impl MultiVectorIndex {
                     }
                 }
             }
-            if options.neighbors > 0 {
-                if let Some(chunk) = &s.documents[id].fields.chunk {
-                    for neighbor in s.retrieval.neighbors(chunk, options.neighbors) {
-                        if !eligible.contains(neighbor) || selected.ids.contains(neighbor) {
-                            continue;
-                        }
-                        add(
-                            &mut selected,
-                            neighbor,
-                            *score,
-                            Some(id.clone()),
-                            text_key(neighbor),
-                        );
-                        if selected.matches.len() >= request.limit {
-                            break;
-                        }
+            if options.neighbors > 0
+                && let Some(chunk) = &s.documents[id].fields.chunk
+            {
+                for neighbor in s.retrieval.neighbors(chunk, options.neighbors) {
+                    if !eligible.contains(neighbor) || selected.ids.contains(neighbor) {
+                        continue;
+                    }
+                    add(
+                        &mut selected,
+                        neighbor,
+                        *score,
+                        Some(id.clone()),
+                        text_key(neighbor),
+                    );
+                    if selected.matches.len() >= request.limit {
+                        break;
                     }
                 }
             }
         }
-        Ok(selected.matches)
+
+        let top1_margin = match ranked.as_slice() {
+            [a, b, ..] => (a.1 - b.1).max(0.0),
+            _ => 0.0,
+        };
+        let topk_score_spread = ranked
+            .first()
+            .zip(
+                ranked.get(
+                    request
+                        .limit
+                        .saturating_sub(1)
+                        .min(ranked.len().saturating_sub(1)),
+                ),
+            )
+            .map_or(0.0, |(top, bot)| (top.1 - bot.1).max(0.0));
+        let unique_sources = selected
+            .matches
+            .iter()
+            .filter_map(|h| h.chunk.as_ref().map(|c| c.parent.as_str()))
+            .collect::<HashSet<_>>()
+            .len();
+        let source_diversity = if selected.matches.is_empty() {
+            1.0
+        } else {
+            unique_sources as f32 / selected.matches.len() as f32
+        };
+        let signals = RankingSignals {
+            top1_margin,
+            topk_score_spread,
+            channel_agreement,
+            source_diversity,
+            dedup_count: selected.dedup_count,
+        };
+        Ok((selected.matches, signals))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::FAIL_COMMIT;
+    use crate::{engine::planner::FusionOperator, storage::FAIL_COMMIT};
     use serde_json::json;
 
     fn document(
@@ -1162,18 +1333,31 @@ mod tests {
             .retain(|channel| matches!(channel, Channel::Dense { .. }));
 
         let exact = index.plan(&query).unwrap();
-        assert_eq!(exact.channels[0].operator, PhysicalOperator::ExactDense);
-        assert_eq!(exact.channels[0].reason, PlanReason::AnnUnavailable);
+        assert_eq!(
+            exact.parallel_channels()[0].operator,
+            PhysicalOperator::ExactDense
+        );
+        assert_eq!(
+            exact.parallel_channels()[0].reason,
+            PlanReason::AnnUnavailable
+        );
 
         index.build_dense_ann("semantic", 4, 16).unwrap();
         let ann = index.plan(&query).unwrap();
-        assert_eq!(ann.channels[0].operator, PhysicalOperator::HnswDense);
-        assert_eq!(ann.channels[0].reason, PlanReason::AnnReady);
+        // 3-doc corpus, dim=2: cost_exact=12 < cost_hnsw=3072 → exact chosen by cost model.
+        assert_eq!(
+            ann.parallel_channels()[0].operator,
+            PhysicalOperator::ExactDense
+        );
+        assert_eq!(
+            ann.parallel_channels()[0].reason,
+            PlanReason::LowerEstimatedCost
+        );
         let response = index.retrieve(&query).unwrap();
         assert_eq!(response.trace.plan, ann);
         assert_eq!(
             response.trace.channels[0]["backend"],
-            ann.channels[0].operator.as_str()
+            ann.parallel_channels()[0].operator.as_str()
         );
 
         query.filter = Some(Predicate::Eq {
@@ -1181,8 +1365,14 @@ mod tests {
             value: json!("a"),
         });
         let filtered = index.plan(&query).unwrap();
-        assert_eq!(filtered.channels[0].operator, PhysicalOperator::ExactDense);
-        assert_eq!(filtered.channels[0].reason, PlanReason::FilterRequiresExact);
+        assert_eq!(
+            filtered.parallel_channels()[0].operator,
+            PhysicalOperator::ExactDense
+        );
+        assert_eq!(
+            filtered.parallel_channels()[0].reason,
+            PlanReason::FilterRequiresExact
+        );
         assert_eq!(filtered.eligible_documents, 2);
     }
     #[test]
@@ -1605,9 +1795,10 @@ mod tests {
         let mut q = request();
         q.filter = None;
         q.prefetch.retain(|c| matches!(c, Channel::Dense { .. }));
+        // 3-doc corpus: cost model prefers exact over HNSW (exact=12 < hnsw=3072 units).
         assert_eq!(
             index.retrieve(&q).unwrap().trace.channels[0]["backend"],
-            "hnsw_dense"
+            "exact_dense"
         );
         assert!(index.delete("b").unwrap());
         assert!(
@@ -1707,7 +1898,445 @@ mod tests {
     }
 
     #[test]
+    fn auto_mode_generates_bm25_channel_from_text_representation() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path()); // has BM25 (token_documents > 0)
+
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [],
+            "planning_mode": "auto",
+            "query": {"text": "E123 repair"},
+            "limit": 3
+        }))
+        .unwrap();
+        let response = index.retrieve(&query).unwrap();
+        // Auto mode with text query → must have generated at least one BM25 channel.
+        let policy = response
+            .trace
+            .plan
+            .policy
+            .as_ref()
+            .expect("policy plan must be present in auto mode");
+        assert!(
+            policy.channels_selected.contains(&LogicalChannelKind::Bm25),
+            "auto mode should select BM25 when text coverage is sufficient"
+        );
+        assert!(
+            !response.matches.is_empty(),
+            "auto mode must return results"
+        );
+    }
+
+    #[test]
+    fn auto_mode_generates_dense_channel_from_representation() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path()); // has "semantic" dense field
+
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [],
+            "planning_mode": "auto",
+            "query": {"dense": {"semantic": [1.0, 0.0]}},
+            "limit": 3
+        }))
+        .unwrap();
+        let plan = index.plan(&query).unwrap();
+        // Verify that the plan has channels (from generated prefetch).
+        assert!(
+            !plan.parallel_channels().is_empty(),
+            "auto mode with dense query must generate channels"
+        );
+    }
+
+    #[test]
+    fn unsupported_requests_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [],
+            "limit": 3
+        }))
+        .unwrap();
+        assert!(
+            index.plan(&query).is_err(),
+            "manual mode with empty prefetch must be invalid"
+        );
+
+        let mut query = request();
+        query.objective.latency_budget_ms = Some(10.0);
+        let error = index.plan(&query).unwrap_err();
+        assert!(error.to_string().contains("requires calibrated planning"));
+    }
+
+    #[test]
+    fn auto_mode_trace_includes_policy_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [],
+            "planning_mode": "auto",
+            "query": {"text": "repair"},
+            "limit": 2
+        }))
+        .unwrap();
+        let response = index.retrieve(&query).unwrap();
+        let policy = response
+            .trace
+            .plan
+            .policy
+            .as_ref()
+            .expect("auto mode must embed PolicyPlan in plan");
+        assert!(!policy.channels_selected.is_empty());
+        assert!(!policy.selection_reasons.is_empty());
+    }
+
+    #[test]
+    fn auto_with_overrides_uses_the_caller_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [{"kind":"bm25","text":"exact phrase","limit":1}],
+            "planning_mode": "auto_with_overrides",
+            "query": {"text":"repair"},
+            "limit": 1
+        }))
+        .unwrap();
+        let plan = index.plan(&query).unwrap();
+        assert_eq!(plan.parallel_channels()[0].limit, 1);
+        assert_eq!(plan.policy.unwrap().generated_prefetch, query.prefetch);
+    }
+
+    #[test]
+    fn token_budget_skips_large_chunks_rather_than_stopping() {
+        // Insert two short docs and one long doc (>budget by itself).
+        // With a skip-and-continue packer, short docs should appear in output
+        // even though the long doc comes first in score order.
+        let dir = tempfile::tempdir().unwrap();
+        let index = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
+        let long_text = "word ".repeat(200); // ~200 words ≈ 260 estimated tokens
+        let short_text = "short";
+        index
+            .upsert_records(vec![
+                RetrievalDocument {
+                    id: "long".into(),
+                    text: Some(long_text.clone()),
+                    metadata: serde_json::json!({}),
+                    representations: BTreeMap::from([(
+                        "s".into(),
+                        Representation::Dense {
+                            vector: vec![1.0, 0.0],
+                        },
+                    )]),
+                    ..RetrievalDocument::default()
+                },
+                RetrievalDocument {
+                    id: "short1".into(),
+                    text: Some(short_text.into()),
+                    metadata: serde_json::json!({}),
+                    representations: BTreeMap::from([(
+                        "s".into(),
+                        Representation::Dense {
+                            vector: vec![0.9, 0.1],
+                        },
+                    )]),
+                    ..RetrievalDocument::default()
+                },
+                RetrievalDocument {
+                    id: "short2".into(),
+                    text: Some(short_text.into()),
+                    metadata: serde_json::json!({}),
+                    representations: BTreeMap::from([(
+                        "s".into(),
+                        Representation::Dense {
+                            vector: vec![0.8, 0.2],
+                        },
+                    )]),
+                    ..RetrievalDocument::default()
+                },
+            ])
+            .unwrap();
+
+        // Budget of 50 tokens: "long" (~260 tokens) doesn't fit; short docs do.
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [{"kind":"dense","field":"s","vector":[1.0,0.0],"limit":10}],
+            "limit": 5,
+            "objective": {"context_budget_tokens": 50}
+        }))
+        .unwrap();
+        let response = index.retrieve(&query).unwrap();
+        // Short docs must appear — packer should skip "long" and continue.
+        let ids: Vec<&str> = response.matches.iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            ids.contains(&"short1") || ids.contains(&"short2"),
+            "short docs should be included when large doc is skipped: got {:?}",
+            ids
+        );
+        // estimated_tokens should be populated.
+        assert!(
+            response
+                .matches
+                .iter()
+                .any(|h| h.estimated_tokens.is_some()),
+            "estimated_tokens must be populated when context_budget_tokens is set"
+        );
+    }
+
+    #[test]
+    fn ranking_signals_are_populated_in_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query = request();
+
+        let response = index.retrieve(&query).unwrap();
+        let signals = &response.trace.signals;
+        assert!(signals.source_diversity >= 0.0 && signals.source_diversity <= 1.0);
+        assert!(signals.topk_score_spread >= 0.0);
+    }
+
+    #[test]
     fn global_development_choice_is_the_rrf_default() {
         assert!(matches!(Fusion::default(), Fusion::Rrf { k } if k == 10.));
+    }
+
+    #[test]
+    fn plan_stages_structure_matches_request_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        // Two-channel request: Dense + BM25
+        let query = request();
+        let plan = index.plan(&query).unwrap();
+
+        // First stage must be Parallel with one PlannedChannel per prefetch entry.
+        let PlanStage::Parallel(channels) = &plan.stages[0] else {
+            panic!("expected Parallel stage, got {:?}", plan.stages[0]);
+        };
+        assert_eq!(channels.len(), query.prefetch.len());
+
+        // Second stage must be Fusion (two channels → RRF).
+        assert!(
+            matches!(
+                plan.stages[1],
+                PlanStage::Fusion(FusionOperator::ReciprocalRank)
+            ),
+            "expected RRF fusion, got {:?}",
+            plan.stages[1]
+        );
+
+        // Last stage must be Context.
+        assert!(
+            matches!(plan.stages.last().unwrap(), PlanStage::Context(_)),
+            "last stage must be Context"
+        );
+
+        assert!(plan.estimate.critical_path_cost > 0.0);
+        assert!(plan.estimate.total_cost > 0.0);
+        serde_json::to_value(&plan).expect("plans exposed by HTTP must serialize");
+    }
+
+    #[test]
+    fn single_channel_plan_uses_native_score_not_rrf() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut query = request();
+        query.prefetch.retain(|c| matches!(c, Channel::Bm25 { .. }));
+
+        let plan = index.plan(&query).unwrap();
+        assert!(
+            matches!(
+                plan.stages[1],
+                PlanStage::Fusion(FusionOperator::NativeScore)
+            ),
+            "single channel must bypass RRF"
+        );
+    }
+
+    #[test]
+    fn plan_with_rerank_includes_rerank_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut query = request();
+        query
+            .prefetch
+            .retain(|c| matches!(c, Channel::Dense { .. }));
+        query.rerank = Some(Rerank {
+            field: Some("tokens".into()),
+            vectors: vec![vec![1., 0.]],
+            limit: 3,
+            adaptive: None,
+        });
+
+        let plan = index.plan(&query).unwrap();
+        let has_rerank = plan
+            .stages
+            .iter()
+            .any(|s| matches!(s, PlanStage::Rerank(_)));
+        assert!(has_rerank, "rerank stage missing from plan");
+    }
+
+    #[test]
+    fn plan_is_deterministic_for_same_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query = request();
+
+        let plan_a = index.plan(&query).unwrap();
+        let plan_b = index.plan(&query).unwrap();
+        assert_eq!(plan_a, plan_b, "planning must be deterministic");
+    }
+
+    #[test]
+    fn plan_parallel_channels_accessor_returns_channels_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query = request();
+
+        let plan = index.plan(&query).unwrap();
+        let channels = plan.parallel_channels();
+        assert_eq!(channels.len(), query.prefetch.len());
+        for (i, ch) in channels.iter().enumerate() {
+            assert_eq!(ch.index, i);
+        }
+    }
+
+    #[test]
+    fn retrieve_trace_per_stage_ms_is_aligned_with_plan_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query = request();
+
+        let response = index.retrieve(&query).unwrap();
+        let trace = &response.trace;
+
+        assert_eq!(
+            trace.per_stage_actual_ms.len(),
+            trace.plan.stages.len(),
+            "per_stage_actual_ms must have one entry per plan stage"
+        );
+        for &ms in &trace.per_stage_actual_ms {
+            assert!(ms >= 0.0, "stage duration must be non-negative");
+        }
+    }
+
+    #[test]
+    fn retrieve_trace_plan_matches_dry_run_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut query = request();
+        query.filter = None;
+
+        let dry_run = index.plan(&query).unwrap();
+        let response = index.retrieve(&query).unwrap();
+        assert_eq!(
+            response.trace.plan, dry_run,
+            "plan embedded in trace must match plan() dry-run"
+        );
+    }
+
+    #[test]
+    fn plan_estimate_uses_critical_path_for_parallel_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query = request(); // two channels
+
+        let plan = index.plan(&query).unwrap();
+        let channels = plan.parallel_channels();
+        let channel_cost_sum: f64 = channels.iter().map(|c| c.estimated_cost_units).sum();
+
+        assert!(
+            plan.estimate.critical_path_cost <= plan.estimate.total_cost,
+            "critical-path cost must not exceed total cost"
+        );
+        assert!(
+            channel_cost_sum > 0.0,
+            "per-channel cost units must be populated"
+        );
+    }
+
+    #[test]
+    fn cost_model_selects_exact_for_tiny_corpus_even_with_ann_built() {
+        // 3-doc corpus, dim=2: ExactDense cost = 3×2×2=12 units.
+        // HnswDense cost = 256 × ceil(log2(3)) × 2 × 3 = 3072 units → exact cheaper.
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        index.build_dense_ann("semantic", 4, 16).unwrap();
+
+        let mut query = request();
+        query.filter = None;
+        query
+            .prefetch
+            .retain(|c| matches!(c, Channel::Dense { .. }));
+
+        let plan = index.plan(&query).unwrap();
+        let ch = &plan.parallel_channels()[0];
+        // With cost model active, exact should win for tiny corpora.
+        assert_eq!(ch.operator, PhysicalOperator::ExactDense);
+        assert!(
+            matches!(
+                ch.reason,
+                PlanReason::LowerEstimatedCost | PlanReason::AnnReady
+            ),
+            "expected cost-based reason, got {:?}",
+            ch.reason
+        );
+    }
+
+    #[test]
+    fn filter_stats_selectivity_accurate_for_equality_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path()); // 3 docs: 2 with tenant=a, 1 with tenant=denied
+        let query = request(); // filter: tenant=a
+
+        let plan = index.plan(&query).unwrap();
+        let fs = plan.stats.filter_stats.as_ref().unwrap();
+        let expected = 2.0 / 3.0_f32;
+        assert!(
+            (fs.selectivity - expected).abs() < 0.05,
+            "selectivity should be ~{expected:.2}, got {:.2}",
+            fs.selectivity
+        );
+    }
+
+    #[test]
+    fn cost_model_selects_hnsw_when_cheaper_than_exact() {
+        // 50 docs, dim=2, ef=4:
+        // hnsw = 4 × ceil(log2(50)) × 2 × 3 = 4×6×6 = 144
+        // exact = 50 × 2 × 2 = 200 → HNSW cheaper
+        let dir = tempfile::tempdir().unwrap();
+        let index = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
+        let docs: Vec<_> = (0..50_u32)
+            .map(|i| {
+                let v = if i % 2 == 0 {
+                    vec![1.0_f32, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                };
+                RetrievalDocument {
+                    id: format!("d{i}"),
+                    representations: BTreeMap::from([(
+                        "f".into(),
+                        Representation::Dense { vector: v },
+                    )]),
+                    ..RetrievalDocument::default()
+                }
+            })
+            .collect();
+        index.upsert_records(docs).unwrap();
+        index.build_dense_ann("f", 4, 16).unwrap();
+
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [{"kind": "dense", "field": "f", "vector": [1.0, 0.0],
+                          "limit": 5, "ef_search": 4}],
+            "limit": 5
+        }))
+        .unwrap();
+        let plan = index.plan(&query).unwrap();
+        assert_eq!(
+            plan.parallel_channels()[0].operator,
+            PhysicalOperator::HnswDense,
+            "HNSW should be cheaper for 50 docs with ef=4"
+        );
+        assert_eq!(
+            plan.parallel_channels()[0].reason,
+            PlanReason::LowerEstimatedCost
+        );
     }
 }

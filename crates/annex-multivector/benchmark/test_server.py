@@ -127,7 +127,7 @@ class ServerTests(unittest.TestCase):
                 {"field": "semantic", "m": 4, "ef_construct": 16},
             )
             result = http(base, route("a", "retrieve"), query)
-            self.assertEqual(result["trace"]["channels"][0]["backend"], "hnsw_dense")
+            self.assertEqual(result["trace"]["channels"][0]["backend"], "exact_dense")
             http(base, route("a", "compact"), {})
             self.assertEqual(
                 http(base, route("a", "retrieve"), query)["matches"], result["matches"]

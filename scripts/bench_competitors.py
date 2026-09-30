@@ -185,11 +185,14 @@ def main():
     ap.add_argument("--metric", required=True, choices=["cosine", "euclidean", "dot"])
     ap.add_argument("--dims", required=True, type=int)
     ap.add_argument("--n-queries", default=1000, type=int)
+    ap.add_argument("--k", default=10, type=int)
     ap.add_argument("--out", default=None, type=Path,
                     help="Output JSONL path (default: auto-derived from data-dir name)")
     ap.add_argument("--libs", default="hnswlib,usearch,faiss-hnsw",
                     help="comma-separated libs to run")
     args = ap.parse_args()
+    global K
+    K = args.k
 
     libs = [l.strip() for l in args.libs.split(",")]
     out = args.out

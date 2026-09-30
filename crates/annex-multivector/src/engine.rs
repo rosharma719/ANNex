@@ -1,5 +1,7 @@
 #[path = "planner.rs"]
 mod planner;
+#[path = "policy.rs"]
+mod policy;
 #[path = "retrieval.rs"]
 mod retrieval;
 use crate::{
@@ -15,11 +17,17 @@ use annex::{
     utils::types::DistanceMetric,
     vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
 };
-pub use planner::{FilterStrategy, PhysicalOperator, PlanReason, PlannedChannel, RetrievalPlan};
+pub use planner::{
+    ContextOperator, ContextPlan, FieldStats, FilterStats, FilterStrategy, FusionOperator,
+    LogicalChannel, LogicalChannelKind, LogicalFusion, LogicalPlan, PhysicalOperator, PlanEstimate,
+    PlanReason, PlanStage, PlannedChannel, PlannerStats, QualityPreference, RepresentationKind,
+    RerankPlan, RetrievalObjective, RetrievalPlan,
+};
+pub use policy::{PlanningMode, PolicyPlan, QueryRepresentations};
 use rayon::prelude::*;
 pub use retrieval::{
-    AdaptiveRerank, Channel, Chunk, ContextHit, ContextOptions, Fusion, Predicate, Representation,
-    Rerank, RetrievalDocument, RetrievalResponse, RetrievalTrace, RetrieveRequest,
+    AdaptiveRerank, Channel, Chunk, ContextHit, ContextOptions, Fusion, Predicate, RankingSignals,
+    Representation, Rerank, RetrievalDocument, RetrievalResponse, RetrievalTrace, RetrieveRequest,
 };
 use retrieval::{FieldSchema, Fields, RetrievalState};
 use serde::{Deserialize, Serialize};
@@ -668,8 +676,10 @@ impl MultiVectorIndex {
                 }
                 let bytes = record_bytes(object_bytes, d.location)?;
                 let stored_ids = bytes[16..16 + d.tokens * 4]
-                    .chunks_exact(4)
-                    .map(|v| u32::from_le_bytes(v.try_into().unwrap()));
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|v| u32::from_le_bytes(*v));
                 if !stored_ids.eq(d.centroid_ids.iter().copied()) {
                     return Err(IndexError::Invalid(
                         "manifest/record centroid mismatch".into(),
@@ -720,10 +730,10 @@ impl MultiVectorIndex {
                         .file_name()
                         .to_str()
                         .and_then(|s| s.parse::<u64>().ok())
+                        && Some(id) != storage_generation
+                        && !sealed.contains_key(&id)
                     {
-                        if Some(id) != storage_generation && !sealed.contains_key(&id) {
-                            fs::remove_dir_all(entry.path())?;
-                        }
+                        fs::remove_dir_all(entry.path())?;
                     }
                 }
             }

@@ -1,12 +1,12 @@
 # Release workflow — triggered by per-crate version tags.
 #
 # Tag format:  <crate>-v<semver>
-#   annex-core-v0.2.0         → publish annex-core to crates.io
+#   annex-v0.2.0              → publish annex to crates.io
 #   annex-multivector-v0.2.0  → publish annex-multivector to crates.io
 #   annex-server-v0.2.0       → publish annex-server to crates.io
-#   annex-py-v0.2.0           → build wheels + publish annex-py to PyPI
+#   annex-py-v0.2.0           → build wheels + publish ANNexDB to PyPI
 #
-# Dependency order: annex-core must be tagged (and indexed by crates.io,
+# Dependency order: annex must be tagged (and indexed by crates.io,
 # allow ~5 min) before tagging annex-multivector, annex-server, or annex-py.
 #
 # Required secrets:
@@ -16,13 +16,14 @@
 # One-time setup on PyPI:
 #   pypi.org → your project → Publishing → Add publisher
 #   → GitHub · owner: rosharma719 · repo: ANNex · workflow: release.yml
+#   → environment: ANNexDB (pending publishers can create the project)
 
 name: Release
 
 on:
   push:
     tags:
-      - 'annex-core-v*'
+      - 'annex-v*'
       - 'annex-multivector-v*'
       - 'annex-server-v*'
       - 'annex-py-v*'
@@ -39,6 +40,8 @@ jobs:
       version:   ${{ steps.parse.outputs.version }}
       is_python: ${{ steps.parse.outputs.is_python }}
     steps:
+      - uses: actions/checkout@v4
+
       - id: parse
         run: |
           TAG="${GITHUB_REF_NAME}"
@@ -46,6 +49,26 @@ jobs:
           CRATE="${TAG%-v*}"
           IS_PYTHON="false"
           [[ "$CRATE" == "annex-py" ]] && IS_PYTHON="true"
+
+          case "$CRATE" in
+            annex) MANIFEST="crates/annex-core/Cargo.toml" ;;
+            annex-multivector) MANIFEST="crates/annex-multivector/Cargo.toml" ;;
+            annex-server) MANIFEST="crates/annex-server/Cargo.toml" ;;
+            annex-py) MANIFEST="python/annex-py/Cargo.toml" ;;
+            *) echo "unsupported release tag: $TAG" >&2; exit 1 ;;
+          esac
+          MANIFEST_VERSION=$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["version"])' "$MANIFEST")
+          [[ "$VERSION" == "$MANIFEST_VERSION" ]] || {
+            echo "tag version $VERSION does not match $MANIFEST version $MANIFEST_VERSION" >&2
+            exit 1
+          }
+          if [[ "$IS_PYTHON" == "true" ]]; then
+            PYTHON_VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("python/annex-py/pyproject.toml", "rb"))["project"]["version"])')
+            [[ "$VERSION" == "$PYTHON_VERSION" ]] || {
+              echo "tag version $VERSION does not match pyproject version $PYTHON_VERSION" >&2
+              exit 1
+            }
+          fi
           echo "crate=$CRATE"     >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "is_python=$IS_PYTHON" >> "$GITHUB_OUTPUT"
@@ -55,6 +78,8 @@ jobs:
     needs: metadata
     if: needs.metadata.outputs.is_python == 'false'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required for gh release create
     steps:
       - uses: actions/checkout@v4
 
@@ -69,7 +94,7 @@ jobs:
           key: release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Publish ${{ needs.metadata.outputs.crate }}
-        run: cargo publish -p ${{ needs.metadata.outputs.crate }}
+        run: cargo publish --locked -p ${{ needs.metadata.outputs.crate }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -154,5 +179,5 @@ jobs:
           VERSION="${{ needs.metadata.outputs.version }}"
           NOTES=$(awk "/^## \[$VERSION\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
           gh release create "${{ github.ref_name }}" \
-            --title "annex-py $VERSION" \
+            --title "ANNexDB $VERSION" \
             --notes "${NOTES:-No changelog entry found for $VERSION}"

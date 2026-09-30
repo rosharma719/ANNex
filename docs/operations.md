@@ -1,6 +1,6 @@
 # Runtime Operations
 
-This contract covers `annex-core::Segment`. The multivector engine has a separate [durability contract](multivector-durability.md).
+This contract covers `annex::Segment`. The multivector engine has a separate [durability contract](multivector-durability.md).
 
 ## Snapshot notes
 

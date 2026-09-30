@@ -65,7 +65,7 @@ For canonical naming and build manifests, see [index-construction.md](./index-co
 ## H&M filtered retrieval
 
 ```sh
-cargo test --release -p annex-core --test hnm hnm_filtered_cosine_recall -- --ignored --nocapture
+cargo test --release -p annex --test hnm hnm_filtered_cosine_recall -- --ignored --nocapture
 ```
 
 See [dataset setup](data-download.md) and [harness configuration](test-config.md).
@@ -77,7 +77,7 @@ do not establish real-data recall or production performance.
 
 ```sh
 VECTORDB_BENCH_SIZE=20000 VECTORDB_BENCH_DIM=1536 \
-cargo test --release -p annex-core --test perf_unfiltered -- --ignored --nocapture
+cargo test --release -p annex --test perf_unfiltered -- --ignored --nocapture
 cargo bench -p annex-multivector --bench kernels
 ```
 

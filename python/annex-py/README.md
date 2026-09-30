@@ -1,11 +1,18 @@
 # Python snapshot search
 
-`annex_py.Index` loads an ANNex core `Segment` snapshot and provides native
+`annexdb.Index` loads an ANNex core `Segment` snapshot and provides native
 single-query and batch HNSW search. Python 3.9+ and NumPy are required.
 The [multivector HTTP API](../../crates/annex-multivector/README.md) owns hybrid
 queries and collections; this binding currently exposes snapshot search only.
 
-Build/install from the workspace root in an activated virtual environment:
+Install from PyPI:
+
+```sh
+python -m pip install ANNexDB
+```
+
+To build from source, run this from the workspace root in an activated virtual
+environment:
 
 ```sh
 python -m pip install 'maturin>=1.8,<2' numpy
@@ -13,10 +20,10 @@ maturin develop --release --manifest-path python/annex-py/Cargo.toml
 ```
 
 ```python
-import annex_py
+import annexdb
 import numpy as np
 
-index = annex_py.Index("segment.bin", quantize=False)
+index = annexdb.Index("segment.bin", quantize=False)
 query = np.zeros(index.dim(), dtype=np.float32)  # replace with your embedding
 ids, scores = index.search(query, k=10, ef=128)
 ids, scores = index.search_batch(query[None, :], k=10, ef=128, threads=4)

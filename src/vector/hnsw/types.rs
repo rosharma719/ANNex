@@ -44,6 +44,20 @@ pub struct SearchRuntimeOptions {
     /// Set to 0 to disable SQ8 traversal. Overrides `VECTORDB_SQ8_RERANK_FACTOR`.
     /// Has no effect if `quantize_all()` has not been called on the index.
     pub sq8_rerank_factor: Option<usize>,
+    /// Skip the f32 rerank and return the SQ8-ranked candidates directly, scoring them
+    /// from the integer dot product instead of the stored f32 vectors.
+    ///
+    /// This makes L0 search stop touching the f32 store, which is both faster (no rerank
+    /// pass, 4x fewer bytes streamed per candidate) and lossy: recall drops by roughly
+    /// 0.002-0.006 at recall@20 versus the reranked path on NYTimes-256.
+    ///
+    /// Cosine only. Other metrics keep the reranked path, because the integer dot product
+    /// has no cheap exact-metric equivalent there.
+    ///
+    /// Note this does NOT shrink resident memory on its own: upper-level descent still
+    /// scores with f32 (see `greedy_search_layer_unfiltered`), so the f32 store stays
+    /// live for the whole search. Overrides `VECTORDB_SQ8_SCORE_ONLY`. Default false.
+    pub sq8_score_only: Option<bool>,
     /// Screen each L0 neighbor with a fast integer dot product before prefetching its
     /// f32 vector. Neighbors whose SQ8 score is clearly below the current worst result
     /// are skipped, saving the f32 prefetch + distance computation. Effective at high ef

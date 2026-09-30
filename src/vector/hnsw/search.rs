@@ -23,7 +23,7 @@ use super::config::{
     neighbor_scan_patience, neighbor_scan_rotate_enabled, neighbor_scan_stride_enabled,
     next_search_trace_seq, num_entry_seeds_default, search_expansion_cap_override,
     search_expansion_multiplier, search_trace_logger, sq8_rerank_factor_default,
-    sq8_screen_enabled, ti_skip_enabled, trace_every,
+    sq8_score_only_default, sq8_screen_enabled, ti_skip_enabled, trace_every,
 };
 use super::scratch::SEARCH_SCRATCH;
 use super::stats::{SearchLayerStats, SearchStats, UNFILTERED_SEARCH_AGG, UnfilteredSample};
@@ -1565,12 +1565,27 @@ impl HNSWIndex {
             .sq8_rerank_factor
             .or_else(sq8_rerank_factor_default)
             .unwrap_or(0);
-        let use_sq8 =
-            rerank_factor > 0 && !self.quantized.is_empty() && self.metric != DistanceMetric::Dot;
+        // Score-only is Cosine-only: the integer dot maps onto cosine similarity by a fixed
+        // scale, but has no cheap exact equivalent for Euclidean.
+        let score_only = opts
+            .sq8_score_only
+            .unwrap_or_else(sq8_score_only_default)
+            && self.metric == DistanceMetric::Cosine;
+        // `score_only` implies the SQ8 traversal even when no rerank factor is configured,
+        // so the flag stands alone rather than silently no-oping.
+        let use_sq8 = (rerank_factor > 0 || score_only)
+            && !self.quantized.is_empty()
+            && self.metric != DistanceMetric::Dot;
 
         if use_sq8 {
             let query_q = self.quantize_query(query);
-            let extended_ef = ef.saturating_mul(rerank_factor).max(ef);
+            // Without a rerank pass there is no larger pool to choose from, so traversing
+            // past ef would only add work.
+            let extended_ef = if score_only {
+                ef
+            } else {
+                ef.saturating_mul(rerank_factor).max(ef)
+            };
             let (sq8_cands, _) = self.search_layer_unfiltered_sq8(
                 query,
                 &query_q,
@@ -1582,6 +1597,42 @@ impl HNSWIndex {
                 stats,
                 trace,
             )?;
+
+            if score_only {
+                // `search_layer_unfiltered_sq8` leaves `raw_score` as a 0.0 placeholder and
+                // `sort_key` as the negated integer dot, so rescale both into the metric's
+                // real score domain instead of returning the placeholder to callers.
+                //
+                // quantize_all/quantize_query both scale by 127.5, so
+                // sq8_approx_dot ~= 127.5^2 * dot(v, q).
+                const SQ8_DOT_SCALE: f32 = 127.5 * 127.5;
+                let mut scored: Vec<NodeCandidate> = sq8_cands
+                    .iter()
+                    .map(|c| {
+                        let dot = -c.sort_key / SQ8_DOT_SCALE;
+                        let sim = dot.clamp(-1.0, 1.0);
+                        let raw = 1.0 - sim;
+                        let sort_key = if normalize {
+                            self.normalize_score(raw)
+                        } else {
+                            raw
+                        };
+                        NodeCandidate {
+                            idx: c.idx,
+                            raw_score: raw,
+                            sort_key,
+                        }
+                    })
+                    .collect();
+                scored.sort_by(|a, b| {
+                    a.sort_key
+                        .partial_cmp(&b.sort_key)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                scored.truncate(ef);
+                return Ok(scored);
+            }
+
             // Rerank the approximate candidate pool with full f32 precision.
             let mut reranked: Vec<NodeCandidate> = sq8_cands
                 .iter()

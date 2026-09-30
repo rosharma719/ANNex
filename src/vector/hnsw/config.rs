@@ -46,6 +46,7 @@ static DIVERSITY_ALPHA_HIGH: OnceLock<Option<f32>> = OnceLock::new();
 static DIVERSITY_PRUNE_FLOOR: OnceLock<Option<usize>> = OnceLock::new();
 static TI_SKIP: OnceLock<bool> = OnceLock::new();
 static SQ8_RERANK_FACTOR: OnceLock<Option<usize>> = OnceLock::new();
+static SQ8_SCORE_ONLY: OnceLock<bool> = OnceLock::new();
 static LID_SORT: OnceLock<bool> = OnceLock::new();
 
 fn hnsw_telemetry() -> &'static HnswTelemetryConfig {
@@ -281,6 +282,12 @@ pub(crate) fn diversity_prune_floor() -> usize {
 
 pub fn sq8_rerank_factor_default() -> Option<usize> {
     *SQ8_RERANK_FACTOR.get_or_init(|| env_usize_nonzero("VECTORDB_SQ8_RERANK_FACTOR"))
+}
+
+/// Default for `SearchRuntimeOptions::sq8_score_only`. Off unless
+/// `VECTORDB_SQ8_SCORE_ONLY` opts in, so the lossless f32-reranked path stays the default.
+pub fn sq8_score_only_default() -> bool {
+    *SQ8_SCORE_ONLY.get_or_init(|| env_bool("VECTORDB_SQ8_SCORE_ONLY").unwrap_or(false))
 }
 
 pub fn lid_sort_enabled() -> bool {

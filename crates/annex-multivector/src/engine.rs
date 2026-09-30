@@ -1,6 +1,7 @@
 #[path = "retrieval.rs"]
 mod retrieval;
 use crate::{
+    analyzer::{Analyzer, TextAnalyzer},
     fde::{Vector, dot, maxsim_flat, normalize},
     muvera::FdeEncoder,
     storage::{
@@ -46,6 +47,10 @@ pub struct IndexConfig {
     pub fde_ksim: usize,
     #[serde(default = "default_fde_projected")]
     pub fde_projected: usize,
+    /// Text analysis policy for the lexical field. Persisted with the
+    /// collection; reopening with a different policy is a configuration error.
+    #[serde(default)]
+    pub analyzer: TextAnalyzer,
 }
 fn default_centroids() -> usize {
     64
@@ -75,6 +80,7 @@ impl IndexConfig {
             fde_repetitions: 20,
             fde_ksim: 4,
             fde_projected: 8,
+            analyzer: TextAnalyzer::plain(),
         }
     }
 }
@@ -223,8 +229,8 @@ pub enum IndexError {
     Invalid(String),
     #[error("index configuration is {actual:?}, requested {requested:?}")]
     Config {
-        actual: IndexConfig,
-        requested: IndexConfig,
+        actual: Box<IndexConfig>,
+        requested: Box<IndexConfig>,
     },
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -432,6 +438,7 @@ impl MultiVectorIndex {
             ));
         }
         validate_config_size(&config)?;
+        config.analyzer.validate().map_err(IndexError::Invalid)?;
         let root = path.as_ref().to_owned();
         let mut created_parents = Vec::new();
         let mut missing = root.as_path();
@@ -496,8 +503,8 @@ impl MultiVectorIndex {
             }
             if m.config != config {
                 return Err(IndexError::Config {
-                    actual: m.config,
-                    requested: config,
+                    actual: Box::new(m.config),
+                    requested: Box::new(config),
                 });
             }
             (
@@ -736,7 +743,10 @@ impl MultiVectorIndex {
         // contract even when no live document still uses a field. Legacy
         // manifests default to an empty map and infer it while replaying docs;
         // the next mutation persists the inferred schema.
-        let mut retrieval = RetrievalState::from_schema(representation_schema)?;
+        let mut retrieval = RetrievalState::from_schema(
+            representation_schema,
+            Analyzer::new(config.analyzer.clone()),
+        )?;
         let mut ordered: Vec<_> = documents.iter().collect();
         ordered.sort_by(|a, b| a.0.cmp(b.0));
         for (id, d) in ordered {

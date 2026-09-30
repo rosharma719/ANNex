@@ -1,5 +1,7 @@
 //! A persistent two-stage late-interaction retrieval engine.
 
+mod analyzer;
+pub use analyzer::{Stopwords, TextAnalyzer};
 mod collections;
 pub use collections::Collections;
 mod engine;

@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Durable hybrid retrieval with named dense/sparse/multivector fields, metadata
   predicates, BM25/RRF, optional MaxSim reranking and context selection.
 - Independent collection namespaces and named dense ANN graphs.
+- Persisted lexical analyzer policies, including an English preset with accent
+  folding, stop-word removal, Snowball stemming and query term frequencies.
+- Default RRF `k` reduced from 60 to 10 after one global five-corpus development
+  sweep; benchmark comparators receive the same setting.
 - Python/NumPy snapshot search with validated inputs, GIL release, and threaded
   batches; Linux/macOS CI installs and tests the built wheel.
 - Immutable query generations with retained mappings, sealed vector segments

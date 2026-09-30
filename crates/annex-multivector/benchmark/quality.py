@@ -23,7 +23,13 @@ from significance import paired_bootstrap
 
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
-DATASETS = ["beir/nfcorpus/test", "beir/scifact/test", "beir/arguana"]
+DATASETS = [
+    "beir/nfcorpus/test",
+    "beir/scifact/test",
+    "beir/arguana",
+    "beir/fiqa/test",
+    "beir/scidocs",
+]
 
 
 def embeddings(args, docs, queries):
@@ -88,8 +94,12 @@ def main():
     parser.add_argument("--engines", default="annex,qdrant,lancedb")
     parser.add_argument("--qdrant-binary", type=Path)
     parser.add_argument("--candidates", type=int, default=100)
+    parser.add_argument("--rrf-k", type=int, default=10)
     parser.add_argument(
         "--binary", type=Path, default=Path("target/release/annex-multivector")
+    )
+    parser.add_argument(
+        "--annex-analyzer", choices=["plain", "english"], default="plain"
     )
     add_protocol_arguments(parser)
     args = parser.parse_args()
@@ -103,6 +113,8 @@ def main():
         return
     if not 100 <= args.candidates <= 100_000:
         parser.error("candidates must be in 100..=100000")
+    if not 0 <= args.rrf_k <= 10_000:
+        parser.error("rrf-k must be in 0..=10000")
     engines = args.engines.split(",")
     if len(set(engines)) != len(engines) or not set(engines) <= {
         "annex",
@@ -126,12 +138,19 @@ def main():
         "model": MODEL,
         "revision": REVISION,
         "candidates": args.candidates,
-        "rrf_k": 60,
+        "rrf_k": args.rrf_k,
         "quality_metrics": "trec_eval linear-gain nDCG@10, Recall@10/20/100, MRR@10",
         "bm25": {
             "k1": 1.2,
             "b": 0.75,
             "tokenizer": "unicode-alphanumeric-lowercase-v1",
+            "annex_analyzer": {
+                "plain": "unicode-alphanumeric-lowercase-v1",
+                "english": "unicode-alphanumeric-english-fold-stop-stem-40-v1",
+            }[args.annex_analyzer],
+            "annex_query_term_frequency": True,
+            "qdrant_shared_analyzer": args.annex_analyzer,
+            "qdrant_shared_query_weights": "raw query term frequency",
         },
         "embedding_hashes": [f["files_sha256"] for f in fingerprints],
         "annex_binary_sha256": file_digest(args.binary),
@@ -142,15 +161,18 @@ def main():
         "strategies": STRATEGIES,
         "dense_search": "exact cosine for every engine; no quantization",
         "qdrant": (
-            "native server, sparse explicit BM25(k1=1.2,b=.75), RRF k=61 "
-            "zero-based, HTTP"
+            f"native server, shared {args.annex_analyzer} analyzer, sparse explicit "
+            f"BM25(k1=1.2,b=.75), RRF k={args.rrf_k + 1} zero-based, HTTP"
         ),
         "lancedb": (
             "embedded native FTS default English "
             "stemming/stopwords/ascii-folding/max-token-length40; native RRF "
-            "K=60 one-based"
+            f"K={args.rrf_k} one-based"
         ),
-        "annex": "fsync, native lexical BM25 and RRF, HTTP",
+        "annex": (
+            f"fsync, native lexical BM25 ({args.annex_analyzer} analyzer, raw "
+            "query term frequency) and RRF, HTTP"
+        ),
         "query_order": (
             "dataset order, engine then dense/BM25/hybrid; no randomized latency trials"
         ),

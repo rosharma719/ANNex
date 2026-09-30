@@ -38,6 +38,7 @@ For the multivector server, follow its [quickstart](crates/annex-multivector/REA
 
 - [Contribution and test workflow](CONTRIBUTING.md)
 - [Benchmark commands](docs/benchmarks.md) and [reporting policy](BENCHMARK_POLICY.md)
+- [Query planner specification and implementation handoff](docs/query-planner-spec.md)
 - [Dataset setup](docs/data-download.md), [test configuration](docs/test-config.md)
 - [Snapshot construction](docs/index-construction.md), [recall analysis](docs/recall_frontier_pipeline.md)
 - [Historical benchmark corrections](crates/annex-multivector/benchmark/RESULTS.md)

@@ -33,33 +33,20 @@ VECTORDB_M=16 VECTORDB_NYT_EF_CONSTRUCT=300 \
 - Misses concentrate on saturated level-0 nodes (degree at M0 cap). Entry/routing quality and neighbor diversity are the main levers, not a global EF bump.
 - Marginal recall per added ms drops fast: +0.089 recall/0.11 ms (EF 32→64) vs +0.029/0.977 ms (EF 256→512).
 
-## H&M (2048-D Cosine)
+## H&M (2048-D Cosine, Filtered)
 
-Download instructions live in [data-download.md](./data-download.md).
+Download: see [data-download.md](./data-download.md) — H&M is not yet in the registry (different source/format).
 
-Run the filtered recall harness:
+**Filtered recall harness** (ANNex only — hnswlib/faiss don't support metadata filters):
 
 ```bash
-cargo test --release hnm_filtered_cosine_recall -- --ignored --nocapture
+./bench/hnm/run_annexdb.sh           # build index + sweep ef values → results_annexdb.jsonl
+python3 bench/hnm/evaluate.py        # print recall + latency table
 ```
 
-Useful runtime knobs:
-
-- `VECTORDB_HNM_TOPK`
-- `VECTORDB_HNM_EF_SEARCH_LIST`
-- `VECTORDB_HNM_QUERIES`
-- `VECTORDB_HNM_BASE_LIMIT`
-- `VECTORDB_HNM_EF_CONSTRUCT`
-
-### Recorded filtered recall/latency curve
-
-Dataset: H&M 2048D cosine, `ef_construct=100`, `M=16`
-
-- `EF=32`: `1329.8 qps`, `0.752 ms/query`, `0.566 recall`
-- `EF=64`: `1293.8 qps`, `0.773 ms/query`, `0.709 recall`
-- `EF=128`: `787.4 qps`, `1.270 ms/query`, `0.859 recall`
-- `EF=256`: `501.5 qps`, `1.994 ms/query`, `0.907 recall`
-- `EF=512`: `338.8 qps`, `2.952 ms/query`, `0.939 recall`
+Current results: `bench/hnm/results_annexdb.jsonl`.
+Provenance: `bench/hnm/manifest.json`.
+Environment: `bench/hnm/environment.md` — dataset, methodology, index params.
 
 ## General performance notes
 

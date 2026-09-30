@@ -8,7 +8,7 @@
     "ef_values": "32,64,128,256,512"
   },
   "competitors": {
-    "timestamp": "2026-09-30T09:43:40",
+    "timestamp": "2026-09-30T10:08:05",
     "rounds": 3,
     "hnswlib": "0.8.0",
     "usearch": "2.26.2",

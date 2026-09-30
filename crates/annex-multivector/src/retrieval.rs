@@ -317,7 +317,7 @@ fn default_b() -> f32 {
 fn default_ef() -> usize {
     256
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Channel {
     Bm25 {
@@ -407,7 +407,13 @@ pub struct ContextOptions {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetrieveRequest {
+    #[serde(default)]
     pub prefetch: Vec<Channel>,
+    #[serde(default)]
+    pub planning_mode: PlanningMode,
+    /// Query representations for auto-planning (required when planning_mode != Manual).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<QueryRepresentations>,
     #[serde(default)]
     pub objective: RetrievalObjective,
     #[serde(default)]
@@ -656,6 +662,24 @@ impl MultiVectorIndex {
         let started = Instant::now();
         planner::validate_request(request)?;
         let s = self.snapshot();
+        // Phase 3: for auto modes, generate prefetch from policy planner first.
+        let (effective_request, policy_plan) =
+            if request.planning_mode != PlanningMode::Manual {
+                let stats = planner::planner_stats(&s, self.fde.output_dimension(), None);
+                let policy = policy::generate_policy_prefetch(
+                    request.query.as_ref().unwrap(),
+                    &stats,
+                    request.limit,
+                    request.objective.quality,
+                    s.retrieval.schema(),
+                );
+                let mut patched = request.clone();
+                patched.prefetch = policy.generated_prefetch.clone();
+                (std::borrow::Cow::Owned(patched), Some(policy))
+            } else {
+                (std::borrow::Cow::Borrowed(request), None)
+            };
+        let request = effective_request.as_ref();
         let eligible: HashSet<_> = s
             .documents
             .iter()
@@ -667,7 +691,8 @@ impl MultiVectorIndex {
             })
             .map(|(id, _)| id.as_str())
             .collect();
-        let plan = self.compile_plan(&s, request, eligible.len())?;
+        let mut plan = self.compile_plan(&s, request, eligible.len())?;
+        plan.policy = policy_plan;
         let mut per_stage_actual_ms: Vec<f64> = Vec::with_capacity(plan.stages.len());
 
         // ── Stage 0: Parallel channel execution ──────────────────────────────
@@ -1773,6 +1798,87 @@ mod tests {
             .upsert_records(vec![document("new", "E123", vec![1., 0.], "a", 2)])
             .unwrap();
         assert_eq!(reopened.stats().documents, 4);
+    }
+
+    // ── Phase 3: retrieval-policy optimizer ──────────────────────────────────
+
+    #[test]
+    fn auto_mode_generates_bm25_channel_from_text_representation() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path()); // has BM25 (token_documents > 0)
+
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [],
+            "planning_mode": "auto",
+            "query": {"text": "E123 repair"},
+            "limit": 3
+        }))
+        .unwrap();
+        let response = index.retrieve(&query).unwrap();
+        // Auto mode with text query → must have generated at least one BM25 channel.
+        let policy = response.trace.plan.policy.as_ref().expect("policy plan must be present in auto mode");
+        assert!(
+            policy.channels_selected.iter().any(|k| *k == LogicalChannelKind::Bm25),
+            "auto mode should select BM25 when text coverage is sufficient"
+        );
+        assert!(!response.matches.is_empty(), "auto mode must return results");
+    }
+
+    #[test]
+    fn auto_mode_generates_dense_channel_from_representation() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path()); // has "semantic" dense field
+
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [],
+            "planning_mode": "auto",
+            "query": {"dense": {"semantic": [1.0, 0.0]}},
+            "limit": 3
+        }))
+        .unwrap();
+        let plan = index.plan(&query).unwrap();
+        // Verify that the plan has channels (from generated prefetch).
+        assert!(
+            !plan.parallel_channels().is_empty(),
+            "auto mode with dense query must generate channels"
+        );
+    }
+
+    #[test]
+    fn manual_mode_with_empty_prefetch_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [],
+            "limit": 3
+        }))
+        .unwrap();
+        assert!(
+            index.plan(&query).is_err(),
+            "manual mode with empty prefetch must be invalid"
+        );
+    }
+
+    #[test]
+    fn auto_mode_trace_includes_policy_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [],
+            "planning_mode": "auto",
+            "query": {"text": "repair"},
+            "limit": 2
+        }))
+        .unwrap();
+        let response = index.retrieve(&query).unwrap();
+        let policy = response
+            .trace
+            .plan
+            .policy
+            .as_ref()
+            .expect("auto mode must embed PolicyPlan in plan");
+        assert!(!policy.channels_selected.is_empty());
+        assert!(!policy.selection_reasons.is_empty());
     }
 
     #[test]

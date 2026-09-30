@@ -1,5 +1,7 @@
 #[path = "planner.rs"]
 mod planner;
+#[path = "policy.rs"]
+mod policy;
 #[path = "retrieval.rs"]
 mod retrieval;
 use crate::{
@@ -21,6 +23,7 @@ pub use planner::{
     PhysicalOperator, PlanEstimate, PlanReason, PlanStage, PlannerStats, PlannedChannel,
     QualityPreference, RerankPlan, RepresentationKind, RetrievalObjective, RetrievalPlan,
 };
+pub use policy::{PlanningMode, PolicyPlan, QueryRepresentations};
 use rayon::prelude::*;
 pub use retrieval::{
     AdaptiveRerank, Channel, Chunk, ContextHit, ContextOptions, Fusion, Predicate, Representation,

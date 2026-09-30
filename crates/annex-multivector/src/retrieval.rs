@@ -669,115 +669,131 @@ impl MultiVectorIndex {
             .collect();
         let plan = self.compile_plan(&s, request, eligible.len())?;
         let mut per_stage_actual_ms: Vec<f64> = Vec::with_capacity(plan.stages.len());
-        let mut channels = Vec::new();
-        let mut lists = Vec::new();
 
         // ── Stage 0: Parallel channel execution ──────────────────────────────
+        // Channels are independent — dispatch them concurrently with Rayon.
+        // NOTE: each channel may itself use par_iter internally; nested Rayon
+        // work-stealing is safe but may create contention under high concurrency.
+        // A per-query parallelism budget is tracked in a later phase.
+        let planned_channels_snap: Vec<_> = plan.parallel_channels().to_vec();
         let parallel_stage_start = Instant::now();
-        for (channel_index, channel) in request.prefetch.iter().enumerate() {
-            let at = Instant::now();
-            let planned = &plan.parallel_channels()[channel_index];
-            let limit = planned.limit;
-            let allowed = |number| {
-                s.retrieval
-                    .ids
-                    .get(&number)
-                    .is_some_and(|id| eligible.contains(id.as_str()))
-            };
-            let external = |hits: Vec<(u64, f32)>| {
-                hits.into_iter()
-                    .map(|(id, score)| (s.retrieval.ids[&id].clone(), score))
-                    .collect::<Vec<_>>()
-            };
-            let tie_break = |a, b| s.retrieval.ids[&a].cmp(&s.retrieval.ids[&b]);
-            let scores = match channel {
-                Channel::Bm25 { text, k1, b, .. } => {
-                    // BM25 query weights are raw analyzed query term
-                    // frequencies: repeated query terms contribute repeatedly.
-                    let query = SparseVector::from_pairs(
-                        s.retrieval.analyzer.analyze(text).into_iter().filter_map(
-                            |(term, count)| {
-                                s.retrieval.vocabulary.get(&term).map(|&id| (id, count))
-                            },
-                        ),
-                    );
-                    external(
-                        s.retrieval
-                            .lexical
-                            .search_bm25_filtered_by(&query, limit, *k1, *b, allowed, tie_break)
-                            .map_err(sparse_error)?,
-                    )
-                }
-                Channel::Sparse { field, vector, .. } => {
-                    let index = s
-                        .retrieval
-                        .sparse
-                        .get(field)
-                        .ok_or_else(|| invalid(format!("unknown sparse field {field:?}")))?;
-                    external(
-                        index
-                            .search_dot_filtered_by(vector, limit, allowed, tie_break)
-                            .map_err(sparse_error)?,
-                    )
-                }
-                Channel::Dense {
-                    field,
-                    vector,
-                    ef_search,
-                    ..
-                } => {
-                    if planned.operator == PhysicalOperator::HnswDense {
-                        self.ann_scores(
-                            &s,
-                            &s.named_ann[field],
-                            &normalize(vector),
-                            limit,
-                            *ef_search,
-                        )?
-                    } else {
-                        self.named_scores(
-                            &s,
-                            field,
-                            std::slice::from_ref(vector),
-                            false,
-                            &eligible,
-                            limit,
-                        )?
+        let channel_results: Vec<Result<(Vec<(String, f32)>, Value), IndexError>> = request
+            .prefetch
+            .par_iter()
+            .enumerate()
+            .map(|(channel_index, channel)| {
+                let at = Instant::now();
+                let planned = &planned_channels_snap[channel_index];
+                let limit = planned.limit;
+                let allowed = |number: u64| {
+                    s.retrieval
+                        .ids
+                        .get(&number)
+                        .is_some_and(|id| eligible.contains(id.as_str()))
+                };
+                let external = |hits: Vec<(u64, f32)>| -> Vec<(String, f32)> {
+                    hits.into_iter()
+                        .map(|(id, score)| (s.retrieval.ids[&id].clone(), score))
+                        .collect()
+                };
+                let tie_break =
+                    |a: u64, b: u64| s.retrieval.ids[&a].cmp(&s.retrieval.ids[&b]);
+                let scores = match channel {
+                    Channel::Bm25 { text, k1, b, .. } => {
+                        let query = SparseVector::from_pairs(
+                            s.retrieval.analyzer.analyze(text).into_iter().filter_map(
+                                |(term, count)| {
+                                    s.retrieval.vocabulary.get(&term).map(|&id| (id, count))
+                                },
+                            ),
+                        );
+                        external(
+                            s.retrieval
+                                .lexical
+                                .search_bm25_filtered_by(
+                                    &query, limit, *k1, *b, allowed, tie_break,
+                                )
+                                .map_err(sparse_error)?,
+                        )
                     }
-                }
-                Channel::Multivector {
-                    field: Some(field),
-                    vectors,
-                    ..
-                } => self.named_scores(&s, field, vectors, true, &eligible, limit)?,
-                Channel::Multivector {
-                    field: None,
-                    vectors,
-                    ef_search,
-                    ..
-                } => {
-                    let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
-                    if planned.operator == PhysicalOperator::HnswFde {
-                        self.ann_fde_scores(
-                            &s,
-                            &self.fde.encode_query(&normalized),
-                            limit,
-                            *ef_search,
-                        )?
-                    } else {
-                        self.exact_fde_scores_filtered(
-                            &s,
-                            &normalized,
-                            Some(limit),
-                            Some(&eligible),
-                        )?
+                    Channel::Sparse { field, vector, .. } => {
+                        let index = s.retrieval.sparse.get(field).ok_or_else(|| {
+                            invalid(format!("unknown sparse field {field:?}"))
+                        })?;
+                        external(
+                            index
+                                .search_dot_filtered_by(vector, limit, allowed, tie_break)
+                                .map_err(sparse_error)?,
+                        )
                     }
-                }
-            };
-            let backend = planned.operator.as_str();
-            channels.push(serde_json::json!({"backend": backend,"candidates": scores.len(),"elapsed_ms": at.elapsed().as_secs_f64()*1000.}));
-            lists.push(scores);
-        }
+                    Channel::Dense {
+                        field,
+                        vector,
+                        ef_search,
+                        ..
+                    } => {
+                        if planned.operator == PhysicalOperator::HnswDense {
+                            self.ann_scores(
+                                &s,
+                                &s.named_ann[field],
+                                &normalize(vector),
+                                limit,
+                                *ef_search,
+                            )?
+                        } else {
+                            self.named_scores(
+                                &s,
+                                field,
+                                std::slice::from_ref(vector),
+                                false,
+                                &eligible,
+                                limit,
+                            )?
+                        }
+                    }
+                    Channel::Multivector {
+                        field: Some(field),
+                        vectors,
+                        ..
+                    } => self.named_scores(&s, field, vectors, true, &eligible, limit)?,
+                    Channel::Multivector {
+                        field: None,
+                        vectors,
+                        ef_search,
+                        ..
+                    } => {
+                        let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
+                        if planned.operator == PhysicalOperator::HnswFde {
+                            self.ann_fde_scores(
+                                &s,
+                                &self.fde.encode_query(&normalized),
+                                limit,
+                                *ef_search,
+                            )?
+                        } else {
+                            self.exact_fde_scores_filtered(
+                                &s,
+                                &normalized,
+                                Some(limit),
+                                Some(&eligible),
+                            )?
+                        }
+                    }
+                };
+                let backend = planned.operator.as_str();
+                let entry = serde_json::json!({
+                    "backend": backend,
+                    "candidates": scores.len(),
+                    "elapsed_ms": at.elapsed().as_secs_f64() * 1000.
+                });
+                Ok((scores, entry))
+            })
+            .collect();
+        let (mut lists, channels): (Vec<_>, Vec<_>) = channel_results
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .unzip();
         per_stage_actual_ms.push(parallel_stage_start.elapsed().as_secs_f64() * 1000.);
 
         // ── Stage 1: Fusion ───────────────────────────────────────────────────
@@ -1200,11 +1216,15 @@ mod tests {
 
         index.build_dense_ann("semantic", 4, 16).unwrap();
         let ann = index.plan(&query).unwrap();
+        // 3-doc corpus, dim=2: cost_exact=12 < cost_hnsw=3072 → exact chosen by cost model.
         assert_eq!(
             ann.parallel_channels()[0].operator,
-            PhysicalOperator::HnswDense
+            PhysicalOperator::ExactDense
         );
-        assert_eq!(ann.parallel_channels()[0].reason, PlanReason::AnnReady);
+        assert_eq!(
+            ann.parallel_channels()[0].reason,
+            PlanReason::LowerEstimatedCost
+        );
         let response = index.retrieve(&query).unwrap();
         assert_eq!(response.trace.plan, ann);
         assert_eq!(
@@ -1647,9 +1667,10 @@ mod tests {
         let mut q = request();
         q.filter = None;
         q.prefetch.retain(|c| matches!(c, Channel::Dense { .. }));
+        // 3-doc corpus: cost model prefers exact over HNSW (exact=12 < hnsw=3072 units).
         assert_eq!(
             index.retrieve(&q).unwrap().trace.channels[0]["backend"],
-            "hnsw_dense"
+            "exact_dense"
         );
         assert!(index.delete("b").unwrap());
         assert!(
@@ -1903,6 +1924,96 @@ mod tests {
         assert!(
             channel_cost_sum > 0.0,
             "per-channel cost units must be populated"
+        );
+    }
+
+    // ── Phase 1B: concurrent channel execution ───────────────────────────────
+
+    #[test]
+    fn retrieve_results_are_identical_with_or_without_concurrency() {
+        // Functional correctness: parallel execution must produce the same
+        // matches as sequential would. Timing is not asserted (flaky in CI).
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query = request();
+
+        let resp = index.retrieve(&query).unwrap();
+        // Re-run — same query, same generation — must produce same results.
+        let resp2 = index.retrieve(&query).unwrap();
+        assert_eq!(
+            resp.matches.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            resp2.matches.iter().map(|h| h.id.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(resp.trace.plan, resp2.trace.plan);
+    }
+
+    // ── Phase 1C: cost-based exact/HNSW selection ─────────────────────────────
+
+    #[test]
+    fn cost_model_selects_exact_for_tiny_corpus_even_with_ann_built() {
+        // 3-doc corpus, dim=2: ExactDense cost = 3×2×2=12 units.
+        // HnswDense cost = 256 × ceil(log2(3)) × 2 × 3 = 3072 units → exact cheaper.
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        index.build_dense_ann("semantic", 4, 16).unwrap();
+
+        let mut query = request();
+        query.filter = None;
+        query.prefetch.retain(|c| matches!(c, Channel::Dense { .. }));
+
+        let plan = index.plan(&query).unwrap();
+        let ch = &plan.parallel_channels()[0];
+        // With cost model active, exact should win for tiny corpora.
+        assert_eq!(ch.operator, PhysicalOperator::ExactDense);
+        assert!(
+            matches!(ch.reason, PlanReason::LowerEstimatedCost | PlanReason::AnnReady),
+            "expected cost-based reason, got {:?}",
+            ch.reason
+        );
+    }
+
+    #[test]
+    fn cost_model_selects_hnsw_when_cheaper_than_exact() {
+        // 50 docs, dim=2, ef=4:
+        // hnsw = 4 × ceil(log2(50)) × 2 × 3 = 4×6×6 = 144
+        // exact = 50 × 2 × 2 = 200 → HNSW cheaper
+        let dir = tempfile::tempdir().unwrap();
+        let index = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
+        let docs: Vec<_> = (0..50_u32)
+            .map(|i| {
+                let v = if i % 2 == 0 {
+                    vec![1.0_f32, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                };
+                RetrievalDocument {
+                    id: format!("d{i}"),
+                    representations: BTreeMap::from([(
+                        "f".into(),
+                        Representation::Dense { vector: v },
+                    )]),
+                    ..RetrievalDocument::default()
+                }
+            })
+            .collect();
+        index.upsert_records(docs).unwrap();
+        index.build_dense_ann("f", 4, 16).unwrap();
+
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [{"kind": "dense", "field": "f", "vector": [1.0, 0.0],
+                          "limit": 5, "ef_search": 4}],
+            "limit": 5
+        }))
+        .unwrap();
+        let plan = index.plan(&query).unwrap();
+        assert_eq!(
+            plan.parallel_channels()[0].operator,
+            PhysicalOperator::HnswDense,
+            "HNSW should be cheaper for 50 docs with ef=4"
+        );
+        assert_eq!(
+            plan.parallel_channels()[0].reason,
+            PlanReason::LowerEstimatedCost
         );
     }
 

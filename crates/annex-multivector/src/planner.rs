@@ -404,7 +404,7 @@ impl MultiVectorIndex {
         // ── Physical channel planning ─────────────────────────────────────────
         let mut planned_channels = Vec::with_capacity(request.prefetch.len());
         for (index, channel) in request.prefetch.iter().enumerate() {
-            let (operator, reason, limit, ef_search) = match channel {
+            let (operator, reason, limit, ef_search, cost) = match channel {
                 Channel::Bm25 { text, limit, k1, b } => {
                     if text.len() > 65_536
                         || !k1.is_finite()
@@ -414,7 +414,8 @@ impl MultiVectorIndex {
                     {
                         return Err(invalid("invalid BM25 query or parameters"));
                     }
-                    (PhysicalOperator::Bm25, PlanReason::LexicalIndex, *limit, None)
+                    let cost = stats.token_documents as f64 * 10.0;
+                    (PhysicalOperator::Bm25, PlanReason::LexicalIndex, *limit, None, cost)
                 }
                 Channel::Sparse {
                     field,
@@ -427,7 +428,8 @@ impl MultiVectorIndex {
                     vector
                         .canonicalized()
                         .map_err(|error| invalid(error.to_string()))?;
-                    (PhysicalOperator::SparseDot, PlanReason::SparseIndex, *limit, None)
+                    let cost = stats.token_documents as f64 * 5.0;
+                    (PhysicalOperator::SparseDot, PlanReason::SparseIndex, *limit, None, cost)
                 }
                 Channel::Dense {
                     field,
@@ -448,14 +450,27 @@ impl MultiVectorIndex {
                     if backend == "hnsw" && !ann_ready {
                         return Err(invalid("dense ANN not built"));
                     }
-                    let (operator, reason) = choose_ann(
+                    let dim = state.retrieval.dense_dimension(field).unwrap_or(1) as f64;
+                    let ef = *ef_search as f64;
+                    let n = stats.documents.max(1) as f64;
+                    let f = eligible_documents.max(1) as f64;
+                    let cost_exact = f * dim * 2.0;
+                    let cost_hnsw = ef * n.log2().ceil().max(1.0) * dim * 3.0;
+                    let (operator, reason) = choose_ann_with_cost(
                         backend,
                         request.filter.is_some(),
                         ann_ready,
                         PhysicalOperator::ExactDense,
                         PhysicalOperator::HnswDense,
+                        cost_exact,
+                        cost_hnsw,
                     );
-                    (operator, reason, *limit, Some(*ef_search))
+                    let cost = if operator == PhysicalOperator::HnswDense {
+                        cost_hnsw
+                    } else {
+                        cost_exact
+                    };
+                    (operator, reason, *limit, Some(*ef_search), cost)
                 }
                 Channel::Multivector {
                     field: Some(field),
@@ -476,16 +491,20 @@ impl MultiVectorIndex {
                     if backend != "auto" && backend != "exact" {
                         return Err(invalid("named multivectors support exact or auto"));
                     }
-                    (
+                    let reason = if backend == "exact" {
+                        PlanReason::RequestedExact
+                    } else {
+                        PlanReason::OperatorRequiresExact
+                    };
+                    let cost = estimate_channel_cost(
                         PhysicalOperator::ExactMaxsim,
-                        if backend == "exact" {
-                            PlanReason::RequestedExact
-                        } else {
-                            PlanReason::OperatorRequiresExact
-                        },
-                        *limit,
+                        eligible_documents,
+                        stats.documents,
                         None,
-                    )
+                        &stats,
+                        channel,
+                    );
+                    (PhysicalOperator::ExactMaxsim, reason, *limit, None, cost)
                 }
                 Channel::Multivector {
                     field: None,
@@ -506,27 +525,32 @@ impl MultiVectorIndex {
                     if backend == "hnsw" && !ann_ready {
                         return Err(invalid("FDE ANN not built"));
                     }
-                    let (operator, reason) = choose_ann(
+                    let fde_dim = stats.fde_dimension.max(1) as f64;
+                    let ef = *ef_search as f64;
+                    let n = stats.documents.max(1) as f64;
+                    let f = eligible_documents.max(1) as f64;
+                    let cost_exact = f * fde_dim * 2.0;
+                    let cost_hnsw = ef * n.log2().ceil().max(1.0) * fde_dim * 3.0;
+                    let (operator, reason) = choose_ann_with_cost(
                         backend,
                         request.filter.is_some(),
                         ann_ready,
                         PhysicalOperator::ExactFde,
                         PhysicalOperator::HnswFde,
+                        cost_exact,
+                        cost_hnsw,
                     );
-                    (operator, reason, *limit, Some(*ef_search))
+                    let cost = if operator == PhysicalOperator::HnswFde {
+                        cost_hnsw
+                    } else {
+                        cost_exact
+                    };
+                    (operator, reason, *limit, Some(*ef_search), cost)
                 }
             };
             if limit == 0 || limit > 100_000 {
                 return Err(invalid("channel limit must be in 1..=100000"));
             }
-            let cost = estimate_channel_cost(
-                operator,
-                eligible_documents,
-                stats.documents,
-                ef_search,
-                &stats,
-                channel,
-            );
             planned_channels.push(PlannedChannel {
                 index,
                 operator,
@@ -727,23 +751,34 @@ pub(super) fn planner_stats(state: &State, fde_dimension: usize) -> PlannerStats
     }
 }
 
-// ── Operator selection heuristic (Phase 1A; cost-based selection in Phase 1C) ─
+// ── Cost-based operator selection (Phase 1C) ─────────────────────────────────
 
-fn choose_ann(
+/// Choose between exact and ANN operator using the cost model.
+/// `cost_exact` and `cost_hnsw` are in cost units (use `estimate_channel_cost`
+/// or the inline formulas in `compile_plan`).
+fn choose_ann_with_cost(
     backend: &str,
     filtered: bool,
     ann_ready: bool,
     exact: PhysicalOperator,
     ann: PhysicalOperator,
+    cost_exact: f64,
+    cost_hnsw: f64,
 ) -> (PhysicalOperator, PlanReason) {
     if backend == "exact" {
-        (exact, PlanReason::RequestedExact)
-    } else if filtered {
-        (exact, PlanReason::FilterRequiresExact)
-    } else if ann_ready {
-        (ann, PlanReason::AnnReady)
+        return (exact, PlanReason::RequestedExact);
+    }
+    if filtered {
+        return (exact, PlanReason::FilterRequiresExact);
+    }
+    if !ann_ready {
+        return (exact, PlanReason::AnnUnavailable);
+    }
+    // ANN is available — choose by cost model.
+    if cost_exact <= cost_hnsw {
+        (exact, PlanReason::LowerEstimatedCost)
     } else {
-        (exact, PlanReason::AnnUnavailable)
+        (ann, PlanReason::LowerEstimatedCost)
     }
 }
 

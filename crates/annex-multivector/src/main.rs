@@ -642,13 +642,14 @@ mod tests {
         let actual = plan(State(index), Json(body))
             .await
             .unwrap_or_else(|error| panic!("planning failed: {}", error.0));
+        // 2-doc corpus: cost model prefers exact over HNSW.
         assert_eq!(
             actual.0.parallel_channels()[0].operator,
-            multivector::PhysicalOperator::HnswFde
+            multivector::PhysicalOperator::ExactFde
         );
         assert_eq!(
             actual.0.parallel_channels()[0].reason,
-            multivector::PlanReason::AnnReady
+            multivector::PlanReason::LowerEstimatedCost
         );
     }
 

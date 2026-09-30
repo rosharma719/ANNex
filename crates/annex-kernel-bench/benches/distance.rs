@@ -14,7 +14,15 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use simsimd::SpatialSimilarity;
 
 const DIMS: &[usize] = &[96, 100, 128, 256, 384, 768, 960, 1536];
-const SET: usize = 256;
+/// Vectors scored per iteration. The default (256) keeps the set in L2 up to
+/// 1536 dims, where large dimensions are L2-bandwidth bound and every decent
+/// kernel ties. `ANNEX_BENCH_SET=4` keeps it in L1 to expose compute.
+fn set_size() -> usize {
+    std::env::var("ANNEX_BENCH_SET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256)
+}
 
 fn filter(name: &str) -> bool {
     // ANNEX_BENCH_ISAS=avx2,avx512 limits the per-ISA series.
@@ -45,8 +53,8 @@ fn f32_group(
     for &dim in DIMS {
         let mut rng = Rng::new(dim as u64);
         let query = rng.vector(dim);
-        let set: Vec<Vec<f32>> = (0..SET).map(|_| rng.vector(dim)).collect();
-        group.throughput(Throughput::Elements(SET as u64));
+        let set: Vec<Vec<f32>> = (0..set_size()).map(|_| rng.vector(dim)).collect();
+        group.throughput(Throughput::Elements(set_size() as u64));
         let mut run = |id: &str, f: &dyn Fn(&[f32], &[f32]) -> f32| {
             group.bench_function(BenchmarkId::new(id, dim), |b| {
                 b.iter(|| {
@@ -116,12 +124,65 @@ fn bench_l2(c: &mut Criterion) {
     );
 }
 
+/// Scoring a 16-neighbour HNSW batch: one `*_many` call vs 16 single calls.
+fn bench_batched(c: &mut Criterion) {
+    const BATCH: usize = 16;
+    let metrics: [(
+        &str,
+        fn(&[f32], &[f32]) -> f32,
+        fn(&[f32], &[&[f32]], &mut [f32]),
+    ); 2] = [
+        ("dot_batch16", kernels::dot, kernels::dot_many),
+        (
+            "l2sq_batch16",
+            kernels::l2_squared,
+            kernels::l2_squared_many,
+        ),
+    ];
+    for (name, single, many) in metrics {
+        let mut group = c.benchmark_group(name);
+        for &dim in DIMS {
+            let mut rng = Rng::new(dim as u64 ^ 0xb7);
+            let query = rng.vector(dim);
+            // Enough batches to overflow L1/L2 like a real neighbour walk.
+            let sets: Vec<Vec<Vec<f32>>> = (0..(set_size() / BATCH).max(1))
+                .map(|_| (0..BATCH).map(|_| rng.vector(dim)).collect())
+                .collect();
+            group.throughput(Throughput::Elements((sets.len() * BATCH) as u64));
+            group.bench_function(BenchmarkId::new("single-calls", dim), |b| {
+                b.iter(|| {
+                    let mut acc = 0.0f32;
+                    for set in &sets {
+                        for v in set {
+                            acc += single(black_box(&query), black_box(v));
+                        }
+                    }
+                    acc
+                })
+            });
+            group.bench_function(BenchmarkId::new("many", dim), |b| {
+                let mut out = [0.0f32; BATCH];
+                b.iter(|| {
+                    let mut acc = 0.0f32;
+                    for set in &sets {
+                        let refs: [&[f32]; BATCH] = std::array::from_fn(|i| set[i].as_slice());
+                        many(black_box(&query), black_box(&refs), &mut out);
+                        acc += out[0] + out[BATCH - 1];
+                    }
+                    acc
+                })
+            });
+        }
+        group.finish();
+    }
+}
+
 fn bench_sq8(c: &mut Criterion) {
     let mut group = c.benchmark_group("sq8_i8xu8");
     for &dim in DIMS {
         let mut rng = Rng::new(dim as u64 ^ 0x5a);
         let query = sq8_query(&rng.unit_vector(dim));
-        let set: Vec<Vec<u8>> = (0..SET)
+        let set: Vec<Vec<u8>> = (0..set_size())
             .map(|_| sq8_encode(&rng.unit_vector(dim)))
             .collect();
         // SimSIMD has no u8-with-offset kernel; its i8 x i8 dot does the same
@@ -130,7 +191,7 @@ fn bench_sq8(c: &mut Criterion) {
             .iter()
             .map(|v| v.iter().map(|&b| (b ^ 0x80) as i8).collect())
             .collect();
-        group.throughput(Throughput::Elements(SET as u64));
+        group.throughput(Throughput::Elements(set_size() as u64));
         let mut run = |id: &str, f: &dyn Fn(&[i8], &[u8]) -> i32| {
             group.bench_function(BenchmarkId::new(id, dim), |b| {
                 b.iter(|| {
@@ -174,6 +235,6 @@ fn config() -> Criterion {
 criterion_group! {
     name = distance;
     config = config();
-    targets = bench_dot, bench_l2, bench_sq8
+    targets = bench_dot, bench_l2, bench_batched, bench_sq8
 }
 criterion_main!(distance);

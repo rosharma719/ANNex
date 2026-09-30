@@ -348,6 +348,21 @@ impl HNSWIndex {
         }
     }
 
+    /// Batched [`Self::fast_score`]: `out[i] = fast_score(query, vecs[i])`.
+    #[inline]
+    pub(crate) fn fast_score_many(&self, query: &[f32], vecs: &[&[f32]], out: &mut [f32]) {
+        match self.metric {
+            DistanceMetric::Cosine => {
+                kernels::dot_many(query, vecs, out);
+                for o in &mut out[..vecs.len()] {
+                    *o = 1.0 - (*o).clamp(-1.0, 1.0);
+                }
+            }
+            DistanceMetric::Dot => kernels::dot_many(query, vecs, out),
+            DistanceMetric::Euclidean => kernels::l2_squared_many(query, vecs, out),
+        }
+    }
+
     pub fn mark_deleted(&self, point_id: PointId) {
         let Some(idx) = self.idx_of(point_id) else {
             return;

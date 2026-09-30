@@ -85,6 +85,7 @@ impl fmt::Display for Isa {
 
 type F32Fn = unsafe fn(&[f32], &[f32]) -> f32;
 type Sq8Fn = unsafe fn(&[i8], &[u8]) -> i32;
+type ManyFn = unsafe fn(&[f32], &[&[f32]], &mut [f32]);
 
 /// A table of kernels for one ISA. Obtain one with [`Kernels::detect`] or
 /// [`Kernels::for_isa`]; construction checks CPU support, so calls are safe.
@@ -94,6 +95,8 @@ pub struct Kernels {
     dot: F32Fn,
     l2_squared: F32Fn,
     dot_i8_u8_centered: Sq8Fn,
+    dot_many: ManyFn,
+    l2_squared_many: ManyFn,
 }
 
 impl fmt::Debug for Kernels {
@@ -121,6 +124,8 @@ impl Kernels {
             dot: dot_scalar_unsafe,
             l2_squared: l2_squared_scalar_unsafe,
             dot_i8_u8_centered: dot_i8_u8_centered_scalar_unsafe,
+            dot_many: dot_many_scalar,
+            l2_squared_many: l2_squared_many_scalar,
         };
         Some(match isa {
             Isa::Scalar => scalar,
@@ -130,6 +135,8 @@ impl Kernels {
                 dot: x86::dot_avx2,
                 l2_squared: x86::l2_avx2,
                 dot_i8_u8_centered: x86::sq8_avx2,
+                dot_many: x86::dot_many_avx2,
+                l2_squared_many: x86::l2_many_avx2,
             },
             #[cfg(target_arch = "x86_64")]
             Isa::Avx512 => Kernels {
@@ -137,6 +144,8 @@ impl Kernels {
                 dot: x86::dot_avx512,
                 l2_squared: x86::l2_avx512,
                 dot_i8_u8_centered: x86::sq8_avx512bw,
+                dot_many: x86::dot_many_avx512,
+                l2_squared_many: x86::l2_many_avx512,
             },
             #[cfg(target_arch = "x86_64")]
             Isa::Avx512Vnni => Kernels {
@@ -144,6 +153,8 @@ impl Kernels {
                 dot: x86::dot_avx512,
                 l2_squared: x86::l2_avx512,
                 dot_i8_u8_centered: x86::sq8_avx512vnni,
+                dot_many: x86::dot_many_avx512,
+                l2_squared_many: x86::l2_many_avx512,
             },
             #[cfg(target_arch = "aarch64")]
             Isa::Neon => Kernels {
@@ -151,6 +162,8 @@ impl Kernels {
                 dot: neon::dot,
                 l2_squared: neon::l2,
                 dot_i8_u8_centered: neon::sq8,
+                dot_many: neon::dot_many,
+                l2_squared_many: neon::l2_many,
             },
             #[allow(unreachable_patterns)]
             _ => return None,
@@ -182,6 +195,22 @@ impl Kernels {
     pub fn dot_i8_u8_centered(&self, query: &[i8], stored: &[u8]) -> i32 {
         // SAFETY: as above.
         unsafe { (self.dot_i8_u8_centered)(query, stored) }
+    }
+
+    /// `out[i] = dot(query, vectors[i])`. Panics if `out` is shorter than `vectors`.
+    #[inline]
+    pub fn dot_many(&self, query: &[f32], vectors: &[&[f32]], out: &mut [f32]) {
+        assert!(out.len() >= vectors.len());
+        // SAFETY: as above.
+        unsafe { (self.dot_many)(query, vectors, out) }
+    }
+
+    /// `out[i] = l2_squared(query, vectors[i])`. Panics if `out` is shorter than `vectors`.
+    #[inline]
+    pub fn l2_squared_many(&self, query: &[f32], vectors: &[&[f32]], out: &mut [f32]) {
+        assert!(out.len() >= vectors.len());
+        // SAFETY: as above.
+        unsafe { (self.l2_squared_many)(query, vectors, out) }
     }
 }
 
@@ -270,6 +299,27 @@ pub fn dot_i8_u8_centered(query: &[i8], stored: &[u8]) -> i32 {
     }
 }
 
+/// Scores `query` against every vector in `vectors`, writing `out[i] =
+/// dot(query, vectors[i])`. Processes four vectors per pass so each query
+/// load feeds four FMAs; results match [`dot`] to rounding. Panics if `out`
+/// is shorter than `vectors`.
+#[inline]
+pub fn dot_many(query: &[f32], vectors: &[&[f32]], out: &mut [f32]) {
+    detected().dot_many(query, vectors, out)
+}
+
+/// Batched [`l2_squared`]; see [`dot_many`].
+#[inline]
+pub fn l2_squared_many(query: &[f32], vectors: &[&[f32]], out: &mut [f32]) {
+    detected().l2_squared_many(query, vectors, out)
+}
+
+#[inline]
+fn detected() -> &'static Kernels {
+    static DETECTED: std::sync::OnceLock<Kernels> = std::sync::OnceLock::new();
+    DETECTED.get_or_init(Kernels::detect)
+}
+
 // ---------------------------------------------------------------------------
 // Scalar references
 // ---------------------------------------------------------------------------
@@ -306,6 +356,18 @@ pub fn dot_i8_u8_centered_scalar(query: &[i8], stored: &[u8]) -> i32 {
         i += 1;
     }
     acc
+}
+
+unsafe fn dot_many_scalar(query: &[f32], vectors: &[&[f32]], out: &mut [f32]) {
+    for (o, v) in out.iter_mut().zip(vectors) {
+        *o = dot_scalar(query, v);
+    }
+}
+
+unsafe fn l2_squared_many_scalar(query: &[f32], vectors: &[&[f32]], out: &mut [f32]) {
+    for (o, v) in out.iter_mut().zip(vectors) {
+        *o = l2_squared_scalar(query, v);
+    }
 }
 
 unsafe fn dot_scalar_unsafe(a: &[f32], b: &[f32]) -> f32 {
@@ -559,6 +621,138 @@ mod x86 {
         }
         _mm512_reduce_add_epi32(_mm512_add_epi32(acc0, acc1))
     }
+
+    // ----- Batched: four vectors per query load -----------------------------
+
+    macro_rules! many_kernel {
+        (
+            $many:ident, $one:ident, $feature:literal, $reg:ty, $lanes:literal,
+            zero: $zero:expr, load: $load:path, fma: $fma:path, sub: $sub:path,
+            mask: $mask:expr, maskload: $maskload:expr, reduce: $reduce:path, l2: $l2:literal
+        ) => {
+            #[target_feature(enable = $feature)]
+            pub(super) unsafe fn $many(query: &[f32], vectors: &[&[f32]], out: &mut [f32]) {
+                const L: usize = $lanes;
+                let n = query.len();
+                let q = query.as_ptr();
+                let mut g = 0;
+                while g < vectors.len() {
+                    let group = &vectors[g..(g + 4).min(vectors.len())];
+                    if group.len() < 4 || group.iter().any(|v| v.len() < n) {
+                        // Partial group or short vectors: single-vector kernel
+                        // (which clamps to the shorter length).
+                        for (o, v) in out[g..].iter_mut().zip(group) {
+                            *o = $one(query, v);
+                        }
+                        g += group.len();
+                        continue;
+                    }
+                    let p = [
+                        group[0].as_ptr(),
+                        group[1].as_ptr(),
+                        group[2].as_ptr(),
+                        group[3].as_ptr(),
+                    ];
+                    let mut a = [$zero; 4];
+                    let mut b = [$zero; 4];
+                    let mut i = 0;
+                    while i + 2 * L <= n {
+                        let q0 = $load(q.add(i));
+                        let q1 = $load(q.add(i + L));
+                        for j in 0..4 {
+                            let v0 = $load(p[j].add(i));
+                            let v1 = $load(p[j].add(i + L));
+                            if $l2 {
+                                let d0 = $sub(q0, v0);
+                                let d1 = $sub(q1, v1);
+                                a[j] = $fma(d0, d0, a[j]);
+                                b[j] = $fma(d1, d1, b[j]);
+                            } else {
+                                a[j] = $fma(q0, v0, a[j]);
+                                b[j] = $fma(q1, v1, b[j]);
+                            }
+                        }
+                        i += 2 * L;
+                    }
+                    if i + L <= n {
+                        let q0 = $load(q.add(i));
+                        for j in 0..4 {
+                            let v0 = $load(p[j].add(i));
+                            if $l2 {
+                                let d0 = $sub(q0, v0);
+                                a[j] = $fma(d0, d0, a[j]);
+                            } else {
+                                a[j] = $fma(q0, v0, a[j]);
+                            }
+                        }
+                        i += L;
+                    }
+                    if i < n {
+                        let m = $mask(n - i);
+                        let q0 = $maskload(m, q.add(i));
+                        for j in 0..4 {
+                            let v0 = $maskload(m, p[j].add(i));
+                            if $l2 {
+                                let d0 = $sub(q0, v0);
+                                b[j] = $fma(d0, d0, b[j]);
+                            } else {
+                                b[j] = $fma(q0, v0, b[j]);
+                            }
+                        }
+                    }
+                    for j in 0..4 {
+                        out[g + j] = $reduce(a[j], b[j]);
+                    }
+                    g += 4;
+                }
+            }
+        };
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn reduce512(a: __m512, b: __m512) -> f32 {
+        _mm512_reduce_add_ps(_mm512_add_ps(a, b))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn reduce256(a: __m256, b: __m256) -> f32 {
+        hsum256(_mm256_add_ps(a, b))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn maskload512(m: __mmask16, p: *const f32) -> __m512 {
+        _mm512_maskz_loadu_ps(m, p)
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn maskload256(m: __m256i, p: *const f32) -> __m256 {
+        _mm256_maskload_ps(p, m)
+    }
+
+    many_kernel!(
+        dot_many_avx512, dot_avx512, "avx512f", __m512, 16,
+        zero: _mm512_setzero_ps(), load: _mm512_loadu_ps, fma: _mm512_fmadd_ps,
+        sub: _mm512_sub_ps, mask: tail_mask16, maskload: maskload512, reduce: reduce512, l2: false
+    );
+    many_kernel!(
+        l2_many_avx512, l2_avx512, "avx512f", __m512, 16,
+        zero: _mm512_setzero_ps(), load: _mm512_loadu_ps, fma: _mm512_fmadd_ps,
+        sub: _mm512_sub_ps, mask: tail_mask16, maskload: maskload512, reduce: reduce512, l2: true
+    );
+    many_kernel!(
+        dot_many_avx2, dot_avx2, "avx2,fma", __m256, 8,
+        zero: _mm256_setzero_ps(), load: _mm256_loadu_ps, fma: _mm256_fmadd_ps,
+        sub: _mm256_sub_ps, mask: tail_mask8, maskload: maskload256, reduce: reduce256, l2: false
+    );
+    many_kernel!(
+        l2_many_avx2, l2_avx2, "avx2,fma", __m256, 8,
+        zero: _mm256_setzero_ps(), load: _mm256_loadu_ps, fma: _mm256_fmadd_ps,
+        sub: _mm256_sub_ps, mask: tail_mask8, maskload: maskload256, reduce: reduce256, l2: true
+    );
 
     // ----- AVX2 + FMA ------------------------------------------------------
 
@@ -819,6 +1013,18 @@ mod neon {
         acc
     }
 
+    pub(super) unsafe fn dot_many(query: &[f32], vectors: &[&[f32]], out: &mut [f32]) {
+        for (o, v) in out.iter_mut().zip(vectors) {
+            *o = dot(query, v);
+        }
+    }
+
+    pub(super) unsafe fn l2_many(query: &[f32], vectors: &[&[f32]], out: &mut [f32]) {
+        for (o, v) in out.iter_mut().zip(vectors) {
+            *o = l2(query, v);
+        }
+    }
+
     #[inline]
     pub(super) unsafe fn sq8(query_i8: &[i8], stored: &[u8]) -> i32 {
         if std::arch::is_aarch64_feature_detected!("dotprod") {
@@ -930,6 +1136,49 @@ mod tests {
                     "{} sq8 dim={dim}",
                     k.isa()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn batched_kernels_match_single_vector_kernels() {
+        for k in Kernels::all_supported() {
+            for &dim in SHAPES {
+                let q = gen_f32(dim as u64 + 11, dim);
+                for count in 0..=9usize {
+                    let store: Vec<Vec<f32>> = (0..count)
+                        .map(|i| {
+                            // One short vector per batch exercises the fallback.
+                            let len = if count > 4 && i == 5 { dim / 2 } else { dim };
+                            gen_f32(dim as u64 * 31 + i as u64, len)
+                        })
+                        .collect();
+                    let refs: Vec<&[f32]> = store.iter().map(Vec::as_slice).collect();
+                    let mut dots = vec![f32::NAN; count + 1];
+                    let mut l2s = vec![f32::NAN; count + 1];
+                    k.dot_many(&q, &refs, &mut dots);
+                    k.l2_squared_many(&q, &refs, &mut l2s);
+                    assert!(
+                        dots[count].is_nan() && l2s[count].is_nan(),
+                        "wrote past end"
+                    );
+                    for (i, v) in refs.iter().enumerate() {
+                        let tol = 1e-4 + 1e-5 * dim as f32;
+                        let (d, l) = (dot_scalar(&q, v), l2_squared_scalar(&q, v));
+                        assert!(
+                            (dots[i] - d).abs() <= tol + 2e-5 * d.abs(),
+                            "{} dot_many dim={dim} count={count} i={i}: {} vs {d}",
+                            k.isa(),
+                            dots[i]
+                        );
+                        assert!(
+                            (l2s[i] - l).abs() <= tol + 2e-5 * l.abs(),
+                            "{} l2_many dim={dim} count={count} i={i}: {} vs {l}",
+                            k.isa(),
+                            l2s[i]
+                        );
+                    }
+                }
             }
         }
     }

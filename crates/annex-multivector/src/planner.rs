@@ -135,6 +135,16 @@ pub enum FilterStrategy {
     BitmapIntersection, // Phase 2A
 }
 
+// ── Filter statistics ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FilterStats {
+    /// Estimated fraction of corpus passing the filter (0.0–1.0).
+    pub estimated_selectivity: f32,
+    /// Physical strategy used to evaluate the filter.
+    pub filter_operator: FilterStrategy,
+}
+
 // ── Planner statistics (corpus facts, one per generation) ────────────────────
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -154,7 +164,7 @@ pub struct FieldStats {
     pub graph_ready: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PlannerStats {
     pub generation: u64,
     pub documents: usize,
@@ -163,6 +173,9 @@ pub struct PlannerStats {
     pub fde_dimension: usize,
     pub fde_graph_ready: bool,
     pub fields: BTreeMap<String, FieldStats>,
+    /// Populated when a filter is present; None for unfiltered plans.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_stats: Option<FilterStats>,
 }
 
 // ── Per-channel execution plans ───────────────────────────────────────────────
@@ -361,7 +374,11 @@ impl MultiVectorIndex {
     ) -> Result<RetrievalPlan, IndexError> {
         validate_request(request)?;
 
-        let stats = planner_stats(state, self.fde.output_dimension());
+        let stats = planner_stats(
+            state,
+            self.fde.output_dimension(),
+            request.filter.as_ref().map(|_| eligible_documents),
+        );
 
         let logical_channels = request
             .prefetch
@@ -454,21 +471,37 @@ impl MultiVectorIndex {
                     let ef = *ef_search as f64;
                     let n = stats.documents.max(1) as f64;
                     let f = eligible_documents.max(1) as f64;
-                    let cost_exact = f * dim * 2.0;
-                    let cost_hnsw = ef * n.log2().ceil().max(1.0) * dim * 3.0;
-                    let (operator, reason) = choose_ann_with_cost(
-                        backend,
-                        request.filter.is_some(),
-                        ann_ready,
-                        PhysicalOperator::ExactDense,
-                        PhysicalOperator::HnswDense,
-                        cost_exact,
-                        cost_hnsw,
-                    );
-                    let cost = if operator == PhysicalOperator::HnswDense {
-                        cost_hnsw
+                    let selectivity = f / n;
+                    let filtered = request.filter.is_some();
+                    // Phase 2B: use HnswPostFilter when filtered + selectivity ≥ threshold.
+                    let (operator, reason, cost) = if filtered
+                        && ann_ready
+                        && backend != "exact"
+                        && selectivity >= POST_FILTER_SELECTIVITY_THRESHOLD
+                    {
+                        let ef_amp = (ef / selectivity.max(POST_FILTER_SELECTIVITY_THRESHOLD))
+                            .min(ef * POST_FILTER_MAX_AMPLIFICATION);
+                        let cost_post = ef_amp * n.log2().ceil().max(1.0) * dim * 3.0;
+                        let cost_exact = f * dim * 2.0;
+                        if cost_post <= cost_exact {
+                            (PhysicalOperator::HnswPostFilter, PlanReason::LowerEstimatedCost, cost_post)
+                        } else {
+                            (PhysicalOperator::ExactDense, PlanReason::LowerEstimatedCost, cost_exact)
+                        }
                     } else {
-                        cost_exact
+                        let cost_exact = f * dim * 2.0;
+                        let cost_hnsw = ef * n.log2().ceil().max(1.0) * dim * 3.0;
+                        let (op, reason) = choose_ann_with_cost(
+                            backend,
+                            filtered,
+                            ann_ready,
+                            PhysicalOperator::ExactDense,
+                            PhysicalOperator::HnswDense,
+                            cost_exact,
+                            cost_hnsw,
+                        );
+                        let cost = if op == PhysicalOperator::HnswDense { cost_hnsw } else { cost_exact };
+                        (op, reason, cost)
                     };
                     (operator, reason, *limit, Some(*ef_search), cost)
                 }
@@ -529,21 +562,36 @@ impl MultiVectorIndex {
                     let ef = *ef_search as f64;
                     let n = stats.documents.max(1) as f64;
                     let f = eligible_documents.max(1) as f64;
-                    let cost_exact = f * fde_dim * 2.0;
-                    let cost_hnsw = ef * n.log2().ceil().max(1.0) * fde_dim * 3.0;
-                    let (operator, reason) = choose_ann_with_cost(
-                        backend,
-                        request.filter.is_some(),
-                        ann_ready,
-                        PhysicalOperator::ExactFde,
-                        PhysicalOperator::HnswFde,
-                        cost_exact,
-                        cost_hnsw,
-                    );
-                    let cost = if operator == PhysicalOperator::HnswFde {
-                        cost_hnsw
+                    let selectivity = f / n;
+                    let filtered = request.filter.is_some();
+                    let (operator, reason, cost) = if filtered
+                        && ann_ready
+                        && backend != "exact"
+                        && selectivity >= POST_FILTER_SELECTIVITY_THRESHOLD
+                    {
+                        let ef_amp = (ef / selectivity.max(POST_FILTER_SELECTIVITY_THRESHOLD))
+                            .min(ef * POST_FILTER_MAX_AMPLIFICATION);
+                        let cost_post = ef_amp * n.log2().ceil().max(1.0) * fde_dim * 3.0;
+                        let cost_exact = f * fde_dim * 2.0;
+                        if cost_post <= cost_exact {
+                            (PhysicalOperator::HnswPostFilter, PlanReason::LowerEstimatedCost, cost_post)
+                        } else {
+                            (PhysicalOperator::ExactFde, PlanReason::LowerEstimatedCost, cost_exact)
+                        }
                     } else {
-                        cost_exact
+                        let cost_exact = f * fde_dim * 2.0;
+                        let cost_hnsw = ef * n.log2().ceil().max(1.0) * fde_dim * 3.0;
+                        let (op, reason) = choose_ann_with_cost(
+                            backend,
+                            filtered,
+                            ann_ready,
+                            PhysicalOperator::ExactFde,
+                            PhysicalOperator::HnswFde,
+                            cost_exact,
+                            cost_hnsw,
+                        );
+                        let cost = if op == PhysicalOperator::HnswFde { cost_hnsw } else { cost_exact };
+                        (op, reason, cost)
                     };
                     (operator, reason, *limit, Some(*ef_search), cost)
                 }
@@ -705,7 +753,11 @@ impl MultiVectorIndex {
 
 // ── Statistics snapshot ───────────────────────────────────────────────────────
 
-pub(super) fn planner_stats(state: &State, fde_dimension: usize) -> PlannerStats {
+pub(super) fn planner_stats(
+    state: &State,
+    fde_dimension: usize,
+    eligible_documents: Option<usize>,
+) -> PlannerStats {
     let fields = state
         .retrieval
         .schema()
@@ -736,9 +788,21 @@ pub(super) fn planner_stats(state: &State, fde_dimension: usize) -> PlannerStats
             )
         })
         .collect();
+    let n = state.documents.len();
+    let filter_stats = eligible_documents.map(|eligible| {
+        let selectivity = if n == 0 {
+            1.0_f32
+        } else {
+            (eligible as f32) / (n as f32)
+        };
+        FilterStats {
+            estimated_selectivity: selectivity.clamp(0.0, 1.0),
+            filter_operator: FilterStrategy::MetadataScan,
+        }
+    });
     PlannerStats {
         generation: state.generation,
-        documents: state.documents.len(),
+        documents: n,
         token_documents: state
             .documents
             .values()
@@ -748,8 +812,17 @@ pub(super) fn planner_stats(state: &State, fde_dimension: usize) -> PlannerStats
         fde_dimension,
         fde_graph_ready: state.fde_ann.is_some(),
         fields,
+        filter_stats,
     }
 }
+
+// ── Phase 2B selectivity thresholds (PlannerConfig; tunable) ─────────────────
+
+/// Minimum selectivity (eligible/N) to consider HnswPostFilter.
+/// Below this, HNSW over-fetch becomes too expensive relative to exact scan.
+const POST_FILTER_SELECTIVITY_THRESHOLD: f64 = 0.05;
+/// Maximum ef_search amplification factor for post-filter (safety cap).
+const POST_FILTER_MAX_AMPLIFICATION: f64 = 4.0;
 
 // ── Cost-based operator selection (Phase 1C) ─────────────────────────────────
 

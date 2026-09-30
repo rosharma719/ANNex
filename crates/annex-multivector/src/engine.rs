@@ -16,8 +16,8 @@ use annex::{
     vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
 };
 pub use planner::{
-    ConditionalStage, ContextPlan, ContextOperator, EscalationPredicate, FieldStats, FilterStrategy,
-    FusionOperator, LogicalChannel, LogicalChannelKind, LogicalFusion, LogicalPlan,
+    ConditionalStage, ContextPlan, ContextOperator, EscalationPredicate, FieldStats, FilterStats,
+    FilterStrategy, FusionOperator, LogicalChannel, LogicalChannelKind, LogicalFusion, LogicalPlan,
     PhysicalOperator, PlanEstimate, PlanReason, PlanStage, PlannerStats, PlannedChannel,
     QualityPreference, RerankPlan, RepresentationKind, RetrievalObjective, RetrievalPlan,
 };

@@ -190,7 +190,7 @@ pub struct ContextPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
 pub enum PlanStage {
     Parallel(Vec<PlannedChannel>),
     Fusion(FusionOperator),

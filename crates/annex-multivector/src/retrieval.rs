@@ -2129,6 +2129,7 @@ mod tests {
 
         assert!(plan.estimate.critical_path_cost > 0.0);
         assert!(plan.estimate.total_cost > 0.0);
+        serde_json::to_value(&plan).expect("plans exposed by HTTP must serialize");
     }
 
     #[test]

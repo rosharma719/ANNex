@@ -1,7 +1,3 @@
-#[path = "agent.rs"]
-mod agent;
-#[path = "regret.rs"]
-pub mod regret;
 #[path = "planner.rs"]
 mod planner;
 #[path = "policy.rs"]
@@ -22,14 +18,12 @@ use annex::{
     vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
 };
 pub use planner::{
-    CalibrationSnapshot, CalibrationStats, ConditionalStage, ContextPlan, ContextOperator,
-    EscalationPredicate, FieldStats, FilterStats, FilterStrategy, FusionOperator, LogicalChannel,
-    LogicalChannelKind, LogicalFusion, LogicalPlan, OperatorClass, PhysicalOperator, PlanEstimate,
-    PlanReason, PlanStage, PlannerStats, PlannedChannel, QualityPreference, RerankPlan,
-    RepresentationKind, RetrievalObjective, RetrievalPlan,
+    ContextOperator, ContextPlan, FieldStats, FilterStats, FilterStrategy, FusionOperator,
+    LogicalChannel, LogicalChannelKind, LogicalFusion, LogicalPlan, PhysicalOperator, PlanEstimate,
+    PlanReason, PlanStage, PlannedChannel, PlannerStats, QualityPreference, RepresentationKind,
+    RerankPlan, RetrievalObjective, RetrievalPlan,
 };
 pub use policy::{PlanningMode, PolicyPlan, QueryRepresentations};
-pub use agent::{AgentDecision, AgentIteration, AgentSearch, CorpusFingerprint, StopReason};
 use rayon::prelude::*;
 pub use retrieval::{
     AdaptiveRerank, Channel, Chunk, ContextHit, ContextOptions, Fusion, Predicate, RankingSignals,
@@ -404,8 +398,6 @@ pub struct MultiVectorIndex {
     state: RwLock<Arc<State>>,
     writer: Mutex<()>,
     durability: Durability,
-    /// Runtime calibration stats, updated after each retrieve(). Advisory only.
-    calibration: Mutex<CalibrationStats>,
     // One process/handle owns append offsets and manifest publication at a time.
     _directory_lock: DirectoryLock,
 }
@@ -684,8 +676,10 @@ impl MultiVectorIndex {
                 }
                 let bytes = record_bytes(object_bytes, d.location)?;
                 let stored_ids = bytes[16..16 + d.tokens * 4]
-                    .chunks_exact(4)
-                    .map(|v| u32::from_le_bytes(v.try_into().unwrap()));
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|v| u32::from_le_bytes(*v));
                 if !stored_ids.eq(d.centroid_ids.iter().copied()) {
                     return Err(IndexError::Invalid(
                         "manifest/record centroid mismatch".into(),
@@ -736,10 +730,10 @@ impl MultiVectorIndex {
                         .file_name()
                         .to_str()
                         .and_then(|s| s.parse::<u64>().ok())
+                        && Some(id) != storage_generation
+                        && !sealed.contains_key(&id)
                     {
-                        if Some(id) != storage_generation && !sealed.contains_key(&id) {
-                            fs::remove_dir_all(entry.path())?;
-                        }
+                        fs::remove_dir_all(entry.path())?;
                     }
                 }
             }
@@ -791,7 +785,6 @@ impl MultiVectorIndex {
                 )
             },
             writer: Mutex::new(()),
-            calibration: Mutex::new(CalibrationStats::new()),
             durability,
             _directory_lock: directory_lock,
             state: RwLock::new(Arc::new(State {
@@ -1957,11 +1950,6 @@ impl MultiVectorIndex {
                 .collect(),
         }
     }
-    /// Frozen calibration snapshot for plan enumeration and regret benchmarks.
-    pub fn calibration_snapshot(&self) -> CalibrationSnapshot {
-        self.calibration.lock().unwrap().snapshot()
-    }
-
     /// Diagnostic score over caller-provided vectors; used to verify scorer parity.
     pub fn score_uncompressed(
         &self,

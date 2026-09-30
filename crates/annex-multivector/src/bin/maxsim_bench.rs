@@ -182,12 +182,7 @@ fn main() {
     // Also measure the crate-level dispatched maxsim_flat so kernel-level
     // improvements in fde.rs (loop reorder, LUT changes, etc.) show up
     // here without having to re-copy the code into this bench.
-    run_one(
-        "crate",
-        |q, d, dim| multivector::maxsim_flat(q, d, dim),
-        &docs,
-        &queries,
-    );
+    run_one("crate", multivector::maxsim_flat, &docs, &queries);
 
     // Correctness check: NEON kernel must agree with scalar per-query.
     #[cfg(target_arch = "aarch64")]

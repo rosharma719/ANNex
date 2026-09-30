@@ -6,33 +6,18 @@ Commands run from the workspace root. Reporting rules live in [BENCHMARK_POLICY.
 
 Download instructions live in [data-download.md](./data-download.md).
 
-Run the main harness:
+Run ANNex and the available competitor libraries, then generate the comparison:
 
 ```bash
-cargo test --release nytimes_256_angular_perf_and_recall -- --ignored --nocapture
+crates/annex-core/bench/nyt256/run_all.sh
 ```
 
-Run the QPS/latency curve from a persisted snapshot:
+The shared harness accepts `M_VALUES` and `EF_SEARCH_LIST`; pass
+`--skip-competitors` to reuse existing competitor output:
 
 ```bash
-VECTORDB_USE_SNAPSHOT=1 \
-VECTORDB_NYT_PERSIST_PATH=data/nytimes-256-angular/index_m16_m0_32_efc100.bin \
-cargo test --release nytimes_qps_latency_curve -- --ignored --nocapture
-```
-
-Build a snapshot with trace logging:
-
-```bash
-VECTORDB_NYT_PERSIST_PATH=data/nytimes-256-angular/index_m16_m0_32_efc100.bin \
-VECTORDB_NYT_M=16 \
-VECTORDB_NYT_M0=32 \
-VECTORDB_NYT_EF_CONSTRUCT=100 \
-VECTORDB_NYT_EF_SEARCH_LIST=100 \
-VECTORDB_DIVERSITY_ALPHA=1 \
-VECTORDB_INSERT_TRACE_LOG=logs/nytimes_insert_m16_m0_32_efc100.jsonl \
-VECTORDB_NYT_ALLOW_BUILD=1 \
-VECTORDB_NYT_SAVE_SNAPSHOT=1 \
-cargo test --release nytimes_build_and_persist_snapshot_only -- --ignored --nocapture
+M_VALUES="16 32" EF_SEARCH_LIST="32,64,128,256" \
+  crates/annex-core/bench/nyt256/run_all.sh --skip-competitors
 ```
 
 Analyze a snapshot:

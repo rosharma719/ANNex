@@ -19,10 +19,6 @@ path = "src/main.rs"
 name = "maxsim-bench"
 path = "src/bin/maxsim_bench.rs"
 
-[[bin]]
-name = "regret-bench"
-path = "src/bin/regret_bench.rs"
-
 [dependencies]
 annex = { path = "../annex-core", version = "0.2.0" }
 axum = "0.8"

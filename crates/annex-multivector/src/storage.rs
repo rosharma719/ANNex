@@ -308,8 +308,10 @@ impl CompressedVectorStore {
             ));
         }
         let ids: Vec<_> = bytes[16..ids_end]
-            .chunks_exact(4)
-            .map(|x| u32::from_le_bytes(x.try_into().unwrap()) as usize)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|x| u32::from_le_bytes(*x) as usize)
             .collect();
         if ids
             .iter()

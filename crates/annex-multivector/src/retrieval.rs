@@ -122,17 +122,17 @@ impl RetrievalState {
     }
     pub(super) fn remove(&mut self, id: &str) {
         if let Some(number) = self.by_id.remove(id) {
-            if let Some(chunk) = self.document_chunks.remove(&number) {
-                if let Some(positions) = self.chunks.get_mut(&chunk.parent) {
-                    if let Some(ids) = positions.get_mut(&chunk.position) {
-                        ids.remove(id);
-                        if ids.is_empty() {
-                            positions.remove(&chunk.position);
-                        }
+            if let Some(chunk) = self.document_chunks.remove(&number)
+                && let Some(positions) = self.chunks.get_mut(&chunk.parent)
+            {
+                if let Some(ids) = positions.get_mut(&chunk.position) {
+                    ids.remove(id);
+                    if ids.is_empty() {
+                        positions.remove(&chunk.position);
                     }
-                    if positions.is_empty() {
-                        self.chunks.remove(&chunk.parent);
-                    }
+                }
+                if positions.is_empty() {
+                    self.chunks.remove(&chunk.parent);
                 }
             }
             self.ids.remove(&number);
@@ -510,10 +510,10 @@ impl ContextSelection {
             return AcceptResult::GroupFull;
         }
         // Skip-and-continue token packing: don't stop on first non-fitting item.
-        if let Some(budget) = token_budget {
-            if self.tokens_consumed + candidate_tokens > budget {
-                return AcceptResult::TokenBudgetExceeded;
-            }
+        if let Some(budget) = token_budget
+            && self.tokens_consumed.saturating_add(candidate_tokens) > budget
+        {
+            return AcceptResult::TokenBudgetExceeded;
         }
         AcceptResult::Ok
     }
@@ -544,6 +544,10 @@ enum AcceptResult {
 }
 
 impl Fields {
+    pub(super) fn has_text(&self) -> bool {
+        self.text.is_some()
+    }
+
     pub(super) fn has_representation(&self, field: &str) -> bool {
         self.representations.contains_key(field)
     }
@@ -583,10 +587,10 @@ impl Fields {
                 "document ID, text or representation count exceeds limits",
             ));
         }
-        if let Some(chunk) = &document.chunk {
-            if chunk.parent.is_empty() || chunk.parent.len() > 4096 {
-                return Err(invalid("invalid chunk parent"));
-            }
+        if let Some(chunk) = &document.chunk
+            && (chunk.parent.is_empty() || chunk.parent.len() > 4096)
+        {
+            return Err(invalid("invalid chunk parent"));
         }
         let mut fields = Self {
             text: document.text.clone(),
@@ -710,22 +714,7 @@ impl MultiVectorIndex {
         let started = Instant::now();
         planner::validate_request(request)?;
         let s = self.snapshot();
-        // Phase 3: for auto modes, generate prefetch from policy planner first.
-        let (effective_request, policy_plan) = if request.planning_mode != PlanningMode::Manual {
-            let stats = planner::planner_stats(&s, self.fde.output_dimension(), None);
-            let policy = policy::generate_policy_prefetch(
-                request.query.as_ref().unwrap(),
-                &stats,
-                request.limit,
-                request.objective.quality,
-                s.retrieval.schema(),
-            );
-            let mut patched = request.clone();
-            patched.prefetch = policy.generated_prefetch.clone();
-            (std::borrow::Cow::Owned(patched), Some(policy))
-        } else {
-            (std::borrow::Cow::Borrowed(request), None)
-        };
+        let (effective_request, policy_plan) = self.prepare_request(&s, request);
         let request = effective_request.as_ref();
         let eligible: HashSet<_> = s
             .documents
@@ -747,7 +736,8 @@ impl MultiVectorIndex {
         // work-stealing is safe but may create contention under high concurrency.
         // A per-query parallelism budget is tracked in a later phase.
         let parallel_stage_start = Instant::now();
-        let channel_results: Vec<Result<(Vec<(String, f32)>, Value), IndexError>> = request
+        type ChannelResult = Result<(Vec<(String, f32)>, Value), IndexError>;
+        let channel_results: Vec<ChannelResult> = request
             .prefetch
             .par_iter()
             .zip(plan.parallel_channels().par_iter())
@@ -1082,9 +1072,7 @@ impl MultiVectorIndex {
             }
         };
         let estimate_tokens = |id: &str| -> Option<usize> {
-            if token_budget.is_none() {
-                return None;
-            }
+            token_budget?;
             let word_count = s.documents[id]
                 .fields
                 .text
@@ -1231,22 +1219,22 @@ impl MultiVectorIndex {
                     }
                 }
             }
-            if options.neighbors > 0 {
-                if let Some(chunk) = &s.documents[id].fields.chunk {
-                    for neighbor in s.retrieval.neighbors(chunk, options.neighbors) {
-                        if !eligible.contains(neighbor) || selected.ids.contains(neighbor) {
-                            continue;
-                        }
-                        add(
-                            &mut selected,
-                            neighbor,
-                            *score,
-                            Some(id.clone()),
-                            text_key(neighbor),
-                        );
-                        if selected.matches.len() >= request.limit {
-                            break;
-                        }
+            if options.neighbors > 0
+                && let Some(chunk) = &s.documents[id].fields.chunk
+            {
+                for neighbor in s.retrieval.neighbors(chunk, options.neighbors) {
+                    if !eligible.contains(neighbor) || selected.ids.contains(neighbor) {
+                        continue;
+                    }
+                    add(
+                        &mut selected,
+                        neighbor,
+                        *score,
+                        Some(id.clone()),
+                        text_key(neighbor),
+                    );
+                    if selected.matches.len() >= request.limit {
+                        break;
                     }
                 }
             }
@@ -1381,15 +1369,9 @@ mod tests {
             filtered.parallel_channels()[0].operator,
             PhysicalOperator::ExactDense
         );
-        // Phase 2B: filtered + selectivity ≥ 0.05 → cost-based decision (not blanket exact).
-        // For tiny corpus, exact is still cheaper so LowerEstimatedCost is the reason.
-        assert!(
-            matches!(
-                filtered.parallel_channels()[0].reason,
-                PlanReason::FilterRequiresExact | PlanReason::LowerEstimatedCost
-            ),
-            "expected exact-forcing reason, got {:?}",
-            filtered.parallel_channels()[0].reason
+        assert_eq!(
+            filtered.parallel_channels()[0].reason,
+            PlanReason::FilterRequiresExact
         );
         assert_eq!(filtered.eligible_documents, 2);
     }
@@ -1936,10 +1918,7 @@ mod tests {
             .as_ref()
             .expect("policy plan must be present in auto mode");
         assert!(
-            policy
-                .channels_selected
-                .iter()
-                .any(|k| *k == LogicalChannelKind::Bm25),
+            policy.channels_selected.contains(&LogicalChannelKind::Bm25),
             "auto mode should select BM25 when text coverage is sufficient"
         );
         assert!(
@@ -1969,7 +1948,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_mode_with_empty_prefetch_is_rejected() {
+    fn unsupported_requests_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let index = index(dir.path());
         let query: RetrieveRequest = serde_json::from_value(json!({
@@ -1981,6 +1960,11 @@ mod tests {
             index.plan(&query).is_err(),
             "manual mode with empty prefetch must be invalid"
         );
+
+        let mut query = request();
+        query.objective.latency_budget_ms = Some(10.0);
+        let error = index.plan(&query).unwrap_err();
+        assert!(error.to_string().contains("requires calibrated planning"));
     }
 
     #[test]
@@ -2003,6 +1987,22 @@ mod tests {
             .expect("auto mode must embed PolicyPlan in plan");
         assert!(!policy.channels_selected.is_empty());
         assert!(!policy.selection_reasons.is_empty());
+    }
+
+    #[test]
+    fn auto_with_overrides_uses_the_caller_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [{"kind":"bm25","text":"exact phrase","limit":1}],
+            "planning_mode": "auto_with_overrides",
+            "query": {"text":"repair"},
+            "limit": 1
+        }))
+        .unwrap();
+        let plan = index.plan(&query).unwrap();
+        assert_eq!(plan.parallel_channels()[0].limit, 1);
+        assert_eq!(plan.policy.unwrap().generated_prefetch, query.prefetch);
     }
 
     #[test]
@@ -2095,94 +2095,6 @@ mod tests {
     #[test]
     fn global_development_choice_is_the_rrf_default() {
         assert!(matches!(Fusion::default(), Fusion::Rrf { k } if k == 10.));
-    }
-
-    // ── Live planner demo (run with --nocapture) ──────────────────────────────
-
-    #[test]
-    #[ignore = "demo: run with --ignored --nocapture to see EXPLAIN output"]
-    fn planner_demo_explain_and_explain_analyze() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path()); // 3 docs: text + dense "semantic" + sparse
-
-        let query = request(); // filter: tenant=a; channels: Dense + BM25
-
-        // ── EXPLAIN: dry-run plan ─────────────────────────────────────────────
-        let plan = index.plan(&query).unwrap();
-        println!("\n=== EXPLAIN ===");
-        println!("corpus: {} docs, {} eligible after filter",
-            plan.stats.documents, plan.eligible_documents);
-        println!("stages: {}", plan.stages.len());
-        for ch in plan.parallel_channels() {
-            println!("  channel[{}] operator={:?}  reason={:?}  limit={}  est_cost={:.0}",
-                ch.index, ch.operator, ch.reason, ch.limit, ch.estimated_cost_units);
-        }
-        println!("estimate: critical_path={:.4}ms  total_cost={:.4}ms",
-            plan.estimate.critical_path_cost, plan.estimate.total_cost);
-        if let Some(fs) = &plan.stats.filter_stats {
-            println!("filter: selectivity={:.2}  strategy={:?}",
-                fs.selectivity, fs.filter_operator);
-        }
-
-        // ── EXPLAIN ANALYZE: what actually happened ───────────────────────────
-        let response = index.retrieve(&query).unwrap();
-        let trace = &response.trace;
-        println!("\n=== EXPLAIN ANALYZE ===");
-        println!("elapsed: {:.3}ms", trace.elapsed_ms);
-        for (i, ms) in trace.per_stage_actual_ms.iter().enumerate() {
-            println!("  stage[{i}] actual={ms:.3}ms");
-        }
-        for ch_json in &trace.channels {
-            println!("  channel backend={:?}  candidates={}  elapsed={:.3}ms",
-                ch_json["backend"], ch_json["candidates"],
-                ch_json["elapsed_ms"].as_f64().unwrap_or(0.));
-        }
-        println!("fused_candidates: {}  reranked: {}",
-            trace.fused_candidates, trace.reranked_candidates);
-        println!("matches: {}", response.matches.len());
-
-        // ── RankingSignals ────────────────────────────────────────────────────
-        let sig = &trace.signals;
-        println!("\n=== RANKING SIGNALS ===");
-        println!("top1_margin:       {:.4}", sig.top1_margin);
-        println!("topk_spread:       {:.4}", sig.topk_score_spread);
-        println!("source_diversity:  {:.2}", sig.source_diversity);
-        println!("channel_agreement: {:?}", sig.channel_agreement);
-
-        // ── Auto-planning mode ────────────────────────────────────────────────
-        let auto_query: RetrieveRequest = serde_json::from_value(json!({
-            "prefetch": [],
-            "planning_mode": "auto",
-            "query": {"text": "E123 repair"},
-            "limit": 3
-        })).unwrap();
-        let auto_resp = index.retrieve(&auto_query).unwrap();
-        let auto_plan = &auto_resp.trace.plan;
-        println!("\n=== AUTO MODE (policy selects channels) ===");
-        if let Some(policy) = &auto_plan.policy {
-            println!("channels selected: {:?}", policy.channels_selected);
-            for reason in &policy.selection_reasons {
-                println!("  reason: {reason}");
-            }
-        }
-        for ch in auto_plan.parallel_channels() {
-            println!("  channel[{}] {:?} limit={}", ch.index, ch.operator, ch.limit);
-        }
-        println!("matches: {:?}", auto_resp.matches.iter().map(|h| h.id.as_str()).collect::<Vec<_>>());
-
-        // ── Cost model: build ANN, shows exact still wins on tiny corpus ──────
-        index.build_dense_ann("semantic", 4, 16).unwrap();
-        let mut unfiltered = query.clone();
-        unfiltered.filter = None;
-        unfiltered.prefetch.retain(|c| matches!(c, Channel::Dense { .. }));
-        let cost_plan = index.plan(&unfiltered).unwrap();
-        println!("\n=== COST MODEL (3-doc corpus: exact beats HNSW) ===");
-        let ch = &cost_plan.parallel_channels()[0];
-        println!("operator:       {:?}", ch.operator);
-        println!("reason:         {:?}", ch.reason);
-        println!("cost_units:     {:.0}", ch.estimated_cost_units);
-        println!("critical_path:  {:.6}ms", cost_plan.estimate.critical_path_cost);
-        println!("(for HNSW to win cost model, need ~100+ docs with this dim)");
     }
 
     #[test]

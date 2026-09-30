@@ -1,8 +1,6 @@
 //! Deterministic physical planning for the retrieval API.
 use super::*;
 
-// ── Request-level objective ───────────────────────────────────────────────────
-
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QualityPreference {
@@ -20,8 +18,6 @@ pub struct RetrievalObjective {
     #[serde(default)]
     pub quality: QualityPreference,
 }
-
-// ── Logical plan (intent, before physical decisions) ─────────────────────────
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,8 +54,6 @@ pub struct LogicalPlan {
     pub context_selection: bool,
 }
 
-// ── Physical operators ────────────────────────────────────────────────────────
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PhysicalOperator {
@@ -70,13 +64,6 @@ pub enum PhysicalOperator {
     ExactMaxsim,
     ExactFde,
     HnswFde,
-    /// HNSW with post-filter overfetch + exact fallback. Not the same as
-    /// filter-aware graph traversal (which requires HNSW library changes).
-    HnswPostFilter,
-    /// Exact scan over the eligible set (filter applied first).
-    ExactEligibleScan,
-    /// Bitmap intersection over indexed categorical fields (Phase 2A).
-    FilterBitmap,
 }
 
 impl PhysicalOperator {
@@ -89,14 +76,9 @@ impl PhysicalOperator {
             Self::ExactMaxsim => "exact_maxsim",
             Self::ExactFde => "exact_fde",
             Self::HnswFde => "hnsw_fde",
-            Self::HnswPostFilter => "hnsw_post_filter",
-            Self::ExactEligibleScan => "exact_eligible_scan",
-            Self::FilterBitmap => "filter_bitmap",
         }
     }
 }
-
-// ── Plan reasons (machine-readable, with structured values) ──────────────────
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,41 +93,28 @@ pub enum PlanReason {
     AnnReady,
     /// ANN graph not built; falling back to exact scan.
     AnnUnavailable,
-    /// Synonym for AnnUnavailable; prefer IndexUnavailable in new code.
-    IndexUnavailable,
     /// Filter present; selectivity too low or post-filter disabled.
     FilterRequiresExact,
-    /// Filter selectivity below threshold for HnswPostFilter.
-    FilterTooSelective,
     /// Operator does not support ANN (e.g. named multivector exact-only).
     OperatorRequiresExact,
     /// Cost model estimated exact cheaper than HNSW for this corpus size.
     LowerEstimatedCost,
-    /// ef_search adapted to fit latency budget.
-    LatencyBudgetConstraint,
 }
-
-// ── Filter strategy ───────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FilterStrategy {
     None,
     MetadataScan,
-    BitmapIntersection, // Phase 2A
 }
-
-// ── Filter statistics ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FilterStats {
-    /// Estimated fraction of corpus passing the filter (0.0–1.0).
-    pub estimated_selectivity: f32,
+    /// Fraction of the current generation that passed the metadata scan.
+    pub selectivity: f32,
     /// Physical strategy used to evaluate the filter.
     pub filter_operator: FilterStrategy,
 }
-
-// ── Planner statistics (corpus facts, one per generation) ────────────────────
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -168,6 +137,7 @@ pub struct FieldStats {
 pub struct PlannerStats {
     pub generation: u64,
     pub documents: usize,
+    pub text_documents: usize,
     pub token_documents: usize,
     pub token_vectors: usize,
     pub fde_dimension: usize,
@@ -177,8 +147,6 @@ pub struct PlannerStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter_stats: Option<FilterStats>,
 }
-
-// ── Per-channel execution plans ───────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PlannedChannel {
@@ -191,8 +159,6 @@ pub struct PlannedChannel {
     /// Raw cost units for this operator (not calibrated to ms yet).
     pub estimated_cost_units: f64,
 }
-
-// ── Fusion, rerank, context plans ────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -223,47 +189,21 @@ pub struct ContextPlan {
     pub context_budget_tokens: Option<usize>,
 }
 
-// ── Conditional escalation (Phase 2D) ────────────────────────────────────────
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct ConditionalStage {
-    pub predicate: EscalationPredicate,
-    pub additional_channels: Vec<PlannedChannel>,
-    pub re_fuse: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum EscalationPredicate {
-    LowChannelAgreement { threshold: f32 },
-    InsufficientEligibleHits { min_count: usize },
-    LowTopScore { threshold: f32 },
-}
-
-// ── Plan IR ───────────────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanStage {
     Parallel(Vec<PlannedChannel>),
     Fusion(FusionOperator),
-    ConditionalEscalation(ConditionalStage),
     Rerank(RerankPlan),
     Context(ContextPlan),
 }
 
-/// Cost estimate for the full plan.
-/// - `estimated_wall_ms`: critical-path wall time (parallel channels counted once).
-/// - `estimated_cpu_work`: aggregate cpu-equivalent ms (sum of all operator costs).
-///
-/// For a 2-channel parallel plan: wall ≈ max(ch₁, ch₂) while cpu_work = ch₁ + ch₂.
+/// Relative work estimate. These units compare plans; they are not latency.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PlanEstimate {
-    pub estimated_wall_ms: f64,
-    pub estimated_cpu_work: f64,
+    pub critical_path_cost: f64,
+    pub total_cost: f64,
 }
-
-// ── Full retrieval plan ───────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RetrievalPlan {
@@ -315,8 +255,6 @@ impl RetrievalPlan {
     }
 }
 
-// ── Request validation ────────────────────────────────────────────────────────
-
 fn invalid(message: impl Into<String>) -> IndexError {
     IndexError::Invalid(message.into())
 }
@@ -343,12 +281,12 @@ pub(super) fn validate_request(request: &RetrieveRequest) -> Result<(), IndexErr
     {
         return Err(invalid("invalid retrieval or context budgets"));
     }
-    if request
-        .objective
-        .latency_budget_ms
-        .is_some_and(|value| !value.is_finite() || value <= 0.0)
-        || request.objective.context_budget_tokens == Some(0)
-    {
+    if request.objective.latency_budget_ms.is_some() {
+        return Err(invalid(
+            "latency_budget_ms requires calibrated planning and is not supported",
+        ));
+    }
+    if request.objective.context_budget_tokens == Some(0) {
         return Err(invalid("invalid retrieval objective"));
     }
     if let Some(filter) = &request.filter {
@@ -357,30 +295,36 @@ pub(super) fn validate_request(request: &RetrieveRequest) -> Result<(), IndexErr
     Ok(())
 }
 
-// ── Plan compilation ──────────────────────────────────────────────────────────
-
 impl MultiVectorIndex {
+    pub(super) fn prepare_request<'a>(
+        &self,
+        state: &State,
+        request: &'a RetrieveRequest,
+    ) -> (std::borrow::Cow<'a, RetrieveRequest>, Option<PolicyPlan>) {
+        if request.planning_mode == PlanningMode::Manual {
+            return (std::borrow::Cow::Borrowed(request), None);
+        }
+        let stats = planner_stats(state, self.fde.output_dimension(), None);
+        let mut policy = policy::generate_policy_prefetch(
+            request.query.as_ref().expect("auto query validated"),
+            &stats,
+            request.limit,
+            request.objective.quality,
+            state.retrieval.schema(),
+        );
+        if request.planning_mode == PlanningMode::AutoWithOverrides {
+            policy::apply_overrides(&mut policy, &request.prefetch);
+        }
+        let mut effective = request.clone();
+        effective.prefetch = policy.generated_prefetch.clone();
+        (std::borrow::Cow::Owned(effective), Some(policy))
+    }
+
     /// Compile a request without scoring documents.
     pub fn plan(&self, request: &RetrieveRequest) -> Result<RetrievalPlan, IndexError> {
         validate_request(request)?;
         let state = self.snapshot();
-        // For auto modes, generate the prefetch via the policy planner first.
-        let (effective_request, policy_plan) =
-            if request.planning_mode != PlanningMode::Manual {
-                let stats = planner_stats(&state, self.fde.output_dimension(), None);
-                let policy = policy::generate_policy_prefetch(
-                    request.query.as_ref().unwrap(),
-                    &stats,
-                    request.limit,
-                    request.objective.quality,
-                    state.retrieval.schema(),
-                );
-                let mut patched = request.clone();
-                patched.prefetch = policy.generated_prefetch.clone();
-                (std::borrow::Cow::Owned(patched), Some(policy))
-            } else {
-                (std::borrow::Cow::Borrowed(request), None)
-            };
+        let (effective_request, policy_plan) = self.prepare_request(&state, request);
         let request = effective_request.as_ref();
         let eligible = state
             .documents
@@ -449,7 +393,6 @@ impl MultiVectorIndex {
             context_selection: request.context != ContextOptions::default(),
         };
 
-        // ── Physical channel planning ─────────────────────────────────────────
         let mut planned_channels = Vec::with_capacity(request.prefetch.len());
         for (index, channel) in request.prefetch.iter().enumerate() {
             let (operator, reason, limit, ef_search, cost) = match channel {
@@ -463,7 +406,13 @@ impl MultiVectorIndex {
                         return Err(invalid("invalid BM25 query or parameters"));
                     }
                     let cost = stats.token_documents as f64 * 10.0;
-                    (PhysicalOperator::Bm25, PlanReason::LexicalIndex, *limit, None, cost)
+                    (
+                        PhysicalOperator::Bm25,
+                        PlanReason::LexicalIndex,
+                        *limit,
+                        None,
+                        cost,
+                    )
                 }
                 Channel::Sparse {
                     field,
@@ -477,7 +426,13 @@ impl MultiVectorIndex {
                         .canonicalized()
                         .map_err(|error| invalid(error.to_string()))?;
                     let cost = stats.token_documents as f64 * 5.0;
-                    (PhysicalOperator::SparseDot, PlanReason::SparseIndex, *limit, None, cost)
+                    (
+                        PhysicalOperator::SparseDot,
+                        PlanReason::SparseIndex,
+                        *limit,
+                        None,
+                        cost,
+                    )
                 }
                 Channel::Dense {
                     field,
@@ -502,37 +457,22 @@ impl MultiVectorIndex {
                     let ef = *ef_search as f64;
                     let n = stats.documents.max(1) as f64;
                     let f = eligible_documents.max(1) as f64;
-                    let selectivity = f / n;
                     let filtered = request.filter.is_some();
-                    // Phase 2B: use HnswPostFilter when filtered + selectivity ≥ threshold.
-                    let (operator, reason, cost) = if filtered
-                        && ann_ready
-                        && backend != "exact"
-                        && selectivity >= POST_FILTER_SELECTIVITY_THRESHOLD
-                    {
-                        let ef_amp = (ef / selectivity.max(POST_FILTER_SELECTIVITY_THRESHOLD))
-                            .min(ef * POST_FILTER_MAX_AMPLIFICATION);
-                        let cost_post = ef_amp * n.log2().ceil().max(1.0) * dim * 3.0;
-                        let cost_exact = f * dim * 2.0;
-                        if cost_post <= cost_exact {
-                            (PhysicalOperator::HnswPostFilter, PlanReason::LowerEstimatedCost, cost_post)
-                        } else {
-                            (PhysicalOperator::ExactDense, PlanReason::LowerEstimatedCost, cost_exact)
-                        }
+                    let cost_exact = f * dim * 2.0;
+                    let cost_hnsw = ef * n.log2().ceil().max(1.0) * dim * 3.0;
+                    let (operator, reason) = choose_ann_with_cost(
+                        backend,
+                        filtered,
+                        ann_ready,
+                        PhysicalOperator::ExactDense,
+                        PhysicalOperator::HnswDense,
+                        cost_exact,
+                        cost_hnsw,
+                    );
+                    let cost = if operator == PhysicalOperator::HnswDense {
+                        cost_hnsw
                     } else {
-                        let cost_exact = f * dim * 2.0;
-                        let cost_hnsw = ef * n.log2().ceil().max(1.0) * dim * 3.0;
-                        let (op, reason) = choose_ann_with_cost(
-                            backend,
-                            filtered,
-                            ann_ready,
-                            PhysicalOperator::ExactDense,
-                            PhysicalOperator::HnswDense,
-                            cost_exact,
-                            cost_hnsw,
-                        );
-                        let cost = if op == PhysicalOperator::HnswDense { cost_hnsw } else { cost_exact };
-                        (op, reason, cost)
+                        cost_exact
                     };
                     (operator, reason, *limit, Some(*ef_search), cost)
                 }
@@ -593,36 +533,22 @@ impl MultiVectorIndex {
                     let ef = *ef_search as f64;
                     let n = stats.documents.max(1) as f64;
                     let f = eligible_documents.max(1) as f64;
-                    let selectivity = f / n;
                     let filtered = request.filter.is_some();
-                    let (operator, reason, cost) = if filtered
-                        && ann_ready
-                        && backend != "exact"
-                        && selectivity >= POST_FILTER_SELECTIVITY_THRESHOLD
-                    {
-                        let ef_amp = (ef / selectivity.max(POST_FILTER_SELECTIVITY_THRESHOLD))
-                            .min(ef * POST_FILTER_MAX_AMPLIFICATION);
-                        let cost_post = ef_amp * n.log2().ceil().max(1.0) * fde_dim * 3.0;
-                        let cost_exact = f * fde_dim * 2.0;
-                        if cost_post <= cost_exact {
-                            (PhysicalOperator::HnswPostFilter, PlanReason::LowerEstimatedCost, cost_post)
-                        } else {
-                            (PhysicalOperator::ExactFde, PlanReason::LowerEstimatedCost, cost_exact)
-                        }
+                    let cost_exact = f * fde_dim * 2.0;
+                    let cost_hnsw = ef * n.log2().ceil().max(1.0) * fde_dim * 3.0;
+                    let (operator, reason) = choose_ann_with_cost(
+                        backend,
+                        filtered,
+                        ann_ready,
+                        PhysicalOperator::ExactFde,
+                        PhysicalOperator::HnswFde,
+                        cost_exact,
+                        cost_hnsw,
+                    );
+                    let cost = if operator == PhysicalOperator::HnswFde {
+                        cost_hnsw
                     } else {
-                        let cost_exact = f * fde_dim * 2.0;
-                        let cost_hnsw = ef * n.log2().ceil().max(1.0) * fde_dim * 3.0;
-                        let (op, reason) = choose_ann_with_cost(
-                            backend,
-                            filtered,
-                            ann_ready,
-                            PhysicalOperator::ExactFde,
-                            PhysicalOperator::HnswFde,
-                            cost_exact,
-                            cost_hnsw,
-                        );
-                        let cost = if op == PhysicalOperator::HnswFde { cost_hnsw } else { cost_exact };
-                        (op, reason, cost)
+                        cost_exact
                     };
                     (operator, reason, *limit, Some(*ef_search), cost)
                 }
@@ -640,7 +566,6 @@ impl MultiVectorIndex {
             });
         }
 
-        // ── Validate fusion ───────────────────────────────────────────────────
         match &request.fusion {
             Fusion::Rrf { k } if !k.is_finite() || *k < 0.0 => {
                 return Err(invalid("RRF k must be finite and nonnegative"));
@@ -659,7 +584,6 @@ impl MultiVectorIndex {
             _ => {}
         }
 
-        // ── Validate rerank ───────────────────────────────────────────────────
         if let Some(rerank) = &request.rerank {
             if rerank.limit < request.limit || rerank.limit > 100_000 {
                 return Err(invalid(
@@ -692,7 +616,6 @@ impl MultiVectorIndex {
             }
         }
 
-        // ── Validate context ──────────────────────────────────────────────────
         match (
             request.context.mmr,
             request.context.diversity_field.as_deref(),
@@ -705,7 +628,6 @@ impl MultiVectorIndex {
             (None, None) => {}
         }
 
-        // ── Assemble stages ───────────────────────────────────────────────────
         let fusion_op = match request.fusion {
             Fusion::Rrf { .. } if planned_channels.len() == 1 => FusionOperator::NativeScore,
             Fusion::Rrf { .. } => FusionOperator::ReciprocalRank,
@@ -728,34 +650,26 @@ impl MultiVectorIndex {
             context_budget_tokens: request.objective.context_budget_tokens,
         };
 
-        // ── Cost estimation ───────────────────────────────────────────────────
-        // Per-channel costs in ms (using static 1ns/unit calibration for Phase 1A).
-        const UNITS_PER_MS: f64 = 1_000_000.0;
-        let channel_costs_ms: Vec<f64> = planned_channels
+        let channel_costs = planned_channels
             .iter()
-            .map(|ch| ch.estimated_cost_units / UNITS_PER_MS)
-            .collect();
-        let parallel_wall_ms = channel_costs_ms
+            .map(|channel| channel.estimated_cost_units)
+            .collect::<Vec<_>>();
+        let parallel_critical_path = channel_costs
             .iter()
-            .cloned()
+            .copied()
             .fold(0.0_f64, f64::max)
-            .max(0.001);
-        let parallel_cpu_ms: f64 = channel_costs_ms.iter().sum::<f64>().max(0.001);
-        let fusion_ms = (planned_channels.len() as f64 * 5.0) / UNITS_PER_MS;
-        let rerank_ms = rerank_plan.as_ref().map_or(0.0, |r| {
+            .max(1.0);
+        let parallel_total = channel_costs.iter().sum::<f64>().max(1.0);
+        let fusion_cost = planned_channels.len() as f64 * 5.0;
+        let rerank_cost = rerank_plan.as_ref().map_or(0.0, |r| {
             let candidates = r.candidate_limit as f64;
-            let avg_tokens = (stats.token_vectors as f64
-                / stats.token_documents.max(1) as f64)
-                .max(1.0);
+            let avg_tokens =
+                (stats.token_vectors as f64 / stats.token_documents.max(1) as f64).max(1.0);
             let dim = self.config.dimension as f64;
-            (candidates * avg_tokens * dim * 2.0) / UNITS_PER_MS
+            candidates * avg_tokens * dim * 2.0
         });
-        let context_ms = (request.limit as f64 * 2.0) / UNITS_PER_MS;
+        let context_cost = request.limit as f64 * 2.0;
 
-        let estimated_wall_ms = parallel_wall_ms + fusion_ms + rerank_ms + context_ms;
-        let estimated_cpu_work = parallel_cpu_ms + fusion_ms + rerank_ms + context_ms;
-
-        // ── Build stage list ──────────────────────────────────────────────────
         let mut stages = Vec::with_capacity(4);
         stages.push(PlanStage::Parallel(planned_channels));
         stages.push(PlanStage::Fusion(fusion_op));
@@ -775,15 +689,16 @@ impl MultiVectorIndex {
             },
             stages,
             estimate: PlanEstimate {
-                estimated_wall_ms,
-                estimated_cpu_work,
+                critical_path_cost: parallel_critical_path
+                    + fusion_cost
+                    + rerank_cost
+                    + context_cost,
+                total_cost: parallel_total + fusion_cost + rerank_cost + context_cost,
             },
             policy: None, // populated by plan()/retrieve() for non-Manual modes
         })
     }
 }
-
-// ── Statistics snapshot ───────────────────────────────────────────────────────
 
 pub(super) fn planner_stats(
     state: &State,
@@ -796,9 +711,7 @@ pub(super) fn planner_stats(
         .iter()
         .map(|(name, schema)| {
             let (kind, dimension) = match schema {
-                FieldSchema::Dense { dimension } => {
-                    (RepresentationKind::Dense, Some(*dimension))
-                }
+                FieldSchema::Dense { dimension } => (RepresentationKind::Dense, Some(*dimension)),
                 FieldSchema::Multivector { dimension } => {
                     (RepresentationKind::Multivector, Some(*dimension))
                 }
@@ -828,165 +741,34 @@ pub(super) fn planner_stats(
             (eligible as f32) / (n as f32)
         };
         FilterStats {
-            estimated_selectivity: selectivity.clamp(0.0, 1.0),
+            selectivity: selectivity.clamp(0.0, 1.0),
             filter_operator: FilterStrategy::MetadataScan,
         }
     });
     PlannerStats {
         generation: state.generation,
         documents: n,
+        text_documents: state
+            .documents
+            .values()
+            .filter(|document| document.fields.has_text())
+            .count(),
         token_documents: state
             .documents
             .values()
             .filter(|document| document.tokens > 0)
             .count(),
-        token_vectors: state.documents.values().map(|document| document.tokens).sum(),
+        token_vectors: state
+            .documents
+            .values()
+            .map(|document| document.tokens)
+            .sum(),
         fde_dimension,
         fde_graph_ready: state.fde_ann.is_some(),
         fields,
         filter_stats,
     }
 }
-
-// ── Phase 2C: CalibrationStats ────────────────────────────────────────────────
-
-/// Stratification key for calibration observations.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct OperatorClass {
-    pub operator: PhysicalOperator,
-    /// Dimension rounded up to power-of-two bucket.
-    pub dim_bucket: usize,
-    /// Corpus size rounded to nearest order-of-magnitude bucket.
-    pub corpus_bucket: usize,
-}
-
-impl OperatorClass {
-    pub fn from_plan(operator: PhysicalOperator, dim: usize, corpus: usize) -> Self {
-        Self {
-            operator,
-            dim_bucket: dim_bucket(dim),
-            corpus_bucket: corpus_bucket(corpus),
-        }
-    }
-}
-
-fn dim_bucket(dim: usize) -> usize {
-    match dim {
-        0..=128 => 128,
-        129..=256 => 256,
-        257..=512 => 512,
-        513..=1024 => 1024,
-        _ => 2048,
-    }
-}
-
-fn corpus_bucket(n: usize) -> usize {
-    match n {
-        0..=999 => 1_000,
-        1_000..=9_999 => 10_000,
-        10_000..=99_999 => 100_000,
-        _ => 1_000_000,
-    }
-}
-
-/// Per-operator-class runtime observation, tracked as EWMA mean + EWMA of
-/// squared deviation. p90 ≈ mean + 1.28 × std_dev (normal approximation).
-/// This is advisory — planner falls back to static coefficients when
-/// `observations < MIN_OBSERVATIONS`.
-#[derive(Clone, Debug)]
-pub struct OperatorCalibration {
-    pub ewma_ms: f64,
-    pub ewma_sq_ms: f64,
-    pub observations: u64,
-    alpha: f64,
-}
-
-impl OperatorCalibration {
-    fn new(first_ms: f64) -> Self {
-        Self {
-            ewma_ms: first_ms,
-            ewma_sq_ms: first_ms * first_ms,
-            observations: 1,
-            alpha: 0.1,
-        }
-    }
-
-    fn update(&mut self, observed_ms: f64) {
-        self.ewma_ms = self.alpha * observed_ms + (1.0 - self.alpha) * self.ewma_ms;
-        self.ewma_sq_ms =
-            self.alpha * observed_ms * observed_ms + (1.0 - self.alpha) * self.ewma_sq_ms;
-        self.observations += 1;
-    }
-
-    pub fn p90_ms(&self) -> f64 {
-        let variance = (self.ewma_sq_ms - self.ewma_ms * self.ewma_ms).max(0.0);
-        self.ewma_ms + 1.28 * variance.sqrt()
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct CalibrationStats {
-    pub by_class: HashMap<OperatorClass, OperatorCalibration>,
-}
-
-impl CalibrationStats {
-    pub const MIN_OBSERVATIONS: u64 = 5;
-
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn record(&mut self, class: OperatorClass, observed_ms: f64) {
-        match self.by_class.entry(class) {
-            std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().update(observed_ms),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(OperatorCalibration::new(observed_ms));
-            }
-        }
-    }
-
-    pub fn estimate_ms(&self, class: &OperatorClass) -> Option<f64> {
-        self.by_class.get(class).filter(|c| c.observations >= Self::MIN_OBSERVATIONS)
-            .map(|c| c.ewma_ms)
-    }
-
-    pub fn p90_ms(&self, class: &OperatorClass) -> Option<f64> {
-        self.by_class.get(class).filter(|c| c.observations >= Self::MIN_OBSERVATIONS)
-            .map(|c| c.p90_ms())
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_class.is_empty()
-    }
-
-    /// Frozen copy for benchmark replay (planning against a stable calibration).
-    pub fn snapshot(&self) -> CalibrationSnapshot {
-        CalibrationSnapshot(self.clone())
-    }
-}
-
-/// Immutable snapshot of calibration stats for reproducible plan enumeration.
-#[derive(Clone, Debug)]
-pub struct CalibrationSnapshot(pub CalibrationStats);
-
-impl CalibrationSnapshot {
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-    pub fn estimate_ms(&self, class: &OperatorClass) -> Option<f64> {
-        self.0.estimate_ms(class)
-    }
-}
-
-// ── Phase 2B selectivity thresholds (PlannerConfig; tunable) ─────────────────
-
-/// Minimum selectivity (eligible/N) to consider HnswPostFilter.
-/// Below this, HNSW over-fetch becomes too expensive relative to exact scan.
-const POST_FILTER_SELECTIVITY_THRESHOLD: f64 = 0.05;
-/// Maximum ef_search amplification factor for post-filter (safety cap).
-const POST_FILTER_MAX_AMPLIFICATION: f64 = 4.0;
-
-// ── Cost-based operator selection (Phase 1C) ─────────────────────────────────
 
 /// Choose between exact and ANN operator using the cost model.
 /// `cost_exact` and `cost_hnsw` are in cost units (use `estimate_channel_cost`
@@ -1017,8 +799,6 @@ fn choose_ann_with_cost(
     }
 }
 
-// ── Per-operator cost estimation (Phase 1A static calibration) ───────────────
-
 fn estimate_channel_cost(
     operator: PhysicalOperator,
     eligible: usize,
@@ -1043,7 +823,7 @@ fn estimate_channel_cost(
             let dim = channel_dim(channel, stats).max(1) as f64;
             ef * log2_n * dim * 3.0
         }
-        PhysicalOperator::ExactFde | PhysicalOperator::ExactEligibleScan => {
+        PhysicalOperator::ExactFde => {
             let fde_dim = stats.fde_dimension.max(1) as f64;
             f * fde_dim * 2.0
         }
@@ -1055,17 +835,9 @@ fn estimate_channel_cost(
             // Approximate: scale FDE cost by token-to-vector ratio
             let fde_dim = stats.fde_dimension.max(1) as f64;
             let avg_tokens = (stats.token_vectors as f64 / stats.token_documents.max(1) as f64)
-                .max(1.0)
-                .min(512.0);
+                .clamp(1.0, 512.0);
             f * fde_dim * avg_tokens * 2.0
         }
-        PhysicalOperator::HnswPostFilter => {
-            let fde_dim = stats.fde_dimension.max(1) as f64;
-            let selectivity = (f / n).max(0.05);
-            let ef_amp = (ef / selectivity).min(ef * 4.0);
-            ef_amp * log2_n * fde_dim * 3.0
-        }
-        PhysicalOperator::FilterBitmap => f * 4.0,
     }
 }
 

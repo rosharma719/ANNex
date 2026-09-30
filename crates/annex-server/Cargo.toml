@@ -1,17 +1,17 @@
 [package]
 name = "annex-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Reference HTTP servers on top of annex-core (dense single-vector) and annex-multivector (late-interaction)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rosharma719/annex"
 
 [[bin]]
-name = "dense-server"
-path = "src/bin/dense_server.rs"
+name = "annex-server"
+path = "src/bin/annex_server.rs"
 
 [dependencies]
-annex-core = { path = "../annex-core" }
+annex-core = { path = "../annex-core", version = "0.2.0" }
 axum = "0.8"
 bytemuck = "1.24"
 clap = { version = "4.5", features = ["derive"] }

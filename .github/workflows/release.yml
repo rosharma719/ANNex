@@ -1,0 +1,158 @@
+# Release workflow — triggered by per-crate version tags.
+#
+# Tag format:  <crate>-v<semver>
+#   annex-core-v0.2.0         → publish annex-core to crates.io
+#   annex-multivector-v0.2.0  → publish annex-multivector to crates.io
+#   annex-server-v0.2.0       → publish annex-server to crates.io
+#   annex-py-v0.2.0           → build wheels + publish annex-py to PyPI
+#
+# Dependency order: annex-core must be tagged (and indexed by crates.io,
+# allow ~5 min) before tagging annex-multivector, annex-server, or annex-py.
+#
+# Required secrets:
+#   CARGO_REGISTRY_TOKEN  — crates.io API token (Account Settings → API Tokens)
+#
+# PyPI uses OIDC Trusted Publishing (no token needed).
+# One-time setup on PyPI:
+#   pypi.org → your project → Publishing → Add publisher
+#   → GitHub · owner: rosharma719 · repo: ANNex · workflow: release.yml
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'annex-core-v*'
+      - 'annex-multivector-v*'
+      - 'annex-server-v*'
+      - 'annex-py-v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Parse tag ────────────────────────────────────────────────────────────────
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      crate:     ${{ steps.parse.outputs.crate }}
+      version:   ${{ steps.parse.outputs.version }}
+      is_python: ${{ steps.parse.outputs.is_python }}
+    steps:
+      - id: parse
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG##*-v}"
+          CRATE="${TAG%-v*}"
+          IS_PYTHON="false"
+          [[ "$CRATE" == "annex-py" ]] && IS_PYTHON="true"
+          echo "crate=$CRATE"     >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_python=$IS_PYTHON" >> "$GITHUB_OUTPUT"
+
+  # ── Rust crates → crates.io ──────────────────────────────────────────────────
+  publish-crate:
+    needs: metadata
+    if: needs.metadata.outputs.is_python == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Publish ${{ needs.metadata.outputs.crate }}
+        run: cargo publish -p ${{ needs.metadata.outputs.crate }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.metadata.outputs.version }}"
+          CRATE="${{ needs.metadata.outputs.crate }}"
+          # Extract this version's section from CHANGELOG.md
+          NOTES=$(awk "/^## \[$VERSION\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
+          gh release create "${{ github.ref_name }}" \
+            --title "$CRATE $VERSION" \
+            --notes "${NOTES:-No changelog entry found for $VERSION}"
+
+  # ── Python wheel builds (matrix across platforms) ────────────────────────────
+  build-wheels:
+    needs: metadata
+    if: needs.metadata.outputs.is_python == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: auto
+          - os: macos-14
+            target: universal2
+            manylinux: ''
+          - os: windows-latest
+            target: x86_64
+            manylinux: ''
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: >-
+            --release
+            --manifest-path python/annex-py/Cargo.toml
+            --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: dist
+
+  # ── Publish Python wheels → PyPI (Trusted Publisher, no token needed) ────────
+  publish-python:
+    needs: [metadata, build-wheels]
+    if: needs.metadata.outputs.is_python == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for OIDC Trusted Publishing
+      contents: write   # required for gh release create
+    environment: ANNexDB  # must match the environment name set in the PyPI trusted publisher
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.metadata.outputs.version }}"
+          NOTES=$(awk "/^## \[$VERSION\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
+          gh release create "${{ github.ref_name }}" \
+            --title "annex-py $VERSION" \
+            --notes "${NOTES:-No changelog entry found for $VERSION}"

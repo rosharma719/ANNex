@@ -1,6 +1,6 @@
 [package]
 name = "annex-multivector"
-version = "0.1.0"
+version = "0.2.0"
 default-run = "annex-multivector"
 edition = "2024"
 description = "Late-interaction retrieval built on annex-core: MUVERA fixed-dimensional candidate generation, packed 2-bit residuals, ColBERT MaxSim rescoring."
@@ -19,7 +19,7 @@ name = "maxsim-bench"
 path = "src/bin/maxsim_bench.rs"
 
 [dependencies]
-annex-core = { path = "../annex-core" }
+annex-core = { path = "../annex-core", version = "0.2.0" }
 axum = "0.8"
 blake3 = "1.8"
 bytemuck = "1.24"

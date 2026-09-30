@@ -91,6 +91,25 @@ def source_digest(workspace):
     return h.hexdigest()
 
 
+def _linux_cpu_info(path=Path("/proc/cpuinfo")):
+    try:
+        fields = dict(
+            line.split(":", 1)
+            for line in path.read_text().split("\n\n", 1)[0].splitlines()
+            if ":" in line
+        )
+    except OSError:
+        return {}
+    fields = {key.strip(): value.strip() for key, value in fields.items()}
+    flags = fields.get("flags", fields.get("Features", "")).split()
+    return {
+        "processor": fields.get(
+            "model name", fields.get("Processor", platform.processor())
+        ),
+        "cpu_features": sorted(set(flags)),
+    }
+
+
 def environment_settings():
     packages = {}
     for name in ("numpy", "ir-datasets", "pylate", "torch", "qdrant-client", "lancedb"):
@@ -108,7 +127,9 @@ def environment_settings():
                 subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True)
             ),
         )
-    elif hasattr(os, "sysconf"):
+    elif platform.system() == "Linux":
+        hardware.update(_linux_cpu_info())
+    if hasattr(os, "sysconf"):
         hardware["memory_bytes"] = os.sysconf("SC_PAGE_SIZE") * os.sysconf(
             "SC_PHYS_PAGES"
         )

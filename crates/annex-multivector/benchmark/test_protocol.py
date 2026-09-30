@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from protocol import prepare_protocol, query_split
+from protocol import _linux_cpu_info, prepare_protocol, query_split
 
 
 class ProtocolTests(unittest.TestCase):
@@ -124,6 +124,17 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(report["label"], "development exploration")
         with self.assertRaisesRegex(ValueError, "from dev"):
             self.prepare(self.args(partition="exploratory", freeze_config=self.path))
+
+    def test_linux_cpu_identity_is_stable_and_deduplicated(self):
+        cpuinfo = Path(self.tmp.name) / "cpuinfo"
+        cpuinfo.write_text(
+            "processor : 0\nmodel name : Test CPU\nflags : sse avx2 sse fma\n\n"
+            "processor : 1\nmodel name : Test CPU\nflags : sse\n"
+        )
+        self.assertEqual(
+            _linux_cpu_info(cpuinfo),
+            {"processor": "Test CPU", "cpu_features": ["avx2", "fma", "sse"]},
+        )
 
 
 if __name__ == "__main__":

@@ -775,6 +775,7 @@ fn l2_scalar(query: &[f32], vec: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 #[allow(unsafe_op_in_unsafe_fn)]
 #[inline]
 unsafe fn dot_avx2(query: &[f32], vec: &[f32]) -> f32 {
@@ -847,6 +848,7 @@ unsafe fn dot_avx2_fma(query: &[f32], vec: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 #[allow(unsafe_op_in_unsafe_fn)]
 #[inline]
 unsafe fn l2_avx2(query: &[f32], vec: &[f32]) -> f32 {
@@ -1527,40 +1529,26 @@ unsafe fn screen_dot_neon_sdot(query_i8: &[i8], stored: &[u8]) -> i32 {
     sum
 }
 
-/// AVX2 path using maddubs + madd pattern.
+/// AVX2 path widening bytes to i16 before multiplication.
 #[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn screen_dot_avx2(query_i8: &[i8], stored: &[u8]) -> i32 {
     use std::arch::x86_64::*;
-    // maddubs(u8, i8): multiplies pairs of unsigned×signed bytes, adds adjacent pairs → i16.
-    // We pass stored (u8) as first arg and query (i8 cast to u8 by adding 128) as second,
-    // then correct the bias with a separate accumulator.
     let n = query_i8.len().min(stored.len());
     let ones = _mm256_set1_epi16(1);
+    let bias = _mm256_set1_epi16(128);
     let mut acc = _mm256_setzero_si256();
     let mut i = 0;
     while i + 32 <= n {
         let s = _mm256_loadu_si256(stored.as_ptr().add(i) as *const __m256i);
-        // treat query i8 as u8 offset by 128: q_u8[d] = q_i8[d] + 128
         let q_raw = _mm256_loadu_si256(query_i8.as_ptr().add(i) as *const __m256i);
-        let offset128 = _mm256_set1_epi8(-128i8); // = 128 as u8
-        let q_u8 = _mm256_add_epi8(q_raw, offset128);
-        // maddubs(s[u8], q_u8[u8]): s×q_u8, adjacent pairs summed → i16
-        // But q_u8 is interpreted as i8 by maddubs... actually:
-        // _mm256_maddubs_epi16(a: u8, b: i8) computes a*b not b*a. Treat s as u8, q_u8 as i8.
-        // Since q_u8 = q_i8 + 128, the range is [0,255] interpreted as i8 wraps, but
-        // this gives wrong products. Use widening multiply instead.
-        // Widen s (u8) and q_raw (i8) to i16, multiply, reduce.
         let s_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(s));
         let s_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(s, 1));
         let q_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(q_raw));
         let q_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(q_raw, 1));
-        // Subtract 128 from s as i16 to center it
-        let bias = _mm256_set1_epi16(128);
         let s_lo_c = _mm256_sub_epi16(s_lo, bias);
         let s_hi_c = _mm256_sub_epi16(s_hi, bias);
-        // Multiply i16 × i16 → keep low 16 bits, then use madd to accumulate into i32
         let prod_lo = _mm256_madd_epi16(_mm256_mullo_epi16(s_lo_c, q_lo), ones);
         let prod_hi = _mm256_madd_epi16(_mm256_mullo_epi16(s_hi_c, q_hi), ones);
         acc = _mm256_add_epi32(acc, _mm256_add_epi32(prod_lo, prod_hi));
@@ -1638,6 +1626,66 @@ mod tests {
                 l2_err <= 1e-3,
                 "l2 mismatch seed={seed}: ref={l2_ref} fast={l2_fast} err={l2_err}"
             );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_simd_kernels_match_scalar_across_shapes() {
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        let fma = std::arch::is_x86_feature_detected!("fma");
+        let required = env::var("ANNEX_REQUIRE_X86_FEATURES").unwrap_or_default();
+        for feature in required.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+            let available = match feature {
+                "avx2" => avx2,
+                "fma" => fma,
+                other => panic!("unknown required x86 feature: {other}"),
+            };
+            assert!(available, "required x86 feature is unavailable: {feature}");
+        }
+
+        eprintln!("x86 kernel coverage: avx2={avx2} fma={fma}");
+        for &dim in &[
+            0, 1, 7, 8, 9, 31, 32, 33, 127, 128, 129, 255, 256, 257, 1537,
+        ] {
+            let query = gen_vec(dim as u32 + 1, dim);
+            let vector = gen_vec(dim as u32 + 10_001, dim + usize::from(dim % 2 == 0));
+            let dot_ref = dot_scalar(&query, &vector);
+            let l2_ref = l2_scalar(&query, &vector);
+            let close = |actual: f32, expected: f32| {
+                let tolerance = 1e-3 + 2e-5 * expected.abs();
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "dim={dim}: expected {expected}, got {actual}, tolerance={tolerance}"
+                );
+            };
+
+            if avx2 {
+                unsafe {
+                    close(dot_avx2(&query, &vector), dot_ref);
+                    close(l2_avx2(&query, &vector), l2_ref);
+                }
+            }
+            if avx2 && fma {
+                unsafe {
+                    close(dot_avx2_fma(&query, &vector), dot_ref);
+                    close(l2_avx2_fma(&query, &vector), l2_ref);
+                }
+            }
+
+            let query_i8: Vec<i8> = (0..dim)
+                .map(|i| [-128, -127, -1, 0, 1, 126, 127][i % 7])
+                .collect();
+            let stored: Vec<u8> = (0..dim + usize::from(dim % 2 == 1))
+                .map(|i| [0, 1, 127, 128, 129, 254, 255][i % 7])
+                .collect();
+            if avx2 {
+                assert_eq!(
+                    unsafe { screen_dot_avx2(&query_i8, &stored) },
+                    screen_dot_scalar(&query_i8, &stored),
+                    "SQ8 mismatch at dim={dim}"
+                );
+            }
         }
     }
 

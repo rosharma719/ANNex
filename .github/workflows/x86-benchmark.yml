@@ -1,0 +1,46 @@
+name: Dedicated x86 benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: [self-hosted, linux, x64, annex-benchmark]
+    timeout-minutes: 90
+    env:
+      ANNEX_REQUIRE_X86_FEATURES: avx2,fma
+      RUSTFLAGS: -C target-cpu=native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Record machine identity
+        run: |
+          test -z "$(git status --porcelain)"
+          test "$(uname -m)" = x86_64
+          mkdir -p x86-results
+          {
+            git rev-parse HEAD
+            rustc --version --verbose
+            cargo --version
+            uname -a
+            lscpu
+            cat /proc/meminfo
+            uptime
+            env | LC_ALL=C sort | grep -E '^(ANNEX_|RUSTFLAGS|RAYON_NUM_THREADS|OMP_NUM_THREADS|MKL_NUM_THREADS)='
+            find /sys/devices/system/cpu -name scaling_governor -exec cat {} + 2>/dev/null | sort -u || true
+            cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || true
+          } > x86-results/environment.txt
+      - name: Validate explicit SIMD paths
+        run: cargo test --locked --release -p annex-core x86_simd_kernels_match_scalar_across_shapes -- --nocapture |& tee x86-results/correctness.txt
+      - name: Measure kernels
+        run: cargo bench --locked -p annex-multivector --bench kernels -- --noplot |& tee x86-results/kernels.txt
+      - name: Preserve raw evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-${{ github.sha }}-${{ github.run_id }}
+          path: |
+            x86-results
+            target/criterion
+          if-no-files-found: error
+          retention-days: 30

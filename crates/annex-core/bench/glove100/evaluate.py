@@ -3,13 +3,13 @@
 Merge ANNex and competitor results, compute Pareto frontier, print comparison table.
 
 Usage:
-    python3 bench/nyt256/evaluate.py \
-        --annexdb bench/nyt256/results_annexdb.jsonl \
-        --competitors bench/nyt256/results_competitors.jsonl
+    python3 bench/glove100/evaluate.py \
+        --annexdb bench/glove100/results_annexdb.jsonl \
+        --competitors bench/glove100/results_competitors.jsonl
 
 Output:
-    - Pareto frontier table (recall@20 vs p50 latency)
-    - Full results CSV: bench/nyt256/results_all.csv
+    - Pareto frontier table (recall@10 vs p50 latency)
+    - Full results CSV: bench/glove100/results_all.csv
 """
 import argparse, json, csv, sys, datetime
 from pathlib import Path
@@ -37,14 +37,14 @@ def label(r):
     return f"{lib} {cfg} ef={ef}".strip()
 
 def _update_manifest(n_rows: int) -> None:
-    p = Path("bench/nyt256/manifest.json")
+    p = Path("bench/glove100/manifest.json")
     m = json.loads(p.read_text()) if p.exists() else {}
     m["combined"] = {"timestamp": datetime.datetime.now().isoformat(timespec="seconds"), "rows": n_rows}
     p.write_text(json.dumps(m, indent=2) + "\n")
 
 
 def _print_manifest_status() -> None:
-    p = Path("bench/nyt256/manifest.json")
+    p = Path("bench/glove100/manifest.json")
     if not p.exists():
         return
     m = json.loads(p.read_text())
@@ -62,9 +62,9 @@ def _print_manifest_status() -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--annexdb",     default="bench/nyt256/results_annexdb.jsonl")
-    parser.add_argument("--competitors", default="bench/nyt256/results_competitors.jsonl")
-    parser.add_argument("--csv-out",     default="bench/nyt256/results_all.csv")
+    parser.add_argument("--annexdb",     default="bench/glove100/results_annexdb.jsonl")
+    parser.add_argument("--competitors", default="bench/glove100/results_competitors.jsonl")
+    parser.add_argument("--csv-out",     default="bench/glove100/results_all.csv")
     args = parser.parse_args()
 
     all_rows = []
@@ -89,19 +89,19 @@ def main():
 
     # Pareto frontier
     front = pareto_front(all_rows)
-    print("═" * 70)
-    print("PARETO FRONTIER — recall@20 vs p50 latency, NYT-256-Angular")
-    print("═" * 70)
-    print(f"{'Engine':<40}  {'recall@20':>9}  {'p50 ms':>8}  {'p99 ms':>8}  {'QPS':>7}")
-    print("─" * 70)
+    print("=" * 70)
+    print("PARETO FRONTIER — recall@10 vs p50 latency, GloVe-100-Angular")
+    print("=" * 70)
+    print(f"{'Engine':<40}  {'recall@10':>9}  {'p50 ms':>8}  {'p99 ms':>8}  {'QPS':>7}")
+    print("-" * 70)
     for r in sorted(front, key=lambda x: -x["recall"]):
         print(f"{label(r):<40}  {r['recall']:>9.4f}  {r['p50_ms']:>8.3f}  "
               f"{r.get('p99_ms', 0):>8.3f}  {r.get('qps', 0):>7.0f}")
 
     # Recall-matched comparison at key targets
-    print("\n" + "═" * 70)
+    print("\n" + "=" * 70)
     print("RECALL-MATCHED COMPARISON (p50 ms to reach each recall target)")
-    print("═" * 70)
+    print("=" * 70)
     targets = [0.87, 0.90, 0.92, 0.94, 0.96]
     libs = sorted(set(r.get("lib", r.get("label", "?")) for r in all_rows))
 
@@ -109,7 +109,7 @@ def main():
     for lib in libs:
         print(f"  {lib[:14]:>14}", end="")
     print()
-    print("─" * 70)
+    print("-" * 70)
 
     for tgt in targets:
         print(f"{tgt:>8.2f}", end="")

@@ -1,0 +1,21 @@
+{
+  "annexdb": {
+    "timestamp": "2026-09-21T17:31:00",
+    "commit": "4b11157",
+    "branch": "perf/recall-frontier",
+    "rust": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "m_values": "16 24 32",
+    "ef_values": "32,64,128,256,512"
+  },
+  "competitors": {
+    "timestamp": "2026-09-30T10:08:05",
+    "rounds": 3,
+    "hnswlib": "0.8.0",
+    "usearch": "2.26.2",
+    "faiss": "1.15.1"
+  },
+  "combined": {
+    "timestamp": "2026-09-21T17:31:00",
+    "rows": 92
+  }
+}

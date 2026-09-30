@@ -3,13 +3,13 @@
 Merge ANNex and competitor results, compute Pareto frontier, print comparison table.
 
 Usage:
-    python3 bench/nyt256/evaluate.py \
-        --annexdb bench/nyt256/results_annexdb.jsonl \
-        --competitors bench/nyt256/results_competitors.jsonl
+    python3 bench/lastfm64/evaluate.py \
+        --annexdb bench/lastfm64/results_annexdb.jsonl \
+        --competitors bench/lastfm64/results_competitors.jsonl
 
 Output:
-    - Pareto frontier table (recall@20 vs p50 latency)
-    - Full results CSV: bench/nyt256/results_all.csv
+    - Pareto frontier table (recall@10 vs p50 latency)
+    - Full results CSV: bench/lastfm64/results_all.csv
 """
 import argparse, json, csv, sys, datetime
 from pathlib import Path
@@ -37,14 +37,14 @@ def label(r):
     return f"{lib} {cfg} ef={ef}".strip()
 
 def _update_manifest(n_rows: int) -> None:
-    p = Path("bench/nyt256/manifest.json")
+    p = Path("bench/lastfm64/manifest.json")
     m = json.loads(p.read_text()) if p.exists() else {}
     m["combined"] = {"timestamp": datetime.datetime.now().isoformat(timespec="seconds"), "rows": n_rows}
     p.write_text(json.dumps(m, indent=2) + "\n")
 
 
 def _print_manifest_status() -> None:
-    p = Path("bench/nyt256/manifest.json")
+    p = Path("bench/lastfm64/manifest.json")
     if not p.exists():
         return
     m = json.loads(p.read_text())
@@ -62,9 +62,9 @@ def _print_manifest_status() -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--annexdb",     default="bench/nyt256/results_annexdb.jsonl")
-    parser.add_argument("--competitors", default="bench/nyt256/results_competitors.jsonl")
-    parser.add_argument("--csv-out",     default="bench/nyt256/results_all.csv")
+    parser.add_argument("--annexdb",     default="bench/lastfm64/results_annexdb.jsonl")
+    parser.add_argument("--competitors", default="bench/lastfm64/results_competitors.jsonl")
+    parser.add_argument("--csv-out",     default="bench/lastfm64/results_all.csv")
     args = parser.parse_args()
 
     all_rows = []
@@ -74,7 +74,7 @@ def main():
         all_rows += load(args.competitors)
 
     if not all_rows:
-        print("No results found. Run run_annexdb.sh and run_competitors.py first.")
+        print("No results found. Run run_annexdb.sh and scripts/bench_competitors.py first.")
         sys.exit(1)
 
     # Write full CSV
@@ -90,9 +90,9 @@ def main():
     # Pareto frontier
     front = pareto_front(all_rows)
     print("═" * 70)
-    print("PARETO FRONTIER — recall@20 vs p50 latency, NYT-256-Angular")
+    print("PARETO FRONTIER — recall@10 vs p50 latency, LastFM-64-Dot")
     print("═" * 70)
-    print(f"{'Engine':<40}  {'recall@20':>9}  {'p50 ms':>8}  {'p99 ms':>8}  {'QPS':>7}")
+    print(f"{'Engine':<40}  {'recall@10':>9}  {'p50 ms':>8}  {'p99 ms':>8}  {'QPS':>7}")
     print("─" * 70)
     for r in sorted(front, key=lambda x: -x["recall"]):
         print(f"{label(r):<40}  {r['recall']:>9.4f}  {r['p50_ms']:>8.3f}  "

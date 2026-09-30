@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Download and convert the NYT-256-angular dataset from ann-benchmarks.
-# Requires: python3, numpy, h5py
+# Retired — use the central dataset fetcher instead:
+#   python3 scripts/fetch_dataset.py nytimes-256-angular [--record]
+# This script is kept only as a reference for the original conversion logic.
 set -euo pipefail
 
 DATADIR="data/nytimes-256-angular"

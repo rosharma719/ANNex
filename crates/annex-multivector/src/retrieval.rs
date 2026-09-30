@@ -997,6 +997,7 @@ impl MultiVectorIndex {
             )));
         }
         let normalized: Vec<_> = query.iter().map(|v| normalize(v)).collect();
+        let prepared = MaxSimQuery::new(&normalized, query[0].len());
         let scores = eligible
             .par_iter()
             .filter_map(|&id| {
@@ -1018,7 +1019,7 @@ impl MultiVectorIndex {
                 };
                 let vector = FixedVectorStore::get(s.record_fde(d), location, dimension * count)?;
                 let score = if multivector {
-                    maxsim_flat(&normalized, vector, dimension)
+                    prepared.score(vector, dimension)
                 } else {
                     dot(&normalized[0], vector)
                 };

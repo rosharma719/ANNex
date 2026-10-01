@@ -35,8 +35,7 @@ pub fn cpu_level() -> CpuLevel {
         if std::arch::is_x86_feature_detected!("avx512f") {
             return CpuLevel::Avx512F;
         }
-        if std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("fma")
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
             return CpuLevel::Avx2Fma;
         }
@@ -75,9 +74,17 @@ mod tests {
         let avx512f = std::arch::is_x86_feature_detected!("avx512f");
         let level = cpu_level();
         if avx512bf16 && avx512f {
-            assert_eq!(level, CpuLevel::Avx512Bf16, "avx512bf16 present but not selected");
+            assert_eq!(
+                level,
+                CpuLevel::Avx512Bf16,
+                "avx512bf16 present but not selected"
+            );
         } else {
-            assert_ne!(level, CpuLevel::Avx512Bf16, "avx512bf16 absent but incorrectly selected");
+            assert_ne!(
+                level,
+                CpuLevel::Avx512Bf16,
+                "avx512bf16 absent but incorrectly selected"
+            );
         }
     }
 }

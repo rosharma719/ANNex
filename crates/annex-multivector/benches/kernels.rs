@@ -66,7 +66,7 @@ fn bench_dot(c: &mut Criterion) {
 }
 
 fn bench_screen_dot(c: &mut Criterion) {
-    use annex::bench_access::{screen_dot_scalar, screen_dot_dispatch};
+    use annex::bench_access::{screen_dot_dispatch, screen_dot_scalar};
 
     let mut group = c.benchmark_group("screen_dot");
 
@@ -145,5 +145,11 @@ fn bench_maxsim_flat_bf16(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(kernels, bench_maxsim_flat, bench_dot, bench_screen_dot, bench_maxsim_flat_bf16);
+criterion_group!(
+    kernels,
+    bench_maxsim_flat,
+    bench_dot,
+    bench_screen_dot,
+    bench_maxsim_flat_bf16
+);
 criterion_main!(kernels);

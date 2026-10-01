@@ -449,7 +449,11 @@ impl HNSWIndex {
                                     let mut raws = [0.0f32; BATCH];
                                     {
                                         let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                            if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                            if i < batch_len {
+                                                vec_view.get(batch[i])
+                                            } else {
+                                                &[]
+                                            }
                                         });
                                         self.fast_score_many(query, &vecs[..batch_len], &mut raws);
                                     }
@@ -492,7 +496,11 @@ impl HNSWIndex {
                                 let mut raws = [0.0f32; BATCH];
                                 {
                                     let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                        if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                        if i < batch_len {
+                                            vec_view.get(batch[i])
+                                        } else {
+                                            &[]
+                                        }
                                     });
                                     self.fast_score_many(query, &vecs[..batch_len], &mut raws);
                                 }
@@ -567,7 +575,11 @@ impl HNSWIndex {
                                     let mut raws = [0.0f32; BATCH];
                                     {
                                         let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                            if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                            if i < batch_len {
+                                                vec_view.get(batch[i])
+                                            } else {
+                                                &[]
+                                            }
                                         });
                                         self.fast_score_many(query, &vecs[..batch_len], &mut raws);
                                     }
@@ -607,7 +619,11 @@ impl HNSWIndex {
                                 let mut raws = [0.0f32; BATCH];
                                 {
                                     let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                        if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                        if i < batch_len {
+                                            vec_view.get(batch[i])
+                                        } else {
+                                            &[]
+                                        }
                                     });
                                     self.fast_score_many(query, &vecs[..batch_len], &mut raws);
                                 }
@@ -692,7 +708,11 @@ impl HNSWIndex {
                                     let mut raws = [0.0f32; BATCH];
                                     {
                                         let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                            if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                            if i < batch_len {
+                                                vec_view.get(batch[i])
+                                            } else {
+                                                &[]
+                                            }
                                         });
                                         self.fast_score_many(query, &vecs[..batch_len], &mut raws);
                                     }
@@ -737,7 +757,11 @@ impl HNSWIndex {
                                 let mut raws = [0.0f32; BATCH];
                                 {
                                     let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                        if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                        if i < batch_len {
+                                            vec_view.get(batch[i])
+                                        } else {
+                                            &[]
+                                        }
                                     });
                                     self.fast_score_many(query, &vecs[..batch_len], &mut raws);
                                 }
@@ -834,9 +858,17 @@ impl HNSWIndex {
                                         let mut raws = [0.0f32; BATCH];
                                         {
                                             let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                                if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                                if i < batch_len {
+                                                    vec_view.get(batch[i])
+                                                } else {
+                                                    &[]
+                                                }
                                             });
-                                            self.fast_score_many(query, &vecs[..batch_len], &mut raws);
+                                            self.fast_score_many(
+                                                query,
+                                                &vecs[..batch_len],
+                                                &mut raws,
+                                            );
                                         }
                                         for i in 0..batch_len {
                                             let idx = batch[i];
@@ -899,7 +931,11 @@ impl HNSWIndex {
                                     let mut raws = [0.0f32; BATCH];
                                     {
                                         let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                            if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                            if i < batch_len {
+                                                vec_view.get(batch[i])
+                                            } else {
+                                                &[]
+                                            }
                                         });
                                         self.fast_score_many(query, &vecs[..batch_len], &mut raws);
                                     }

@@ -1131,25 +1131,41 @@ unsafe fn dot_avx512_bf16(a: *const f32, b: *const f32, len: usize) -> f32 {
         let a1 = _mm512_loadu_ps(a.add(i + 16));
         let b0 = _mm512_loadu_ps(b.add(i));
         let b1 = _mm512_loadu_ps(b.add(i + 16));
-        acc0 = _mm512_dpbf16_ps(acc0, _mm512_cvtne2ps_pbh(a1, a0), _mm512_cvtne2ps_pbh(b1, b0));
+        acc0 = _mm512_dpbf16_ps(
+            acc0,
+            _mm512_cvtne2ps_pbh(a1, a0),
+            _mm512_cvtne2ps_pbh(b1, b0),
+        );
 
         let a2 = _mm512_loadu_ps(a.add(i + 32));
         let a3 = _mm512_loadu_ps(a.add(i + 48));
         let b2 = _mm512_loadu_ps(b.add(i + 32));
         let b3 = _mm512_loadu_ps(b.add(i + 48));
-        acc1 = _mm512_dpbf16_ps(acc1, _mm512_cvtne2ps_pbh(a3, a2), _mm512_cvtne2ps_pbh(b3, b2));
+        acc1 = _mm512_dpbf16_ps(
+            acc1,
+            _mm512_cvtne2ps_pbh(a3, a2),
+            _mm512_cvtne2ps_pbh(b3, b2),
+        );
 
         let a4 = _mm512_loadu_ps(a.add(i + 64));
         let a5 = _mm512_loadu_ps(a.add(i + 80));
         let b4 = _mm512_loadu_ps(b.add(i + 64));
         let b5 = _mm512_loadu_ps(b.add(i + 80));
-        acc2 = _mm512_dpbf16_ps(acc2, _mm512_cvtne2ps_pbh(a5, a4), _mm512_cvtne2ps_pbh(b5, b4));
+        acc2 = _mm512_dpbf16_ps(
+            acc2,
+            _mm512_cvtne2ps_pbh(a5, a4),
+            _mm512_cvtne2ps_pbh(b5, b4),
+        );
 
         let a6 = _mm512_loadu_ps(a.add(i + 96));
         let a7 = _mm512_loadu_ps(a.add(i + 112));
         let b6 = _mm512_loadu_ps(b.add(i + 96));
         let b7 = _mm512_loadu_ps(b.add(i + 112));
-        acc3 = _mm512_dpbf16_ps(acc3, _mm512_cvtne2ps_pbh(a7, a6), _mm512_cvtne2ps_pbh(b7, b6));
+        acc3 = _mm512_dpbf16_ps(
+            acc3,
+            _mm512_cvtne2ps_pbh(a7, a6),
+            _mm512_cvtne2ps_pbh(b7, b6),
+        );
         i += 128;
     }
     while i + 32 <= len {
@@ -1157,7 +1173,11 @@ unsafe fn dot_avx512_bf16(a: *const f32, b: *const f32, len: usize) -> f32 {
         let a1 = _mm512_loadu_ps(a.add(i + 16));
         let b0 = _mm512_loadu_ps(b.add(i));
         let b1 = _mm512_loadu_ps(b.add(i + 16));
-        acc0 = _mm512_dpbf16_ps(acc0, _mm512_cvtne2ps_pbh(a1, a0), _mm512_cvtne2ps_pbh(b1, b0));
+        acc0 = _mm512_dpbf16_ps(
+            acc0,
+            _mm512_cvtne2ps_pbh(a1, a0),
+            _mm512_cvtne2ps_pbh(b1, b0),
+        );
         i += 32;
     }
     acc0 = _mm512_add_ps(acc0, acc1);
@@ -1201,7 +1221,12 @@ unsafe fn dot_many_avx512(query: &[f32], vecs: &[&[f32]], out: &mut [f32]) {
             g += group.len();
             continue;
         }
-        let p = [group[0].as_ptr(), group[1].as_ptr(), group[2].as_ptr(), group[3].as_ptr()];
+        let p = [
+            group[0].as_ptr(),
+            group[1].as_ptr(),
+            group[2].as_ptr(),
+            group[3].as_ptr(),
+        ];
         let mut a = [_mm512_setzero_ps(); 4];
         let mut b = [_mm512_setzero_ps(); 4];
         let mut i = 0;
@@ -1209,14 +1234,16 @@ unsafe fn dot_many_avx512(query: &[f32], vecs: &[&[f32]], out: &mut [f32]) {
             let q0 = _mm512_loadu_ps(q.add(i));
             let q1 = _mm512_loadu_ps(q.add(i + 16));
             for j in 0..4 {
-                a[j] = _mm512_fmadd_ps(q0, _mm512_loadu_ps(p[j].add(i)),      a[j]);
+                a[j] = _mm512_fmadd_ps(q0, _mm512_loadu_ps(p[j].add(i)), a[j]);
                 b[j] = _mm512_fmadd_ps(q1, _mm512_loadu_ps(p[j].add(i + 16)), b[j]);
             }
             i += 32;
         }
         while i + 16 <= n {
             let q0 = _mm512_loadu_ps(q.add(i));
-            for j in 0..4 { a[j] = _mm512_fmadd_ps(q0, _mm512_loadu_ps(p[j].add(i)), a[j]); }
+            for j in 0..4 {
+                a[j] = _mm512_fmadd_ps(q0, _mm512_loadu_ps(p[j].add(i)), a[j]);
+            }
             i += 16;
         }
         let tail_start = i;
@@ -1224,7 +1251,10 @@ unsafe fn dot_many_avx512(query: &[f32], vecs: &[&[f32]], out: &mut [f32]) {
             let s = _mm512_add_ps(a[j], b[j]);
             let mut acc = _mm512_reduce_add_ps(s);
             let mut k = tail_start;
-            while k < n { acc += *q.add(k) * *p[j].add(k); k += 1; }
+            while k < n {
+                acc += *q.add(k) * *p[j].add(k);
+                k += 1;
+            }
             out[g + j] = acc;
         }
         g += 4;
@@ -1242,11 +1272,18 @@ unsafe fn dot_many_avx2_fma(query: &[f32], vecs: &[&[f32]], out: &mut [f32]) {
     while g < vecs.len() {
         let group = &vecs[g..(g + 4).min(vecs.len())];
         if group.len() < 4 || group.iter().any(|v| v.len() < n) {
-            for (o, v) in out[g..].iter_mut().zip(group) { *o = dot_avx2_fma(query, v); }
+            for (o, v) in out[g..].iter_mut().zip(group) {
+                *o = dot_avx2_fma(query, v);
+            }
             g += group.len();
             continue;
         }
-        let p = [group[0].as_ptr(), group[1].as_ptr(), group[2].as_ptr(), group[3].as_ptr()];
+        let p = [
+            group[0].as_ptr(),
+            group[1].as_ptr(),
+            group[2].as_ptr(),
+            group[3].as_ptr(),
+        ];
         let mut a = [_mm256_setzero_ps(); 4];
         let mut b = [_mm256_setzero_ps(); 4];
         let mut i = 0;
@@ -1254,14 +1291,14 @@ unsafe fn dot_many_avx2_fma(query: &[f32], vecs: &[&[f32]], out: &mut [f32]) {
             let q0 = _mm256_loadu_ps(q.add(i));
             let q1 = _mm256_loadu_ps(q.add(i + 8));
             for j in 0..4 {
-                a[j] = _mm256_fmadd_ps(q0, _mm256_loadu_ps(p[j].add(i)),     a[j]);
+                a[j] = _mm256_fmadd_ps(q0, _mm256_loadu_ps(p[j].add(i)), a[j]);
                 b[j] = _mm256_fmadd_ps(q1, _mm256_loadu_ps(p[j].add(i + 8)), b[j]);
             }
             i += 16;
         }
         let tail_start = i;
         for j in 0..4 {
-            let s  = _mm256_add_ps(a[j], b[j]);
+            let s = _mm256_add_ps(a[j], b[j]);
             let hi = _mm256_extractf128_ps(s, 1);
             let lo = _mm256_castps256_ps128(s);
             let sum = _mm_add_ps(hi, lo);
@@ -1270,7 +1307,10 @@ unsafe fn dot_many_avx2_fma(query: &[f32], vecs: &[&[f32]], out: &mut [f32]) {
             let shuf2 = _mm_shuffle_ps(sums, sums, 1);
             let mut acc = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
             let mut k = tail_start;
-            while k < n { acc += *q.add(k) * *p[j].add(k); k += 1; }
+            while k < n {
+                acc += *q.add(k) * *p[j].add(k);
+                k += 1;
+            }
             out[g + j] = acc;
         }
         g += 4;
@@ -2006,8 +2046,8 @@ impl HNSWIndex {}
 /// Re-exports for micro-benchmarks. Not part of the public API.
 #[cfg(feature = "bench-internals")]
 pub mod bench_access {
-    pub use super::screen_dot_scalar;
     pub use super::HNSWIndex;
+    pub use super::screen_dot_scalar;
 
     /// Thin public wrapper around the crate-private `screen_dot` dispatch.
     pub fn screen_dot_dispatch(query_i8: &[i8], stored: &[u8]) -> i32 {
@@ -2092,7 +2132,9 @@ mod tests {
             assert!(available, "required x86 feature is unavailable: {feature}");
         }
 
-        eprintln!("x86 kernel coverage: avx2={avx2} fma={fma} avx512f={avx512f} avx512vnni={avx512vnni}");
+        eprintln!(
+            "x86 kernel coverage: avx2={avx2} fma={fma} avx512f={avx512f} avx512vnni={avx512vnni}"
+        );
         for &dim in &[
             0, 1, 7, 8, 9, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1537,
         ] {
@@ -2300,7 +2342,9 @@ mod tests {
             close(bf16_val, ref_val);
         }
         let len = 512usize;
-        let a: Vec<f32> = (0..len).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let a: Vec<f32> = (0..len)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
         let b = a.clone();
         let ref_val = dot_scalar(&a, &b);
         let bf16_val = unsafe { dot_avx512_bf16(a.as_ptr(), b.as_ptr(), len) };
@@ -2325,7 +2369,12 @@ mod tests {
         idx.fast_score_many(&q, &vref, &mut out);
         for (i, v) in vs.iter().enumerate() {
             let single = idx.fast_score(&q, v);
-            assert!((out[i] - single).abs() < 1e-3, "many[{i}]={} single={}", out[i], single);
+            assert!(
+                (out[i] - single).abs() < 1e-3,
+                "many[{i}]={} single={}",
+                out[i],
+                single
+            );
         }
     }
 
@@ -2371,8 +2420,12 @@ mod tests {
             (vec![-1i8; 256], vec![128u8; 256]),
             // cycle through extreme values across 256 elements
             (
-                (0..256).map(|i| [-128i8, -127, -1, 0, 1, 126, 127][i % 7]).collect(),
-                (0..256).map(|i| [0u8, 1, 127, 128, 129, 254, 255][i % 7]).collect(),
+                (0..256)
+                    .map(|i| [-128i8, -127, -1, 0, 1, 126, 127][i % 7])
+                    .collect(),
+                (0..256)
+                    .map(|i| [0u8, 1, 127, 128, 129, 254, 255][i % 7])
+                    .collect(),
             ),
             // mismatched lengths (min contract)
             (vec![10i8; 17], vec![130u8; 32]),
@@ -2386,11 +2439,23 @@ mod tests {
             let reference = screen_dot_scalar(q, s);
             if avx2 {
                 let result = unsafe { screen_dot_avx2(q, s) };
-                assert_eq!(result, reference, "AVX2 mismatch: q_len={} s_len={}", q.len(), s.len());
+                assert_eq!(
+                    result,
+                    reference,
+                    "AVX2 mismatch: q_len={} s_len={}",
+                    q.len(),
+                    s.len()
+                );
             }
             if avx512f && avx512vnni {
                 let result = unsafe { screen_dot_avx512_vnni(q, s) };
-                assert_eq!(result, reference, "VNNI mismatch: q_len={} s_len={}", q.len(), s.len());
+                assert_eq!(
+                    result,
+                    reference,
+                    "VNNI mismatch: q_len={} s_len={}",
+                    q.len(),
+                    s.len()
+                );
             }
         }
     }

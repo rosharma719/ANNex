@@ -30,12 +30,13 @@ fn flat(document: &[Vec<f32>]) -> Vec<f32> {
 
 fn bench_maxsim_flat(c: &mut Criterion) {
     let mut group = c.benchmark_group("maxsim_flat");
-    // ColBERTv2 shape: 32 query tokens x ~200 doc tokens x 128 dims. Sizes
-    // chosen to match the FiQA/Scifact rescoring workload.
+    // Covers standard ColBERT/E5/MPNet/instructor embedding dimensions.
     for &(dim, doc_tokens, query_tokens) in &[
         (128usize, 200usize, 32usize),
         (128, 100, 32),
-        (384, 200, 32), // E5/MPNet dim
+        (384, 200, 32),
+        (512, 200, 32),
+        (768, 200, 32),
     ] {
         let mut rng_state = 0xdead_beef_cafe_babe_u64;
         let doc_matrix = gen_normalized(&mut rng_state, dim, doc_tokens);
@@ -54,7 +55,6 @@ fn bench_maxsim_flat(c: &mut Criterion) {
 fn bench_dot(c: &mut Criterion) {
     use multivector::maxsim;
     let mut group = c.benchmark_group("maxsim_naive");
-    // A tiny 8-token x 8-token maxsim to bound the naive (non-flat) path.
     let mut rng_state = 0xfeed_face_dead_beef_u64;
     let query = gen_normalized(&mut rng_state, 128, 8);
     let doc = gen_normalized(&mut rng_state, 128, 8);
@@ -65,5 +65,50 @@ fn bench_dot(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(kernels, bench_maxsim_flat, bench_dot);
+fn bench_screen_dot(c: &mut Criterion) {
+    use annex::bench_access::screen_dot_scalar;
+
+    let mut group = c.benchmark_group("screen_dot");
+
+    for &dim in &[128usize, 256, 768] {
+        let mut rng = 0xdead_beef_u64;
+        let query_i8: Vec<i8> = (0..dim)
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng as i8).wrapping_add(1)
+            })
+            .collect();
+        let stored_u8: Vec<u8> = (0..dim)
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng as u8
+            })
+            .collect();
+
+        group.throughput(Throughput::Elements(dim as u64));
+
+        // Scalar reference.
+        let q = query_i8.clone();
+        let s = stored_u8.clone();
+        let label = format!("scalar/dim={dim}");
+        group.bench_function(&label, |b| {
+            b.iter(|| screen_dot_scalar(black_box(&q), black_box(&s)))
+        });
+
+        // Public dispatch (routes to best available kernel).
+        let q2 = query_i8.clone();
+        let s2 = stored_u8.clone();
+        let label = format!("dispatch/dim={dim}");
+        group.bench_function(&label, |b| {
+            b.iter(|| annex::vector::hnsw::HNSWIndex::screen_dot(black_box(&q2), black_box(&s2)))
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(kernels, bench_maxsim_flat, bench_dot, bench_screen_dot);
 criterion_main!(kernels);

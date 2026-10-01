@@ -744,12 +744,14 @@ impl HNSWIndex {
     }
 }
 
+#[allow(dead_code)]
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn dot_product(query: &[f32], vec: &[f32]) -> f32 {
     unsafe { dot_neon(query, vec) }
 }
 
+#[allow(dead_code)]
 #[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
 #[inline]
 fn dot_product(query: &[f32], vec: &[f32]) -> f32 {
@@ -762,18 +764,21 @@ fn dot_product(query: &[f32], vec: &[f32]) -> f32 {
     }
 }
 
+#[allow(dead_code)]
 #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
 #[inline]
 fn dot_product(query: &[f32], vec: &[f32]) -> f32 {
     dot_scalar(query, vec)
 }
 
+#[allow(dead_code)]
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn l2_squared(query: &[f32], vec: &[f32]) -> f32 {
     unsafe { l2_neon(query, vec) }
 }
 
+#[allow(dead_code)]
 #[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
 #[inline]
 fn l2_squared(query: &[f32], vec: &[f32]) -> f32 {
@@ -786,6 +791,7 @@ fn l2_squared(query: &[f32], vec: &[f32]) -> f32 {
     }
 }
 
+#[allow(dead_code)]
 #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
 #[inline]
 fn l2_squared(query: &[f32], vec: &[f32]) -> f32 {
@@ -1578,7 +1584,7 @@ impl HNSWIndex {
     /// Dispatches to NEON sdot on aarch64 (4 cache lines vs 16 for f32), scalar fallback
     /// elsewhere. Monotone with true cosine similarity — higher = closer.
     #[inline]
-    pub(crate) fn screen_dot(query_i8: &[i8], stored: &[u8]) -> i32 {
+    pub fn screen_dot(query_i8: &[i8], stored: &[u8]) -> i32 {
         #[cfg(target_arch = "aarch64")]
         if std::arch::is_aarch64_feature_detected!("dotprod") {
             return unsafe { screen_dot_neon_sdot(query_i8, stored) };
@@ -1591,7 +1597,7 @@ impl HNSWIndex {
     }
 }
 
-fn screen_dot_scalar(query_i8: &[i8], stored: &[u8]) -> i32 {
+pub fn screen_dot_scalar(query_i8: &[i8], stored: &[u8]) -> i32 {
     let n = query_i8.len().min(stored.len());
     let mut a = [0i32; 4];
     let mut i = 0;
@@ -1764,8 +1770,6 @@ impl HNSWIndex {}
 #[cfg(feature = "bench-internals")]
 pub mod bench_access {
     pub use super::screen_dot_scalar;
-    #[cfg(target_arch = "x86_64")]
-    pub use super::{screen_dot_avx2, screen_dot_avx512_vnni};
     pub use super::HNSWIndex;
 }
 
@@ -2012,7 +2016,7 @@ mod tests {
 
     #[test]
     fn fast_score_works_after_snapshot_round_trip() {
-        let mut idx = HNSWIndex::new(DistanceMetric::Cosine, 4, 8, 4, 4);
+        let idx = HNSWIndex::new(DistanceMetric::Cosine, 4, 8, 4, 4);
         idx.insert(1, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.insert(2, vec![0.0, 1.0, 0.0, 0.0]).unwrap();
         let snap = idx.to_snapshot();

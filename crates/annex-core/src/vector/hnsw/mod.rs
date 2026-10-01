@@ -12,3 +12,5 @@ mod types;
 pub use core::{HNSWIndex, HnswConfigSummary, HnswSnapshot};
 pub use stats::SearchStats;
 pub use types::{ScoredPoint, SearchRuntimeOptions};
+#[cfg(feature = "bench-internals")]
+pub use core::bench_access;

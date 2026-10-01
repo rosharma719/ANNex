@@ -1,3 +1,4 @@
+#[cfg(target_arch = "x86_64")]
 use annex::vector::simd::{CpuLevel, cpu_level};
 
 pub type Vector = Vec<f32>;

@@ -75,7 +75,5 @@ pub use crate::utils::types::{DistanceMetric, PointId, Score, Vector};
 pub use crate::vector::hnsw::arena::{
     ChunkedArray, ChunkedArrayView, VectorArena, VectorArenaView,
 };
-#[cfg(feature = "bench-internals")]
-pub use crate::vector::hnsw::bench_access;
 pub use crate::vector::hnsw::{ScoredPoint, SearchRuntimeOptions};
 pub use crate::vector::sparse::{SparseIndex, SparseVector};

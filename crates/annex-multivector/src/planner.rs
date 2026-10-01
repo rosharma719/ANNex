@@ -529,12 +529,23 @@ impl MultiVectorIndex {
                     let n = stats.documents.max(1) as f64;
                     let f = eligible_documents.max(1) as f64;
                     let filtered = request.filter.is_some();
+                    let filter_supported = request
+                        .filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.ann_filter().is_some());
+                    if backend == "hnsw" && !filter_supported {
+                        return Err(invalid("filter is not supported by dense HNSW"));
+                    }
                     let cost_exact = f * dim * 2.0;
-                    let cost_hnsw = ef * n.log2().ceil().max(1.0) * dim * 3.0;
+                    let mut cost_hnsw = ef * n.log2().ceil().max(1.0) * dim * 3.0;
+                    if filtered {
+                        let selectivity = (f / n).clamp(0.01, 1.0);
+                        cost_hnsw /= selectivity.sqrt();
+                    }
                     let (operator, reason) = choose_ann_with_cost(
                         backend,
-                        filtered,
                         ann_ready,
+                        filter_supported,
                         PhysicalOperator::ExactDense,
                         PhysicalOperator::HnswDense,
                         cost_exact,
@@ -605,12 +616,23 @@ impl MultiVectorIndex {
                     let n = stats.documents.max(1) as f64;
                     let f = eligible_documents.max(1) as f64;
                     let filtered = request.filter.is_some();
+                    let filter_supported = request
+                        .filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.ann_filter().is_some());
+                    if backend == "hnsw" && !filter_supported {
+                        return Err(invalid("filter is not supported by FDE HNSW"));
+                    }
                     let cost_exact = f * fde_dim * 2.0;
-                    let cost_hnsw = ef * n.log2().ceil().max(1.0) * fde_dim * 3.0;
+                    let mut cost_hnsw = ef * n.log2().ceil().max(1.0) * fde_dim * 3.0;
+                    if filtered {
+                        let selectivity = (f / n).clamp(0.01, 1.0);
+                        cost_hnsw /= selectivity.sqrt();
+                    }
                     let (operator, reason) = choose_ann_with_cost(
                         backend,
-                        filtered,
                         ann_ready,
+                        filter_supported,
                         PhysicalOperator::ExactFde,
                         PhysicalOperator::HnswFde,
                         cost_exact,
@@ -835,8 +857,8 @@ pub(super) fn planner_stats(
 /// or the inline formulas in `compile_plan`).
 fn choose_ann_with_cost(
     backend: &str,
-    filtered: bool,
     ann_ready: bool,
+    ann_supported: bool,
     exact: PhysicalOperator,
     ann: PhysicalOperator,
     cost_exact: f64,
@@ -845,11 +867,11 @@ fn choose_ann_with_cost(
     if backend == "exact" {
         return (exact, PlanReason::RequestedExact);
     }
-    if filtered {
-        return (exact, PlanReason::FilterRequiresExact);
-    }
     if !ann_ready {
         return (exact, PlanReason::AnnUnavailable);
+    }
+    if !ann_supported {
+        return (exact, PlanReason::FilterRequiresExact);
     }
     // ANN is available — choose by cost model.
     if cost_exact <= cost_hnsw {

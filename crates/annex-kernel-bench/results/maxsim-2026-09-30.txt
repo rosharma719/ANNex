@@ -1,0 +1,111 @@
+    Finished `bench` profile [optimized] target(s) in 0.11s
+     Running benches/maxsim.rs (target/release/deps/maxsim-5d7c4ec411cbf941)
+maxsim/annex/d128/n200/q32
+                        time:   [14.113 µs 15.337 µs 16.641 µs]
+                        thrpt:  [98.453 Gelem/s 106.83 Gelem/s 116.09 Gelem/s]
+maxsim/annex-prepared/d128/n200/q32
+                        time:   [10.324 µs 10.821 µs 11.528 µs]
+                        thrpt:  [142.12 Gelem/s 151.40 Gelem/s 158.70 Gelem/s]
+maxsim/legacy/d128/n200/q32
+                        time:   [413.45 µs 427.11 µs 442.79 µs]
+                        thrpt:  [3.7002 Gelem/s 3.8360 Gelem/s 3.9627 Gelem/s]
+maxsim/simsimd/d128/n200/q32
+                        time:   [70.608 µs 74.154 µs 78.771 µs]
+                        thrpt:  [20.799 Gelem/s 22.095 Gelem/s 23.204 Gelem/s]
+maxsim/ndarray-gemm/d128/n200/q32
+                        time:   [29.533 µs 31.040 µs 33.001 µs]
+                        thrpt:  [49.647 Gelem/s 52.783 Gelem/s 55.477 Gelem/s]
+maxsim/openblas-gemm/d128/n200/q32
+                        time:   [22.723 µs 23.126 µs 23.610 µs]
+                        thrpt:  [69.395 Gelem/s 70.846 Gelem/s 72.105 Gelem/s]
+maxsim/annex/d128/n100/q32
+                        time:   [8.6787 µs 9.0213 µs 9.3834 µs]
+                        thrpt:  [87.303 Gelem/s 90.807 Gelem/s 94.392 Gelem/s]
+maxsim/annex-prepared/d128/n100/q32
+                        time:   [5.0344 µs 5.1468 µs 5.2943 µs]
+                        thrpt:  [154.73 Gelem/s 159.17 Gelem/s 162.72 Gelem/s]
+maxsim/legacy/d128/n100/q32
+                        time:   [198.59 µs 205.85 µs 214.54 µs]
+                        thrpt:  [3.8184 Gelem/s 3.9797 Gelem/s 4.1250 Gelem/s]
+maxsim/simsimd/d128/n100/q32
+                        time:   [31.944 µs 35.515 µs 39.379 µs]
+                        thrpt:  [20.803 Gelem/s 23.066 Gelem/s 25.645 Gelem/s]
+maxsim/ndarray-gemm/d128/n100/q32
+                        time:   [16.716 µs 17.100 µs 17.427 µs]
+                        thrpt:  [47.009 Gelem/s 47.908 Gelem/s 49.006 Gelem/s]
+maxsim/openblas-gemm/d128/n100/q32
+                        time:   [13.863 µs 14.631 µs 15.377 µs]
+                        thrpt:  [53.273 Gelem/s 55.989 Gelem/s 59.091 Gelem/s]
+maxsim/annex/d128/n300/q32
+                        time:   [19.463 µs 20.115 µs 20.983 µs]
+                        thrpt:  [117.12 Gelem/s 122.18 Gelem/s 126.27 Gelem/s]
+maxsim/annex-prepared/d128/n300/q32
+                        time:   [14.088 µs 14.593 µs 15.210 µs]
+                        thrpt:  [161.58 Gelem/s 168.41 Gelem/s 174.44 Gelem/s]
+maxsim/legacy/d128/n300/q32
+                        time:   [599.26 µs 616.91 µs 634.19 µs]
+                        thrpt:  [3.8752 Gelem/s 3.9838 Gelem/s 4.1010 Gelem/s]
+maxsim/simsimd/d128/n300/q32
+                        time:   [119.62 µs 124.19 µs 129.53 µs]
+                        thrpt:  [18.973 Gelem/s 19.789 Gelem/s 20.545 Gelem/s]
+maxsim/ndarray-gemm/d128/n300/q32
+                        time:   [43.167 µs 44.099 µs 45.253 µs]
+                        thrpt:  [54.308 Gelem/s 55.729 Gelem/s 56.932 Gelem/s]
+maxsim/openblas-gemm/d128/n300/q32
+                        time:   [34.198 µs 35.242 µs 36.135 µs]
+                        thrpt:  [68.011 Gelem/s 69.736 Gelem/s 71.865 Gelem/s]
+maxsim/annex/d96/n200/q32
+                        time:   [10.420 µs 10.869 µs 11.501 µs]
+                        thrpt:  [106.84 Gelem/s 113.06 Gelem/s 117.92 Gelem/s]
+maxsim/annex-prepared/d96/n200/q32
+                        time:   [7.2698 µs 7.6592 µs 8.1356 µs]
+                        thrpt:  [151.04 Gelem/s 160.44 Gelem/s 169.03 Gelem/s]
+maxsim/legacy/d96/n200/q32
+                        time:   [294.33 µs 310.23 µs 328.57 µs]
+                        thrpt:  [3.7399 Gelem/s 3.9609 Gelem/s 4.1749 Gelem/s]
+maxsim/simsimd/d96/n200/q32
+                        time:   [66.499 µs 69.691 µs 73.428 µs]
+                        thrpt:  [16.735 Gelem/s 17.632 Gelem/s 18.478 Gelem/s]
+maxsim/ndarray-gemm/d96/n200/q32
+                        time:   [23.392 µs 24.033 µs 24.894 µs]
+                        thrpt:  [49.360 Gelem/s 51.131 Gelem/s 52.530 Gelem/s]
+maxsim/openblas-gemm/d96/n200/q32
+                        time:   [18.005 µs 18.424 µs 19.037 µs]
+                        thrpt:  [64.548 Gelem/s 66.694 Gelem/s 68.249 Gelem/s]
+maxsim/annex/d384/n200/q32
+                        time:   [41.123 µs 42.067 µs 43.375 µs]
+                        thrpt:  [113.32 Gelem/s 116.84 Gelem/s 119.52 Gelem/s]
+maxsim/annex-prepared/d384/n200/q32
+                        time:   [29.172 µs 30.972 µs 33.537 µs]
+                        thrpt:  [146.56 Gelem/s 158.70 Gelem/s 168.49 Gelem/s]
+maxsim/legacy/d384/n200/q32
+                        time:   [1.4074 ms 1.4326 ms 1.4683 ms]
+                        thrpt:  [3.3476 Gelem/s 3.4309 Gelem/s 3.4925 Gelem/s]
+maxsim/simsimd/d384/n200/q32
+                        time:   [204.22 µs 210.40 µs 218.06 µs]
+                        thrpt:  [22.541 Gelem/s 23.361 Gelem/s 24.068 Gelem/s]
+maxsim/ndarray-gemm/d384/n200/q32
+                        time:   [87.023 µs 88.263 µs 90.013 µs]
+                        thrpt:  [54.606 Gelem/s 55.688 Gelem/s 56.482 Gelem/s]
+maxsim/openblas-gemm/d384/n200/q32
+                        time:   [67.930 µs 70.658 µs 74.087 µs]
+                        thrpt:  [66.344 Gelem/s 69.563 Gelem/s 72.357 Gelem/s]
+maxsim/annex/d128/n200/q8
+                        time:   [6.5568 µs 7.0265 µs 7.5748 µs]
+                        thrpt:  [54.074 Gelem/s 58.294 Gelem/s 62.469 Gelem/s]
+maxsim/annex-prepared/d128/n200/q8
+                        time:   [5.6820 µs 5.7841 µs 5.8796 µs]
+                        thrpt:  [69.664 Gelem/s 70.815 Gelem/s 72.087 Gelem/s]
+maxsim/legacy/d128/n200/q8
+                        time:   [107.47 µs 111.70 µs 116.65 µs]
+                        thrpt:  [3.5113 Gelem/s 3.6671 Gelem/s 3.8114 Gelem/s]
+maxsim/simsimd/d128/n200/q8
+                        time:   [21.078 µs 22.285 µs 23.883 µs]
+                        thrpt:  [17.150 Gelem/s 18.380 Gelem/s 19.433 Gelem/s]
+maxsim/ndarray-gemm/d128/n200/q8
+                        time:   [12.131 µs 12.557 µs 13.157 µs]
+                        thrpt:  [31.131 Gelem/s 32.620 Gelem/s 33.765 Gelem/s]
+maxsim/openblas-gemm/d128/n200/q8
+                        time:   [13.170 µs 13.312 µs 13.501 µs]
+                        thrpt:  [30.339 Gelem/s 30.769 Gelem/s 31.102 Gelem/s]
+

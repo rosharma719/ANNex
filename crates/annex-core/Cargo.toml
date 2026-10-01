@@ -22,9 +22,6 @@ exclude = [
     ".claude/*",
 ]
 
-[features]
-bench-internals = []
-
 [lib]
 name = "annex"
 

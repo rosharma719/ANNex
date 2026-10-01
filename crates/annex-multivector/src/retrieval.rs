@@ -84,6 +84,83 @@ struct MetadataKey {
     value: String,
 }
 
+/// Candidate document numbers produced by the metadata index. Sparse matches
+/// stay in a sorted vector; dense matches use one bit per allocated document
+/// number. This avoids a `HashSet` allocation per boolean-filter operation and
+/// keeps membership checks cheap for lexical, sparse, exact, and ANN overlays.
+#[derive(Clone, Debug)]
+pub(super) enum DocSet {
+    Sparse(Vec<u64>),
+    Bitmap { words: Vec<u64>, len: usize },
+}
+
+impl DocSet {
+    fn from_numbers<I>(next_id: u64, numbers: I) -> Self
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let mut ids: Vec<_> = numbers.into_iter().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let word_count = usize::try_from(next_id.saturating_add(63) / 64).unwrap_or(usize::MAX);
+        // A sparse u64 vector costs eight bytes per match. Prefer a bitmap once
+        // it is no larger, while avoiding a large bitmap after heavy churn.
+        if word_count > 0 && word_count <= ids.len() {
+            let mut words = vec![0; word_count];
+            for &id in &ids {
+                let word = (id / 64) as usize;
+                if word < words.len() {
+                    words[word] |= 1_u64 << (id % 64);
+                }
+            }
+            Self::Bitmap {
+                words,
+                len: ids.len(),
+            }
+        } else {
+            Self::Sparse(ids)
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        match self {
+            Self::Sparse(ids) => ids.len(),
+            Self::Bitmap { len, .. } => *len,
+        }
+    }
+
+    pub(super) fn contains(&self, id: u64) -> bool {
+        match self {
+            Self::Sparse(ids) => ids.binary_search(&id).is_ok(),
+            Self::Bitmap { words, .. } => words
+                .get((id / 64) as usize)
+                .is_some_and(|word| word & (1_u64 << (id % 64)) != 0),
+        }
+    }
+
+    pub(super) fn iter(&self) -> Box<dyn Iterator<Item = u64> + '_> {
+        match self {
+            Self::Sparse(ids) => Box::new(ids.iter().copied()),
+            Self::Bitmap { words, .. } => Box::new(words.iter().enumerate().flat_map(
+                |(word_index, &word)| {
+                    (0..64).filter_map(move |bit| {
+                        (word & (1_u64 << bit) != 0)
+                            .then_some((word_index as u64) * 64 + bit)
+                    })
+                },
+            )),
+        }
+    }
+
+    fn intersection(self, other: &Self, next_id: u64) -> Self {
+        Self::from_numbers(next_id, self.iter().filter(|id| other.contains(*id)))
+    }
+
+    fn union(self, other: Self, next_id: u64) -> Self {
+        Self::from_numbers(next_id, self.iter().chain(other.iter()))
+    }
+}
+
 fn pointer_escape(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
@@ -363,51 +440,73 @@ impl RetrievalState {
         Ok(())
     }
 
-    fn indexed_filter_numbers(&self, filter: &Predicate) -> Option<HashSet<u64>> {
+    fn indexed_filter_numbers(&self, filter: &Predicate) -> Option<DocSet> {
         match filter {
             Predicate::Eq { field, value } => {
                 let key = scalar_key(&predicate_pointer(field), value)?;
-                Some(self.metadata_eq.get(&key).cloned().unwrap_or_default())
+                Some(DocSet::from_numbers(
+                    self.next_id,
+                    self.metadata_eq
+                        .get(&key)
+                        .into_iter()
+                        .flat_map(|ids| ids.iter().copied()),
+                ))
             }
             Predicate::In { field, values } => {
                 let pointer = predicate_pointer(field);
-                let mut ids = HashSet::new();
+                let mut ids = Vec::new();
                 for value in values {
                     let key = scalar_key(&pointer, value)?;
                     if let Some(matches) = self.metadata_membership.get(&key) {
-                        ids.extend(matches);
+                        ids.extend(matches.iter().copied());
                     }
                 }
-                Some(ids)
+                Some(DocSet::from_numbers(self.next_id, ids))
             }
             Predicate::And { filters } => {
                 let mut children = filters.iter();
                 let mut ids = self.indexed_filter_numbers(children.next()?)?;
                 for child in children {
                     let matches = self.indexed_filter_numbers(child)?;
-                    ids.retain(|id| matches.contains(id));
+                    ids = ids.intersection(&matches, self.next_id);
                 }
                 Some(ids)
             }
             Predicate::Or { filters } => {
-                let mut ids = HashSet::new();
+                let mut ids = DocSet::Sparse(Vec::new());
                 for child in filters {
-                    ids.extend(self.indexed_filter_numbers(child)?);
+                    ids = ids.union(self.indexed_filter_numbers(child)?, self.next_id);
                 }
                 Some(ids)
             }
             Predicate::Not { filter } => {
                 let excluded = self.indexed_filter_numbers(filter)?;
-                Some(
+                Some(DocSet::from_numbers(
+                    self.next_id,
                     self.ids
                         .keys()
-                        .filter(|id| !excluded.contains(id))
-                        .copied()
-                        .collect(),
-                )
+                        .filter(|id| !excluded.contains(**id))
+                        .copied(),
+                ))
             }
             Predicate::Range { .. } => None,
         }
+    }
+
+    pub(super) fn indexed_filter_set(&self, filter: &Predicate) -> Option<DocSet> {
+        self.indexed_filter_numbers(filter)
+    }
+
+    pub(super) fn number(&self, id: &str) -> Option<u64> {
+        self.by_id.get(id).copied()
+    }
+
+    pub(super) fn external_id(&self, number: u64) -> Option<&str> {
+        self.ids.get(&number).map(String::as_str)
+    }
+
+    pub(super) fn contains_external(&self, set: &DocSet, id: &str) -> bool {
+        self.number(id).is_some_and(|number| set.contains(number))
     }
 
     pub(super) fn indexed_filter_count(&self, filter: &Predicate) -> Option<usize> {
@@ -417,7 +516,7 @@ impl RetrievalState {
     pub(super) fn indexed_filter_ids<'a>(&'a self, filter: &Predicate) -> Option<HashSet<&'a str>> {
         Some(
             self.indexed_filter_numbers(filter)?
-                .into_iter()
+                .iter()
                 .filter_map(|number| self.ids.get(&number).map(String::as_str))
                 .collect(),
         )
@@ -975,6 +1074,7 @@ impl MultiVectorIndex {
             })
         });
         let eligible_documents = eligible.as_ref().map_or(s.documents.len(), HashSet::len);
+        let ann_filter = request.filter.as_ref().and_then(Predicate::ann_filter);
         let mut plan = self.compile_plan(&s, request, eligible_documents)?;
         plan.policy = policy_plan;
         let mut per_stage_actual_ms: Vec<f64> = Vec::with_capacity(plan.stages.len());
@@ -1040,12 +1140,14 @@ impl MultiVectorIndex {
                         ..
                     } => {
                         if planned.operator == PhysicalOperator::HnswDense {
-                            self.ann_scores(
+                            self.ann_scores_filtered(
                                 &s,
                                 &s.named_ann[field],
                                 &normalize(vector),
                                 limit,
                                 *ef_search,
+                                ann_filter.as_ref(),
+                                eligible.as_ref(),
                             )?
                         } else {
                             self.named_scores(
@@ -1071,11 +1173,13 @@ impl MultiVectorIndex {
                     } => {
                         let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
                         if planned.operator == PhysicalOperator::HnswFde {
-                            self.ann_fde_scores(
+                            self.ann_fde_scores_filtered(
                                 &s,
                                 &self.fde.encode_query(&normalized),
                                 limit,
                                 *ef_search,
+                                ann_filter.as_ref(),
+                                eligible.as_ref(),
                             )?
                         } else {
                             self.exact_fde_scores_filtered(
@@ -1248,6 +1352,7 @@ impl MultiVectorIndex {
             )));
         }
         let normalized: Vec<_> = query.iter().map(|v| normalize(v)).collect();
+        let prepared = MaxSimQuery::new(&normalized, query[0].len());
         let score = |id: &str, d: &DocumentRecord| {
             d.fields.representations.get(field).map(|r| {
                 let (location, dimension, count) = match r {
@@ -1264,7 +1369,7 @@ impl MultiVectorIndex {
                 };
                 let vector = FixedVectorStore::get(s.record_fde(d), location, dimension * count)?;
                 let score = if multivector {
-                    maxsim_flat(&normalized, vector, dimension)
+                    prepared.score(vector, dimension)
                 } else {
                     dot(&normalized[0], vector)
                 };

@@ -284,9 +284,6 @@ impl HNSWIndex {
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),
             exact_fallback_threshold: exact_fallback_threshold_override()
                 .unwrap_or(snapshot.exact_fallback_threshold),
-            dot_fn: HNSWIndex::select_dot_fn(),
-            l2_fn: HNSWIndex::select_l2_fn(),
-            dot_many_fn: HNSWIndex::select_dot_many_fn(),
         }
     }
 

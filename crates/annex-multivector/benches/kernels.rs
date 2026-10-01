@@ -66,7 +66,7 @@ fn bench_dot(c: &mut Criterion) {
 }
 
 fn bench_screen_dot(c: &mut Criterion) {
-    use annex::bench_access::{screen_dot_dispatch, screen_dot_scalar};
+    use annex::vector::kernels::{dot_i8_u8_centered, dot_i8_u8_centered_scalar};
 
     let mut group = c.benchmark_group("screen_dot");
 
@@ -96,7 +96,7 @@ fn bench_screen_dot(c: &mut Criterion) {
         let s = stored_u8.clone();
         let label = format!("scalar/dim={dim}");
         group.bench_function(&label, |b| {
-            b.iter(|| screen_dot_scalar(black_box(&q), black_box(&s)))
+            b.iter(|| dot_i8_u8_centered_scalar(black_box(&q), black_box(&s)))
         });
 
         // Full dispatch (routes to best available kernel: VNNI on Ice Lake, AVX2 elsewhere).
@@ -104,7 +104,7 @@ fn bench_screen_dot(c: &mut Criterion) {
         let s2 = stored_u8.clone();
         let label = format!("dispatch/dim={dim}");
         group.bench_function(&label, |b| {
-            b.iter(|| screen_dot_dispatch(black_box(&q2), black_box(&s2)))
+            b.iter(|| dot_i8_u8_centered(black_box(&q2), black_box(&s2)))
         });
     }
     group.finish();

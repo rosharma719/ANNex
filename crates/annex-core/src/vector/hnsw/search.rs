@@ -122,30 +122,6 @@ fn prefetch_read<T>(ptr: *const T) {
     let _ = ptr;
 }
 
-/// L2-targeted prefetch hint. Used for cache lines beyond the first 128 bytes of
-/// a vector so that the early lines land in L1 (immediately useful) while the tail
-/// lands in L2 (available in time without evicting other L1 occupants). On x86 this
-/// is PREFETCHT1; on aarch64 PRFM PLDL2KEEP. Functionally identical to a no-op
-/// from a correctness standpoint.
-#[inline(always)]
-fn prefetch_read_l2<T>(ptr: *const T) {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        std::arch::asm!("prfm pldl2keep, [{addr}]", addr = in(reg) ptr,
-            options(nostack, readonly, preserves_flags));
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(ptr.cast(), std::arch::x86_64::_MM_HINT_T1);
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let _ = ptr;
-}
-
-/// Standard prefetch: covers the first 4 cache lines (256 bytes). Used on the
-/// non-SQ8 path where every passing candidate is prefetched; capping at 4 lines
-/// avoids saturating the prefetch buffer (~20 outstanding misses on Ice Lake) when
-/// all 32 L0 neighbors are batched simultaneously.
 #[inline(always)]
 fn prefetch_from_view(view: &crate::vector::hnsw::arena::VectorArenaView, idx: usize) {
     let vector = view.get(idx);
@@ -153,28 +129,6 @@ fn prefetch_from_view(view: &crate::vector::hnsw::arena::VectorArenaView, idx: u
         if let Some(value) = vector.get(offset) {
             prefetch_read(value);
         }
-    }
-}
-
-/// Full-coverage prefetch: covers every cache line of the vector, capped at 8 lines
-/// (512 bytes) to fully cover 128-dim and meaningfully cover 256-dim without
-/// overloading the prefetch buffer. Used on the SQ8 path where filtering reduces the
-/// number of vectors prefetched by ~50–70%, making wider per-vector coverage safe.
-/// Lines 0–1 (128B) → L1; lines 2–7 → L2 to preserve L1 for scoring computation.
-#[inline(always)]
-fn prefetch_from_view_sq8(view: &crate::vector::hnsw::arena::VectorArenaView, idx: usize) {
-    let vector = view.get(idx);
-    let mut offset = 0;
-    let limit = vector.len().min(8 * 16); // 8 cache lines max
-    while offset < limit {
-        if let Some(value) = vector.get(offset) {
-            if offset < 32 {
-                prefetch_read(value);
-            } else {
-                prefetch_read_l2(value);
-            }
-        }
-        offset += 16;
     }
 }
 
@@ -457,9 +411,9 @@ impl HNSWIndex {
                                         });
                                         self.fast_score_many(query, &vecs[..batch_len], &mut raws);
                                     }
-                                    for i in 0..batch_len {
-                                        let idx = batch[i];
-                                        let raw = raws[i];
+                                    for (&idx, &raw) in
+                                        batch.iter().zip(raws.iter()).take(batch_len)
+                                    {
                                         let score_val = if normalize {
                                             self.normalize_score(raw)
                                         } else {
@@ -504,9 +458,7 @@ impl HNSWIndex {
                                     });
                                     self.fast_score_many(query, &vecs[..batch_len], &mut raws);
                                 }
-                                for i in 0..batch_len {
-                                    let idx = batch[i];
-                                    let raw = raws[i];
+                                for (&idx, &raw) in batch.iter().zip(raws.iter()).take(batch_len) {
                                     let score_val = if normalize {
                                         self.normalize_score(raw)
                                     } else {
@@ -523,7 +475,7 @@ impl HNSWIndex {
                                             raw_score: raw,
                                             sort_key: score_val,
                                         };
-                                        scratch.candidate_queue.push(sp);
+                                        scratch.candidate_queue.push(sp.clone());
 
                                         if improves_result_set {
                                             scratch.result_set.push(NodeResult(sp));
@@ -572,20 +524,8 @@ impl HNSWIndex {
                                 batch[batch_len] = neighbor;
                                 batch_len += 1;
                                 if batch_len == BATCH {
-                                    let mut raws = [0.0f32; BATCH];
-                                    {
-                                        let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                            if i < batch_len {
-                                                vec_view.get(batch[i])
-                                            } else {
-                                                &[]
-                                            }
-                                        });
-                                        self.fast_score_many(query, &vecs[..batch_len], &mut raws);
-                                    }
-                                    for i in 0..batch_len {
-                                        let idx = batch[i];
-                                        let raw = raws[i];
+                                    for &idx in batch.iter().take(batch_len) {
+                                        let raw = self.fast_score(query, vec_view.get(idx));
                                         let score_val = if normalize {
                                             self.normalize_score(raw)
                                         } else {
@@ -616,20 +556,8 @@ impl HNSWIndex {
                                 }
                             }
                             if batch_len > 0 {
-                                let mut raws = [0.0f32; BATCH];
-                                {
-                                    let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                        if i < batch_len {
-                                            vec_view.get(batch[i])
-                                        } else {
-                                            &[]
-                                        }
-                                    });
-                                    self.fast_score_many(query, &vecs[..batch_len], &mut raws);
-                                }
-                                for i in 0..batch_len {
-                                    let idx = batch[i];
-                                    let raw = raws[i];
+                                for &idx in batch.iter().take(batch_len) {
+                                    let raw = self.fast_score(query, vec_view.get(idx));
                                     let score_val = if normalize {
                                         self.normalize_score(raw)
                                     } else {
@@ -644,7 +572,7 @@ impl HNSWIndex {
                                             raw_score: raw,
                                             sort_key: score_val,
                                         };
-                                        scratch.candidate_queue.push(sp);
+                                        scratch.candidate_queue.push(sp.clone());
                                         if improves_result_set {
                                             scratch.result_set.push(NodeResult(sp));
                                             if scratch.result_set.len() > ef {
@@ -666,24 +594,11 @@ impl HNSWIndex {
                             // SQ8 threshold: 127.5² × (1 − worst_score) × safety_margin (0.85).
                             let mut sq8_thresh =
                                 ((1.0 - worst_score) * 127.5 * 127.5 * 0.85) as i32;
-                            let quant_stride = self.dim;
                             for (position, &neighbor) in neighbors.iter().enumerate() {
                                 if let Some(&next) = neighbors.get(position + 2)
                                     && let Some(entry) = scratch.visited_epoch.get(next)
                                 {
                                     prefetch_read(entry);
-                                }
-                                // Prefetch the quantized slice for the neighbor 2 ahead so the
-                                // SQ8 screen load (quantized_slice) is in L1 by the time we
-                                // need it, hiding the same DRAM latency as the f32 prefetch does.
-                                if let Some(&next_q) = neighbors.get(position + 2) {
-                                    let q_start = next_q * quant_stride;
-                                    if next_q < node_bound && q_start < self.quantized.len() {
-                                        // SAFETY: non-faulting hint; q_start < len checked above.
-                                        prefetch_read(unsafe {
-                                            self.quantized.as_ptr().add(q_start)
-                                        });
-                                    }
                                 }
                                 if neighbor >= node_bound
                                     || !is_live_via(&state_view, neighbor)
@@ -701,24 +616,12 @@ impl HNSWIndex {
                                         continue;
                                     }
                                 }
-                                prefetch_from_view_sq8(&vec_view, neighbor);
+                                prefetch_from_view(&vec_view, neighbor);
                                 batch[batch_len] = neighbor;
                                 batch_len += 1;
                                 if batch_len == BATCH {
-                                    let mut raws = [0.0f32; BATCH];
-                                    {
-                                        let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                            if i < batch_len {
-                                                vec_view.get(batch[i])
-                                            } else {
-                                                &[]
-                                            }
-                                        });
-                                        self.fast_score_many(query, &vecs[..batch_len], &mut raws);
-                                    }
-                                    for i in 0..batch_len {
-                                        let idx = batch[i];
-                                        let raw = raws[i];
+                                    for &idx in batch.iter().take(batch_len) {
+                                        let raw = self.fast_score(query, vec_view.get(idx));
                                         let score_val = if normalize {
                                             self.normalize_score(raw)
                                         } else {
@@ -754,20 +657,8 @@ impl HNSWIndex {
                                 }
                             }
                             if batch_len > 0 {
-                                let mut raws = [0.0f32; BATCH];
-                                {
-                                    let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                        if i < batch_len {
-                                            vec_view.get(batch[i])
-                                        } else {
-                                            &[]
-                                        }
-                                    });
-                                    self.fast_score_many(query, &vecs[..batch_len], &mut raws);
-                                }
-                                for i in 0..batch_len {
-                                    let idx = batch[i];
-                                    let raw = raws[i];
+                                for &idx in batch.iter().take(batch_len) {
+                                    let raw = self.fast_score(query, vec_view.get(idx));
                                     let score_val = if normalize {
                                         self.normalize_score(raw)
                                     } else {
@@ -782,7 +673,7 @@ impl HNSWIndex {
                                             raw_score: raw,
                                             sort_key: score_val,
                                         };
-                                        scratch.candidate_queue.push(sp);
+                                        scratch.candidate_queue.push(sp.clone());
                                         if improves_result_set {
                                             scratch.result_set.push(NodeResult(sp));
                                             if scratch.result_set.len() > ef {
@@ -852,27 +743,11 @@ impl HNSWIndex {
                                     batch[batch_len] = neighbor;
                                     batch_len += 1;
                                     if batch_len == BATCH {
-                                        if collect_counters {
-                                            distance_computations += batch_len;
-                                        }
-                                        let mut raws = [0.0f32; BATCH];
-                                        {
-                                            let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                                if i < batch_len {
-                                                    vec_view.get(batch[i])
-                                                } else {
-                                                    &[]
-                                                }
-                                            });
-                                            self.fast_score_many(
-                                                query,
-                                                &vecs[..batch_len],
-                                                &mut raws,
-                                            );
-                                        }
-                                        for i in 0..batch_len {
-                                            let idx = batch[i];
-                                            let raw = raws[i];
+                                        for &idx in batch.iter().take(batch_len) {
+                                            if collect_counters {
+                                                distance_computations += 1;
+                                            }
+                                            let raw = self.fast_score(query, vec_view.get(idx));
                                             let score_val = if normalize {
                                                 self.normalize_score(raw)
                                             } else {
@@ -925,23 +800,11 @@ impl HNSWIndex {
                                     }
                                 }
                                 if !patience_triggered && batch_len > 0 {
-                                    if collect_counters {
-                                        distance_computations += batch_len;
-                                    }
-                                    let mut raws = [0.0f32; BATCH];
-                                    {
-                                        let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
-                                            if i < batch_len {
-                                                vec_view.get(batch[i])
-                                            } else {
-                                                &[]
-                                            }
-                                        });
-                                        self.fast_score_many(query, &vecs[..batch_len], &mut raws);
-                                    }
-                                    for i in 0..batch_len {
-                                        let idx = batch[i];
-                                        let raw = raws[i];
+                                    for &idx in batch.iter().take(batch_len) {
+                                        if collect_counters {
+                                            distance_computations += 1;
+                                        }
+                                        let raw = self.fast_score(query, vec_view.get(idx));
                                         let score_val = if normalize {
                                             self.normalize_score(raw)
                                         } else {
@@ -958,7 +821,7 @@ impl HNSWIndex {
                                                 raw_score: raw,
                                                 sort_key: score_val,
                                             };
-                                            scratch.candidate_queue.push(sp);
+                                            scratch.candidate_queue.push(sp.clone());
 
                                             if improves_result_set {
                                                 scratch.result_set.push(NodeResult(sp));

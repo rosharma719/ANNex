@@ -1321,13 +1321,10 @@ impl MultiVectorIndex {
         }
         let query_fde = self.fde.encode_query(normalized);
         let fde_dimension = self.fde.output_dimension();
-        let approximate_results: Result<Vec<_>, io::Error> = s
-            .documents
-            .par_iter()
-            .filter(|(id, d)| d.tokens > 0 && eligible.is_none_or(|ids| ids.contains(id.as_str())))
-            .map(|(id, record)| {
+        let score = |id: &str, record: &DocumentRecord| {
+            (record.tokens > 0).then(|| {
                 Ok((
-                    id.clone(),
+                    id.to_owned(),
                     dot(
                         &query_fde,
                         FixedVectorStore::get(
@@ -1338,7 +1335,18 @@ impl MultiVectorIndex {
                     ),
                 ))
             })
-            .collect();
+        };
+        let approximate_results: Result<Vec<_>, io::Error> = match eligible {
+            Some(eligible) => eligible
+                .par_iter()
+                .filter_map(|&id| s.documents.get(id).and_then(|record| score(id, record)))
+                .collect(),
+            None => s
+                .documents
+                .par_iter()
+                .filter_map(|(id, record)| score(id, record))
+                .collect(),
+        };
         let mut approximate = approximate_results?;
         let n = approximate.len();
         let by_desc =

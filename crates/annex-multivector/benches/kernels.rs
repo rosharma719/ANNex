@@ -110,5 +110,40 @@ fn bench_screen_dot(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(kernels, bench_maxsim_flat, bench_dot, bench_screen_dot);
+fn bench_maxsim_flat_bf16(c: &mut Criterion) {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = c;
+        println!("[bench_maxsim_flat_bf16] not x86_64 — skipping");
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if !std::arch::is_x86_feature_detected!("avx512bf16") {
+        let _ = c;
+        println!("[bench_maxsim_flat_bf16] avx512bf16 not available on this host — skipping");
+        return;
+    }
+    let mut group = c.benchmark_group("maxsim_flat_bf16");
+    for &(dim, doc_tokens, query_tokens) in &[
+        (128usize, 200usize, 32usize),
+        (128, 100, 32),
+        (384, 200, 32),
+        (512, 200, 32),
+        (768, 200, 32),
+    ] {
+        let mut rng_state = 0xdead_beef_cafe_babe_u64;
+        let doc_matrix = gen_normalized(&mut rng_state, dim, doc_tokens);
+        let doc = flat(&doc_matrix);
+        let query = gen_normalized(&mut rng_state, dim, query_tokens);
+        let label = format!("dim={dim}/doc_tokens={doc_tokens}/query_tokens={query_tokens}");
+        let ops = (dim as u64) * (doc_tokens as u64) * (query_tokens as u64) * 2;
+        group.throughput(Throughput::Elements(ops));
+        group.bench_function(&label, |b| {
+            b.iter(|| maxsim_flat(black_box(&query), black_box(&doc), black_box(dim)))
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(kernels, bench_maxsim_flat, bench_dot, bench_screen_dot, bench_maxsim_flat_bf16);
 criterion_main!(kernels);

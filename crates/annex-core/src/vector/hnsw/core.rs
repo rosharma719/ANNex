@@ -168,6 +168,10 @@ impl HNSWIndex {
         use crate::vector::simd::{CpuLevel, cpu_level};
         match cpu_level() {
             #[cfg(target_arch = "x86_64")]
+            CpuLevel::Avx512Bf16 => {
+                |q: &[f32], v: &[f32]| unsafe { dot_avx512_bf16(q.as_ptr(), v.as_ptr(), q.len()) }
+            }
+            #[cfg(target_arch = "x86_64")]
             CpuLevel::Avx512Vnni | CpuLevel::Avx512F => {
                 |q: &[f32], v: &[f32]| unsafe { dot_avx512(q, v) }
             }
@@ -187,7 +191,7 @@ impl HNSWIndex {
         use crate::vector::simd::{CpuLevel, cpu_level};
         match cpu_level() {
             #[cfg(target_arch = "x86_64")]
-            CpuLevel::Avx512Vnni | CpuLevel::Avx512F => {
+            CpuLevel::Avx512Bf16 | CpuLevel::Avx512Vnni | CpuLevel::Avx512F => {
                 |q: &[f32], v: &[f32]| unsafe { l2_avx512(q, v) }
             }
             #[cfg(target_arch = "x86_64")]
@@ -205,6 +209,8 @@ impl HNSWIndex {
     pub(crate) fn select_dot_many_fn() -> unsafe fn(&[f32], &[&[f32]], &mut [f32]) {
         use crate::vector::simd::{CpuLevel, cpu_level};
         match cpu_level() {
+            #[cfg(target_arch = "x86_64")]
+            CpuLevel::Avx512Bf16 => dot_many_avx512_bf16,
             #[cfg(target_arch = "x86_64")]
             CpuLevel::Avx512Vnni | CpuLevel::Avx512F => dot_many_avx512,
             #[cfg(target_arch = "x86_64")]
@@ -1108,6 +1114,72 @@ unsafe fn l2_avx512(query: &[f32], vec: &[f32]) -> f32 {
         i += 1;
     }
     acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bf16")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_avx512_bf16(a: *const f32, b: *const f32, len: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut acc2 = _mm512_setzero_ps();
+    let mut acc3 = _mm512_setzero_ps();
+    let mut i = 0usize;
+    while i + 128 <= len {
+        let a0 = _mm512_loadu_ps(a.add(i));
+        let a1 = _mm512_loadu_ps(a.add(i + 16));
+        let b0 = _mm512_loadu_ps(b.add(i));
+        let b1 = _mm512_loadu_ps(b.add(i + 16));
+        acc0 = _mm512_dpbf16_ps(acc0, _mm512_cvtne2ps_pbh(a1, a0), _mm512_cvtne2ps_pbh(b1, b0));
+
+        let a2 = _mm512_loadu_ps(a.add(i + 32));
+        let a3 = _mm512_loadu_ps(a.add(i + 48));
+        let b2 = _mm512_loadu_ps(b.add(i + 32));
+        let b3 = _mm512_loadu_ps(b.add(i + 48));
+        acc1 = _mm512_dpbf16_ps(acc1, _mm512_cvtne2ps_pbh(a3, a2), _mm512_cvtne2ps_pbh(b3, b2));
+
+        let a4 = _mm512_loadu_ps(a.add(i + 64));
+        let a5 = _mm512_loadu_ps(a.add(i + 80));
+        let b4 = _mm512_loadu_ps(b.add(i + 64));
+        let b5 = _mm512_loadu_ps(b.add(i + 80));
+        acc2 = _mm512_dpbf16_ps(acc2, _mm512_cvtne2ps_pbh(a5, a4), _mm512_cvtne2ps_pbh(b5, b4));
+
+        let a6 = _mm512_loadu_ps(a.add(i + 96));
+        let a7 = _mm512_loadu_ps(a.add(i + 112));
+        let b6 = _mm512_loadu_ps(b.add(i + 96));
+        let b7 = _mm512_loadu_ps(b.add(i + 112));
+        acc3 = _mm512_dpbf16_ps(acc3, _mm512_cvtne2ps_pbh(a7, a6), _mm512_cvtne2ps_pbh(b7, b6));
+        i += 128;
+    }
+    while i + 32 <= len {
+        let a0 = _mm512_loadu_ps(a.add(i));
+        let a1 = _mm512_loadu_ps(a.add(i + 16));
+        let b0 = _mm512_loadu_ps(b.add(i));
+        let b1 = _mm512_loadu_ps(b.add(i + 16));
+        acc0 = _mm512_dpbf16_ps(acc0, _mm512_cvtne2ps_pbh(a1, a0), _mm512_cvtne2ps_pbh(b1, b0));
+        i += 32;
+    }
+    acc0 = _mm512_add_ps(acc0, acc1);
+    acc2 = _mm512_add_ps(acc2, acc3);
+    acc0 = _mm512_add_ps(acc0, acc2);
+    let mut result = _mm512_reduce_add_ps(acc0);
+    while i < len {
+        result += *a.add(i) * *b.add(i);
+        i += 1;
+    }
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bf16")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_many_avx512_bf16(query: &[f32], vecs: &[&[f32]], out: &mut [f32]) {
+    let n = query.len();
+    let q = query.as_ptr();
+    for (o, v) in out.iter_mut().zip(vecs) {
+        *o = dot_avx512_bf16(q, v.as_ptr(), n.min(v.len()));
+    }
 }
 
 // ── Batched dot kernels (4-vector simultaneous) ───────────────────────────────
@@ -2204,6 +2276,56 @@ mod tests {
                 out[i],
                 single
             );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn dot_avx512_bf16_matches_scalar_across_shapes() {
+        if !std::arch::is_x86_feature_detected!("avx512bf16") {
+            return;
+        }
+        let close = |actual: f32, expected: f32| {
+            let tol = 1e-3_f32 * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() <= tol,
+                "bf16 mismatch: expected={expected} actual={actual} tol={tol}"
+            );
+        };
+        for &len in &[0usize, 1, 4, 16, 31, 32, 33, 64, 128, 256, 384, 512, 768] {
+            let a: Vec<f32> = (0..len).map(|i| (i as f32 + 1.0).recip()).collect();
+            let b: Vec<f32> = (0..len).map(|i| (i as f32 + 2.0).recip()).collect();
+            let ref_val = dot_scalar(&a, &b);
+            let bf16_val = unsafe { dot_avx512_bf16(a.as_ptr(), b.as_ptr(), len) };
+            close(bf16_val, ref_val);
+        }
+        let len = 512usize;
+        let a: Vec<f32> = (0..len).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let b = a.clone();
+        let ref_val = dot_scalar(&a, &b);
+        let bf16_val = unsafe { dot_avx512_bf16(a.as_ptr(), b.as_ptr(), len) };
+        close(bf16_val, ref_val);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn fast_score_many_uses_bf16_on_bf16_hardware() {
+        if !std::arch::is_x86_feature_detected!("avx512bf16") {
+            return;
+        }
+        let idx = HNSWIndex::new(crate::utils::types::DistanceMetric::Cosine, 4, 8, 4, 4);
+        let q = vec![1.0f32, 0.0, 0.0, 0.0];
+        let vs: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.707, 0.707, 0.0, 0.0],
+        ];
+        let vref: Vec<&[f32]> = vs.iter().map(|v| v.as_slice()).collect();
+        let mut out = [0.0f32; 4];
+        idx.fast_score_many(&q, &vref, &mut out);
+        for (i, v) in vs.iter().enumerate() {
+            let single = idx.fast_score(&q, v);
+            assert!((out[i] - single).abs() < 1e-3, "many[{i}]={} single={}", out[i], single);
         }
     }
 

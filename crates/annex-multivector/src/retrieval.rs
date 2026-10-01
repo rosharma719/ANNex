@@ -136,6 +136,56 @@ fn collect_metadata_keys(
     }
 }
 
+fn ann_payload_value(value: &Value) -> Option<annex::PayloadValue> {
+    match value {
+        Value::Bool(value) => Some(annex::PayloadValue::Bool(*value)),
+        Value::Number(value) => value
+            .as_i64()
+            .map(annex::PayloadValue::Int)
+            .or_else(|| {
+                value
+                    .as_u64()
+                    .and_then(|value| i64::try_from(value).ok())
+                    .map(annex::PayloadValue::Int)
+            })
+            .or_else(|| {
+                value
+                    .as_f64()
+                    .map(|value| annex::PayloadValue::Float(value.into()))
+            }),
+        Value::String(value) => Some(annex::PayloadValue::Str(value.clone())),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+fn collect_ann_payload(value: &Value, pointer: &str, payload: &mut annex::Payload) {
+    match value {
+        Value::Object(object) => {
+            for (name, child) in object {
+                let child_pointer = format!("{pointer}/{}", pointer_escape(name));
+                collect_ann_payload(child, &child_pointer, payload);
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                let child_pointer = format!("{pointer}/{index}");
+                collect_ann_payload(child, &child_pointer, payload);
+            }
+        }
+        _ => {
+            if let Some(value) = ann_payload_value(value) {
+                payload.set(pointer, value);
+            }
+        }
+    }
+}
+
+pub(super) fn metadata_ann_payload(metadata: &Value) -> annex::Payload {
+    let mut payload = annex::Payload::default();
+    collect_ann_payload(metadata, "", &mut payload);
+    payload
+}
+
 fn invalid(message: impl Into<String>) -> IndexError {
     IndexError::Invalid(message.into())
 }
@@ -474,6 +524,30 @@ impl Predicate {
             Self::And { filters } => filters.iter().all(|f| f.matches(metadata)),
             Self::Or { filters } => filters.iter().any(|f| f.matches(metadata)),
             Self::Not { filter } => !filter.matches(metadata),
+        }
+    }
+
+    /// Translate the predicate only when the ANN payload evaluator has exactly
+    /// the same semantics. Unsupported shapes retain exact filtered execution.
+    pub(super) fn ann_filter(&self) -> Option<annex::Filter> {
+        match self {
+            Self::Eq { field, value } => Some(annex::Filter::Match {
+                key: predicate_pointer(field),
+                value: ann_payload_value(value)?,
+            }),
+            Self::And { filters } => Some(annex::Filter::And(
+                filters
+                    .iter()
+                    .map(Self::ann_filter)
+                    .collect::<Option<Vec<_>>>()?,
+            )),
+            Self::Or { filters } => Some(annex::Filter::Or(
+                filters
+                    .iter()
+                    .map(Self::ann_filter)
+                    .collect::<Option<Vec<_>>>()?,
+            )),
+            Self::In { .. } | Self::Range { .. } | Self::Not { .. } => None,
         }
     }
 }

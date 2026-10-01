@@ -14,6 +14,8 @@ use crate::{
     },
 };
 use annex::{
+    Filter, Payload,
+    payload_storage::stores::PayloadIndex,
     utils::types::DistanceMetric,
     vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
 };
@@ -258,6 +260,8 @@ struct FdeAnnBase {
     ids: Vec<String>,
     by_id: HashMap<String, u64>,
     field: Option<String>,
+    payloads: HashMap<u64, Payload>,
+    payload_index: PayloadIndex,
 }
 
 #[derive(Clone)]
@@ -1472,6 +1476,13 @@ impl MultiVectorIndex {
             .enumerate()
             .map(|(idx, id)| (id.clone(), idx as u64))
             .collect();
+        let mut payloads = HashMap::with_capacity(ids.len());
+        let mut payload_index = PayloadIndex::new();
+        for (point, id) in ids.iter().enumerate() {
+            let payload = retrieval::metadata_ann_payload(&s.documents[id].metadata);
+            payload_index.insert(point as u64, &payload);
+            payloads.insert(point as u64, payload);
+        }
         let mut next = (*s).clone();
         let ann = FdeAnn {
             base: Arc::new(FdeAnnBase {
@@ -1479,6 +1490,8 @@ impl MultiVectorIndex {
                 ids,
                 by_id,
                 field: field.map(str::to_owned),
+                payloads,
+                payload_index,
             }),
             delta: HashSet::new(),
             tombstones: HashSet::new(),
@@ -1519,10 +1532,22 @@ impl MultiVectorIndex {
         count: usize,
         ef_search: usize,
     ) -> Result<Vec<(String, f32)>, IndexError> {
+        self.ann_fde_scores_filtered(s, query_fde, count, ef_search, None, None)
+    }
+
+    fn ann_fde_scores_filtered(
+        &self,
+        s: &State,
+        query_fde: &Vector,
+        count: usize,
+        ef_search: usize,
+        filter: Option<&Filter>,
+        eligible: Option<&HashSet<&str>>,
+    ) -> Result<Vec<(String, f32)>, IndexError> {
         let ann = s.fde_ann.as_ref().ok_or_else(|| {
             IndexError::Invalid("FDE ANN is not built; call /v1/fde/index".into())
         })?;
-        self.ann_scores(s, ann, query_fde, count, ef_search)
+        self.ann_scores_filtered(s, ann, query_fde, count, ef_search, filter, eligible)
     }
     fn ann_scores(
         &self,
@@ -1531,6 +1556,19 @@ impl MultiVectorIndex {
         query_fde: &Vector,
         count: usize,
         ef_search: usize,
+    ) -> Result<Vec<(String, f32)>, IndexError> {
+        self.ann_scores_filtered(s, ann, query_fde, count, ef_search, None, None)
+    }
+
+    fn ann_scores_filtered(
+        &self,
+        s: &State,
+        ann: &FdeAnn,
+        query_fde: &Vector,
+        count: usize,
+        ef_search: usize,
+        filter: Option<&Filter>,
+        eligible: Option<&HashSet<&str>>,
     ) -> Result<Vec<(String, f32)>, IndexError> {
         if ann.generation != s.generation {
             return Err(IndexError::Invalid(
@@ -1547,11 +1585,21 @@ impl MultiVectorIndex {
                 ef_search: Some(ef_search.max(base_count)),
                 ..SearchRuntimeOptions::default()
             };
-            let points = ann
-                .base
-                .index
-                .search_with_options(query_fde, base_count, &options)
-                .map_err(|error| IndexError::Invalid(format!("HNSW search failed: {error}")))?;
+            let points = match filter {
+                Some(filter) => ann.base.index.in_place_filtered_search(
+                    query_fde,
+                    base_count,
+                    &options,
+                    &ann.base.payloads,
+                    &ann.base.payload_index,
+                    Some(filter),
+                ),
+                None => ann
+                    .base
+                    .index
+                    .search_with_options(query_fde, base_count, &options),
+            }
+            .map_err(|error| IndexError::Invalid(format!("HNSW search failed: {error}")))?;
             for point in points {
                 if ann.tombstones.contains(&point.id) {
                     continue;
@@ -1571,6 +1619,9 @@ impl MultiVectorIndex {
         }
         if !ann.delta.is_empty() {
             for id in &ann.delta {
+                if eligible.is_some_and(|eligible| !eligible.contains(id.as_str())) {
+                    continue;
+                }
                 let record = s
                     .documents
                     .get(id)

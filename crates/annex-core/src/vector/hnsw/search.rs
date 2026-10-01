@@ -400,8 +400,20 @@ impl HNSWIndex {
                                 batch[batch_len] = neighbor;
                                 batch_len += 1;
                                 if batch_len == BATCH {
-                                    for &idx in batch.iter().take(batch_len) {
-                                        let raw = self.fast_score(query, vec_view.get(idx));
+                                    let mut raws = [0.0f32; BATCH];
+                                    {
+                                        let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
+                                            if i < batch_len {
+                                                vec_view.get(batch[i])
+                                            } else {
+                                                &[]
+                                            }
+                                        });
+                                        self.fast_score_many(query, &vecs[..batch_len], &mut raws);
+                                    }
+                                    for (&idx, &raw) in
+                                        batch.iter().zip(raws.iter()).take(batch_len)
+                                    {
                                         let score_val = if normalize {
                                             self.normalize_score(raw)
                                         } else {
@@ -435,8 +447,18 @@ impl HNSWIndex {
                                 }
                             }
                             if batch_len > 0 {
-                                for &idx in batch.iter().take(batch_len) {
-                                    let raw = self.fast_score(query, vec_view.get(idx));
+                                let mut raws = [0.0f32; BATCH];
+                                {
+                                    let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
+                                        if i < batch_len {
+                                            vec_view.get(batch[i])
+                                        } else {
+                                            &[]
+                                        }
+                                    });
+                                    self.fast_score_many(query, &vecs[..batch_len], &mut raws);
+                                }
+                                for (&idx, &raw) in batch.iter().zip(raws.iter()).take(batch_len) {
                                     let score_val = if normalize {
                                         self.normalize_score(raw)
                                     } else {

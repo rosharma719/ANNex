@@ -18,4 +18,4 @@ pub use engine::{
     RepresentationKind, Rerank, RerankPlan, RetrievalDocument, RetrievalObjective, RetrievalPlan,
     RetrievalResponse, RetrievalTrace, RetrieveRequest, UpsertDocument,
 };
-pub use fde::{maxsim, maxsim_flat};
+pub use fde::{MaxSimQuery, maxsim, maxsim_flat};

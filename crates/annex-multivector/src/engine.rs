@@ -6,7 +6,7 @@ mod policy;
 mod retrieval;
 use crate::{
     analyzer::{Analyzer, TextAnalyzer},
-    fde::{Vector, dot, maxsim_flat, normalize},
+    fde::{MaxSimQuery, Vector, dot, maxsim_flat, normalize},
     muvera::FdeEncoder,
     storage::{
         CompressedVectorStore, FixedVectorStore, ObjectLocation, atomic_write, commit_boundary,
@@ -1695,6 +1695,8 @@ impl MultiVectorIndex {
         // top_k) candidates that get thrown away after the sort — on a
         // typical query with candidates=500 and top_k=100 that saves 400
         // String + Value clones per query.
+        // Pack the query once for every candidate (x86 AVX2/AVX-512).
+        let prepared = MaxSimQuery::new(normalized, self.config.dimension);
         let approximate_slice: &[(String, f32)] = approximate.as_slice();
         let scored: Vec<(usize, f32)> = approximate_slice
             .par_iter()
@@ -1722,7 +1724,7 @@ impl MultiVectorIndex {
                         } else {
                             None
                         };
-                        Ok((maxsim_flat(normalized, &scratch, dim), t1))
+                        Ok((prepared.score(&scratch, dim), t1))
                     },
                 )?;
                 let t2 = if timing {

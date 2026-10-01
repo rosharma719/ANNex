@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/annex-core",
     "crates/annex-multivector",
+    "crates/annex-kernel-bench",
     "crates/annex-server",
     "python/annex-py",
 ]

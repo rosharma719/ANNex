@@ -43,6 +43,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "annex-kernel-bench"
+version = "0.0.0"
+dependencies = [
+ "annex",
+ "annex-multivector",
+ "criterion",
+ "ndarray",
+ "simsimd",
+]
+
+[[package]]
 name = "annex-multivector"
 version = "0.2.0"
 dependencies = [
@@ -1430,6 +1441,15 @@ name = "simd-adler32"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d66dc143e6b11c1eddc06d5c423cfc97062865baf299914ab64caa38182078fe"
+
+[[package]]
+name = "simsimd"
+version = "6.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4fb3bc3cdce07a7d7d4caa4c54f8aa967f6be41690482b54b24100a2253fa70"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "slab"

@@ -1,0 +1,29 @@
+[package]
+name = "annex-kernel-bench"
+version = "0.0.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+description = "Distance-kernel benchmarks comparing ANNex with the pre-kernels baseline, SimSIMD, ndarray/matrixmultiply and (optionally) OpenBLAS."
+license = "MIT OR Apache-2.0"
+
+[features]
+# Links the system OpenBLAS (`libopenblas-dev`) for a BLAS sgemm MaxSim baseline.
+blas = []
+
+[dependencies]
+annex = { path = "../annex-core" }
+annex-multivector = { path = "../annex-multivector" }
+ndarray = "0.15"
+simsimd = "6.5"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "distance"
+harness = false
+
+[[bench]]
+name = "maxsim"
+harness = false

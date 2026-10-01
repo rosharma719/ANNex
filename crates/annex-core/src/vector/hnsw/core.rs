@@ -138,6 +138,10 @@ pub struct HNSWIndex {
     pub(crate) alloc: std::sync::Mutex<AllocState>,
     pub(crate) exact_fallback_enabled: bool,
     pub(crate) exact_fallback_threshold: usize,
+    /// Pre-selected dot-product kernel; set at construction from cpu_level().
+    pub(crate) dot_fn: fn(&[f32], &[f32]) -> f32,
+    /// Pre-selected L2-squared kernel; set at construction from cpu_level().
+    pub(crate) l2_fn: fn(&[f32], &[f32]) -> f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -158,6 +162,44 @@ pub struct HnswConfigSummary {
 }
 
 impl HNSWIndex {
+    pub(crate) fn select_dot_fn() -> fn(&[f32], &[f32]) -> f32 {
+        use crate::vector::simd::{CpuLevel, cpu_level};
+        match cpu_level() {
+            #[cfg(target_arch = "x86_64")]
+            CpuLevel::Avx512Vnni | CpuLevel::Avx512F => {
+                |q: &[f32], v: &[f32]| unsafe { dot_avx512(q, v) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            CpuLevel::Avx2Fma => |q: &[f32], v: &[f32]| unsafe { dot_avx2_fma(q, v) },
+            #[cfg(target_arch = "x86_64")]
+            CpuLevel::Avx2 => |q: &[f32], v: &[f32]| unsafe { dot_avx2(q, v) },
+            #[cfg(target_arch = "aarch64")]
+            CpuLevel::NeonDotprod | CpuLevel::Neon => {
+                |q: &[f32], v: &[f32]| unsafe { dot_neon(q, v) }
+            }
+            _ => dot_scalar,
+        }
+    }
+
+    pub(crate) fn select_l2_fn() -> fn(&[f32], &[f32]) -> f32 {
+        use crate::vector::simd::{CpuLevel, cpu_level};
+        match cpu_level() {
+            #[cfg(target_arch = "x86_64")]
+            CpuLevel::Avx512Vnni | CpuLevel::Avx512F => {
+                |q: &[f32], v: &[f32]| unsafe { l2_avx512(q, v) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            CpuLevel::Avx2Fma => |q: &[f32], v: &[f32]| unsafe { l2_avx2_fma(q, v) },
+            #[cfg(target_arch = "x86_64")]
+            CpuLevel::Avx2 => |q: &[f32], v: &[f32]| unsafe { l2_avx2(q, v) },
+            #[cfg(target_arch = "aarch64")]
+            CpuLevel::NeonDotprod | CpuLevel::Neon => {
+                |q: &[f32], v: &[f32]| unsafe { l2_neon(q, v) }
+            }
+            _ => l2_scalar,
+        }
+    }
+
     pub fn new(
         metric: DistanceMetric,
         m: usize,
@@ -214,6 +256,8 @@ impl HNSWIndex {
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),
             exact_fallback_threshold: exact_fallback_threshold_override()
                 .unwrap_or(DEFAULT_EXACT_FALLBACK_THRESHOLD),
+            dot_fn: Self::select_dot_fn(),
+            l2_fn: Self::select_l2_fn(),
         }
     }
 
@@ -332,18 +376,11 @@ impl HNSWIndex {
     pub(crate) fn fast_score(&self, query: &[f32], vec: &[f32]) -> f32 {
         match self.metric {
             DistanceMetric::Cosine => {
-                let dot: f32 = dot_product(query, vec);
-                let sim = if dot > 1.0 {
-                    1.0
-                } else if dot < -1.0 {
-                    -1.0
-                } else {
-                    dot
-                };
-                1.0 - sim
+                let dot = (self.dot_fn)(query, vec).clamp(-1.0, 1.0);
+                1.0 - dot
             }
-            DistanceMetric::Dot => dot_product(query, vec),
-            DistanceMetric::Euclidean => l2_squared(query, vec),
+            DistanceMetric::Dot => (self.dot_fn)(query, vec),
+            DistanceMetric::Euclidean => (self.l2_fn)(query, vec),
         }
     }
 
@@ -1971,6 +2008,20 @@ mod tests {
             "screen_dot dim={} vecs={} iters={} total={} ns/call={:.2} acc={}",
             dim, vecs, iters, total, ns_per, acc
         );
+    }
+
+    #[test]
+    fn fast_score_works_after_snapshot_round_trip() {
+        let mut idx = HNSWIndex::new(DistanceMetric::Cosine, 4, 8, 4, 4);
+        idx.insert(1, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.insert(2, vec![0.0, 1.0, 0.0, 0.0]).unwrap();
+        let snap = idx.to_snapshot();
+        let restored = HNSWIndex::from_snapshot(snap);
+        let q = vec![1.0f32, 0.0, 0.0, 0.0];
+        let v = vec![0.0f32, 1.0, 0.0, 0.0];
+        // cosine distance = 1 - dot(q,v) = 1.0
+        let score = restored.fast_score(&q, &v);
+        assert!((score - 1.0).abs() < 1e-5, "score={score}");
     }
 
     #[test]

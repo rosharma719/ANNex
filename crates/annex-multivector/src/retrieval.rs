@@ -716,18 +716,18 @@ impl MultiVectorIndex {
         let s = self.snapshot();
         let (effective_request, policy_plan) = self.prepare_request(&s, request);
         let request = effective_request.as_ref();
-        let eligible: HashSet<_> = s
-            .documents
-            .iter()
-            .filter(|(_, d)| {
-                request
-                    .filter
-                    .as_ref()
-                    .is_none_or(|f| f.matches(&d.metadata))
-            })
-            .map(|(id, _)| id.as_str())
-            .collect();
-        let mut plan = self.compile_plan(&s, request, eligible.len())?;
+        // An unfiltered query means every live document is eligible. Keep that
+        // state implicit: materializing a HashSet of every ID makes an HNSW
+        // query O(collection size) before graph traversal even begins.
+        let eligible: Option<HashSet<_>> = request.filter.as_ref().map(|filter| {
+            s.documents
+                .iter()
+                .filter(|(_, document)| filter.matches(&document.metadata))
+                .map(|(id, _)| id.as_str())
+                .collect()
+        });
+        let eligible_documents = eligible.as_ref().map_or(s.documents.len(), HashSet::len);
+        let mut plan = self.compile_plan(&s, request, eligible_documents)?;
         plan.policy = policy_plan;
         let mut per_stage_actual_ms: Vec<f64> = Vec::with_capacity(plan.stages.len());
 
@@ -745,10 +745,12 @@ impl MultiVectorIndex {
                 let at = Instant::now();
                 let limit = planned.limit;
                 let allowed = |number: u64| {
-                    s.retrieval
-                        .ids
-                        .get(&number)
-                        .is_some_and(|id| eligible.contains(id.as_str()))
+                    eligible.as_ref().is_none_or(|eligible| {
+                        s.retrieval
+                            .ids
+                            .get(&number)
+                            .is_some_and(|id| eligible.contains(id.as_str()))
+                    })
                 };
                 let external = |hits: Vec<(u64, f32)>| -> Vec<(String, f32)> {
                     hits.into_iter()
@@ -803,7 +805,7 @@ impl MultiVectorIndex {
                                 field,
                                 std::slice::from_ref(vector),
                                 false,
-                                &eligible,
+                                eligible.as_ref(),
                                 limit,
                             )?
                         }
@@ -812,7 +814,7 @@ impl MultiVectorIndex {
                         field: Some(field),
                         vectors,
                         ..
-                    } => self.named_scores(&s, field, vectors, true, &eligible, limit)?,
+                    } => self.named_scores(&s, field, vectors, true, eligible.as_ref(), limit)?,
                     Channel::Multivector {
                         field: None,
                         vectors,
@@ -832,7 +834,7 @@ impl MultiVectorIndex {
                                 &s,
                                 &normalized,
                                 Some(limit),
-                                Some(&eligible),
+                                eligible.as_ref(),
                             )?
                         }
                     }
@@ -930,7 +932,7 @@ impl MultiVectorIndex {
             if let Some(field) = &rerank.field {
                 let pool: HashSet<_> = ranked.iter().map(|(id, _)| id.as_str()).collect();
                 ranked =
-                    self.named_scores(&s, field, &rerank.vectors, true, &pool, rerank.limit)?;
+                    self.named_scores(&s, field, &rerank.vectors, true, Some(&pool), rerank.limit)?;
                 if ranked.len() != reranked {
                     return Err(invalid("rerank field missing from a candidate"));
                 }
@@ -952,7 +954,8 @@ impl MultiVectorIndex {
         }
 
         let context_stage_start = Instant::now();
-        let (matches, signals) = self.context(&s, ranked, &fused, &eligible, request, agreement)?;
+        let (matches, signals) =
+            self.context(&s, ranked, &fused, eligible.as_ref(), request, agreement)?;
         per_stage_actual_ms.push(context_stage_start.elapsed().as_secs_f64() * 1000.);
 
         Ok(RetrievalResponse {
@@ -960,7 +963,7 @@ impl MultiVectorIndex {
             trace: RetrievalTrace {
                 plan,
                 generation: s.generation,
-                eligible_documents: eligible.len(),
+                eligible_documents,
                 channels,
                 fused_candidates,
                 reranked_candidates: reranked,
@@ -978,7 +981,7 @@ impl MultiVectorIndex {
         field: &str,
         query: &[Vector],
         multivector: bool,
-        eligible: &HashSet<&str>,
+        eligible: Option<&HashSet<&str>>,
         limit: usize,
     ) -> Result<Vec<(String, f32)>, IndexError> {
         validate_matrix(query)?;
@@ -997,13 +1000,8 @@ impl MultiVectorIndex {
             )));
         }
         let normalized: Vec<_> = query.iter().map(|v| normalize(v)).collect();
-        let scores = eligible
-            .par_iter()
-            .filter_map(|&id| {
-                let d = s.documents.get(id)?;
-                d.fields.representations.get(field).map(|r| (id, d, r))
-            })
-            .map(|(id, d, r)| {
+        let score = |id: &str, d: &DocumentRecord| {
+            d.fields.representations.get(field).map(|r| {
                 let (location, dimension, count) = match r {
                     StoredRepresentation::Dense {
                         location,
@@ -1024,7 +1022,18 @@ impl MultiVectorIndex {
                 };
                 Ok::<_, IndexError>((id.to_owned(), score))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+        };
+        let scores = match eligible {
+            Some(eligible) => eligible
+                .par_iter()
+                .filter_map(|&id| s.documents.get(id).and_then(|d| score(id, d)))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => s
+                .documents
+                .par_iter()
+                .filter_map(|(id, d)| score(id, d))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         Ok(top(scores, limit))
     }
 
@@ -1033,7 +1042,7 @@ impl MultiVectorIndex {
         s: &State,
         ranked: Vec<(String, f32)>,
         fused: &HashMap<String, (f32, Vec<usize>)>,
-        eligible: &HashSet<&str>,
+        eligible: Option<&HashSet<&str>>,
         request: &RetrieveRequest,
         channel_agreement: Option<f32>,
     ) -> Result<(Vec<ContextHit>, RankingSignals), IndexError> {
@@ -1110,7 +1119,7 @@ impl MultiVectorIndex {
                    key: Option<blake3::Hash>|
          -> bool {
             let d = &s.documents[id];
-            if !eligible.contains(id) {
+            if eligible.is_some_and(|eligible| !eligible.contains(id)) {
                 return false;
             }
             let est_tokens = estimate_tokens(id).unwrap_or(0);
@@ -1155,7 +1164,8 @@ impl MultiVectorIndex {
                         continue;
                     }
                     let est_tokens = estimate_tokens(id).unwrap_or(0);
-                    let result = if !eligible.contains(id.as_str()) {
+                    let result = if eligible.is_some_and(|eligible| !eligible.contains(id.as_str()))
+                    {
                         AcceptResult::AlreadyAdded // permanent exclusion
                     } else {
                         selected.accepts(
@@ -1223,7 +1233,9 @@ impl MultiVectorIndex {
                 && let Some(chunk) = &s.documents[id].fields.chunk
             {
                 for neighbor in s.retrieval.neighbors(chunk, options.neighbors) {
-                    if !eligible.contains(neighbor) || selected.ids.contains(neighbor) {
+                    if eligible.is_some_and(|eligible| !eligible.contains(neighbor))
+                        || selected.ids.contains(neighbor)
+                    {
                         continue;
                     }
                     add(
@@ -1375,6 +1387,45 @@ mod tests {
         );
         assert_eq!(filtered.eligible_documents, 2);
     }
+
+    #[test]
+    fn cached_planner_stats_track_replacement_deletion_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut query = request();
+        query.filter = None;
+        query
+            .prefetch
+            .retain(|channel| matches!(channel, Channel::Dense { .. }));
+
+        let initial = index.plan(&query).unwrap().stats;
+        assert_eq!(initial.documents, 3);
+        assert_eq!(initial.text_documents, 3);
+        assert_eq!(initial.fields["semantic"].documents, 3);
+        assert_eq!(initial.fields["tokens"].documents, 3);
+        assert_eq!(initial.fields["sparse"].documents, 3);
+
+        index
+            .upsert_records(vec![RetrievalDocument {
+                id: "a".into(),
+                metadata: json!({"tenant": "a"}),
+                ..RetrievalDocument::default()
+            }])
+            .unwrap();
+        index.delete("b").unwrap();
+
+        let updated = index.plan(&query).unwrap().stats;
+        assert_eq!(updated.documents, 2);
+        assert_eq!(updated.text_documents, 1);
+        assert_eq!(updated.fields["semantic"].documents, 1);
+        assert_eq!(updated.fields["tokens"].documents, 1);
+        assert_eq!(updated.fields["sparse"].documents, 1);
+
+        drop(index);
+        let reopened = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
+        assert_eq!(reopened.plan(&query).unwrap().stats, updated);
+    }
+
     #[test]
     fn hybrid_filters_before_top_k_and_preserves_named_fields_on_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -1854,7 +1905,7 @@ mod tests {
                 "semantic",
                 &[vec![1., 0.]],
                 false,
-                &HashSet::from(["a", "b"]),
+                Some(&HashSet::from(["a", "b"])),
                 10,
             )
             .unwrap();
@@ -1868,7 +1919,7 @@ mod tests {
                     "semantic",
                     &[vec![1., 0.]],
                     false,
-                    &HashSet::from(["a", "b"]),
+                    Some(&HashSet::from(["a", "b"])),
                     10
                 )
                 .unwrap(),
@@ -1885,7 +1936,7 @@ mod tests {
                     "semantic",
                     &[vec![1., 0.]],
                     false,
-                    &HashSet::from(["a", "b"]),
+                    Some(&HashSet::from(["a", "b"])),
                     10
                 )
                 .unwrap(),

@@ -281,6 +281,7 @@ struct State {
     named_ann: HashMap<String, FdeAnn>,
     stores: Arc<SegmentStores>,
     retrieval: Arc<RetrievalState>,
+    planner_stats: planner::CachedPlannerStats,
     objects_map: Option<Arc<memmap2::Mmap>>,
     fde_map: Option<Arc<memmap2::Mmap>>,
     sealed: HashMap<u64, Arc<SegmentSnapshot>>,
@@ -765,6 +766,8 @@ impl MultiVectorIndex {
         for (id, d) in ordered {
             retrieval.insert(id, &d.fields)?;
         }
+        let planner_stats =
+            planner::CachedPlannerStats::from_documents(&documents, retrieval.schema());
         Ok(Self {
             fde: if fde_encoding_version == 2 {
                 FdeEncoder::new(
@@ -813,6 +816,7 @@ impl MultiVectorIndex {
                     retired: std::sync::atomic::AtomicBool::new(false),
                 }),
                 retrieval: Arc::new(retrieval),
+                planner_stats,
                 sealed,
             })),
             root,
@@ -1025,6 +1029,9 @@ impl MultiVectorIndex {
             let fields = Arc::new(Fields::prepare(&document, &next.stores)?);
             let id = document.id;
             Arc::make_mut(&mut next.retrieval).insert(&id, &fields)?;
+            if let Some(old) = next.documents.get(&id) {
+                next.planner_stats.remove(old, next.retrieval.schema());
+            }
             if let Some(old_ids) = next
                 .documents
                 .get(&id)
@@ -1098,20 +1105,19 @@ impl MultiVectorIndex {
                     ann.delta.remove(&id);
                 }
             }
-            next.documents.insert(
-                id,
-                DocumentRecord {
-                    centroid_ids: ids,
-                    unique_centroids,
-                    location,
-                    fde_location,
-                    metadata: document.metadata,
-                    tokens: vectors.len(),
-                    compressed_bytes: size,
-                    fields,
-                    storage_id: next.stores.id.unwrap_or(0),
-                },
-            );
+            let record = DocumentRecord {
+                centroid_ids: ids,
+                unique_centroids,
+                location,
+                fde_location,
+                metadata: document.metadata,
+                tokens: vectors.len(),
+                compressed_bytes: size,
+                fields,
+                storage_id: next.stores.id.unwrap_or(0),
+            };
+            next.planner_stats.add(&record, next.retrieval.schema());
+            next.documents.insert(id, record);
         }
         self.commit(&s, next)
     }
@@ -1124,6 +1130,7 @@ impl MultiVectorIndex {
         let mut next = (*s).clone();
         let d = next.documents.remove(id).unwrap();
         Arc::make_mut(&mut next.retrieval).remove(id);
+        next.planner_stats.remove(&d, next.retrieval.schema());
         for c in d.unique_centroids {
             next.postings[c as usize].remove(id);
         }

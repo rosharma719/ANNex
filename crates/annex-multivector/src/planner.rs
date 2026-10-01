@@ -148,6 +148,72 @@ pub struct PlannerStats {
     pub filter_stats: Option<FilterStats>,
 }
 
+/// Collection-wide statistics maintained with each immutable state generation.
+/// Query planning must not scan the document map to rediscover these values.
+#[derive(Clone, Debug, Default)]
+pub(super) struct CachedPlannerStats {
+    text_documents: usize,
+    token_documents: usize,
+    token_vectors: usize,
+    field_documents: BTreeMap<String, usize>,
+}
+
+impl CachedPlannerStats {
+    pub(super) fn from_documents(
+        documents: &HashMap<String, DocumentRecord>,
+        schema: &BTreeMap<String, FieldSchema>,
+    ) -> Self {
+        let mut stats = Self {
+            field_documents: schema.keys().map(|name| (name.clone(), 0)).collect(),
+            ..Self::default()
+        };
+        for document in documents.values() {
+            stats.add(document, schema);
+        }
+        stats
+    }
+
+    pub(super) fn add(
+        &mut self,
+        document: &DocumentRecord,
+        schema: &BTreeMap<String, FieldSchema>,
+    ) {
+        self.text_documents += usize::from(document.fields.has_text());
+        self.token_documents += usize::from(document.tokens > 0);
+        self.token_vectors += document.tokens;
+        for name in schema.keys() {
+            let count = self.field_documents.entry(name.clone()).or_default();
+            *count += usize::from(document.fields.has_representation(name));
+        }
+    }
+
+    pub(super) fn remove(
+        &mut self,
+        document: &DocumentRecord,
+        schema: &BTreeMap<String, FieldSchema>,
+    ) {
+        self.text_documents = self
+            .text_documents
+            .checked_sub(usize::from(document.fields.has_text()))
+            .expect("cached text-document count is consistent");
+        self.token_documents = self
+            .token_documents
+            .checked_sub(usize::from(document.tokens > 0))
+            .expect("cached token-document count is consistent");
+        self.token_vectors = self
+            .token_vectors
+            .checked_sub(document.tokens)
+            .expect("cached token-vector count is consistent");
+        for name in schema.keys() {
+            let decrement = usize::from(document.fields.has_representation(name));
+            let count = self.field_documents.entry(name.clone()).or_default();
+            *count = count
+                .checked_sub(decrement)
+                .expect("cached field-document count is consistent");
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PlannedChannel {
     pub index: usize,
@@ -326,16 +392,16 @@ impl MultiVectorIndex {
         let state = self.snapshot();
         let (effective_request, policy_plan) = self.prepare_request(&state, request);
         let request = effective_request.as_ref();
-        let eligible = state
-            .documents
-            .values()
-            .filter(|document| {
-                request
-                    .filter
-                    .as_ref()
-                    .is_none_or(|filter| filter.matches(&document.metadata))
-            })
-            .count();
+        let eligible = request
+            .filter
+            .as_ref()
+            .map_or(state.documents.len(), |filter| {
+                state
+                    .documents
+                    .values()
+                    .filter(|document| filter.matches(&document.metadata))
+                    .count()
+            });
         let mut plan = self.compile_plan(&state, request, eligible)?;
         plan.policy = policy_plan;
         Ok(plan)
@@ -718,10 +784,11 @@ pub(super) fn planner_stats(
                 FieldSchema::Sparse => (RepresentationKind::Sparse, None),
             };
             let documents = state
-                .documents
-                .values()
-                .filter(|document| document.fields.has_representation(name))
-                .count();
+                .planner_stats
+                .field_documents
+                .get(name)
+                .copied()
+                .unwrap_or(0);
             (
                 name.clone(),
                 FieldStats {
@@ -748,21 +815,9 @@ pub(super) fn planner_stats(
     PlannerStats {
         generation: state.generation,
         documents: n,
-        text_documents: state
-            .documents
-            .values()
-            .filter(|document| document.fields.has_text())
-            .count(),
-        token_documents: state
-            .documents
-            .values()
-            .filter(|document| document.tokens > 0)
-            .count(),
-        token_vectors: state
-            .documents
-            .values()
-            .map(|document| document.tokens)
-            .sum(),
+        text_documents: state.planner_stats.text_documents,
+        token_documents: state.planner_stats.token_documents,
+        token_vectors: state.planner_stats.token_vectors,
         fde_dimension,
         fde_graph_ready: state.fde_ann.is_some(),
         fields,

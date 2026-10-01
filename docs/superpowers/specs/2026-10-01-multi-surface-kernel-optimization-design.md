@@ -1,6 +1,6 @@
 # Multi-Surface Kernel Optimization
 
-**Date:** 2026-10-01 (revised after review)
+**Date:** 2026-10-01 (revised ×2 after review)
 **Branch:** feat/query-planner
 **Author:** rosharma719
 
@@ -8,10 +8,10 @@
 
 ## Goal
 
-Vectorize all hot kernels for every real deployment surface, eliminate in-loop dispatch overhead, and produce benchmarks that prove gains — including a structured comparison against competing retrieval stacks.
+Vectorize all hot kernels for every real deployment surface, eliminate in-loop dispatch overhead, and produce benchmarks that prove gains — including real-dataset MaxSim validation and a structured competitor comparison.
 
 Three sequential stages:
-1. **Correct kernels + per-backend microbenchmarks** — the bulk of this spec
+1. **Correct kernels + per-backend microbenchmarks** (this spec)
 2. **EC2 end-to-end validation** — HNSW and MaxSim against ANNex baseline at matched recall
 3. **Competitor comparison** — separate project; methodology defined at end of this doc
 
@@ -21,22 +21,22 @@ Three sequential stages:
 
 ### `annex-core` — HNSW search kernels (`core.rs`)
 
-| Kernel | ARM64 | AVX2+FMA | AVX-512 |
-|---|---|---|---|
-| `dot_product` | NEON ✓ | AVX2+FMA ✓ | — |
-| `l2_squared` | NEON ✓ | AVX2+FMA ✓ | — |
-| `screen_dot` | NEON sdot ✓ | AVX2 ✓ (widening, keep as-is) | — |
+| Kernel | ARM64 | AVX2 | AVX2+FMA | AVX-512 |
+|---|---|---|---|---|
+| `dot_product` | NEON ✓ | AVX2 ✓ | AVX2+FMA ✓ | — |
+| `l2_squared` | NEON ✓ | AVX2 ✓ | AVX2+FMA ✓ | — |
+| `screen_dot` | NEON sdot ✓ | AVX2 ✓ (widening) | — | — |
 
-All three dispatch via `is_x86_feature_detected!()` inside the function body, which is called per candidate in the HNSW inner loop.
+All three dispatch via `is_x86_feature_detected!()` inside the function body. `fast_score()` (which calls `dot_product`/`l2_squared`) is called at 14 sites in `search.rs` — inside BFS candidate loops, filtered-search loops, exact-scan loops, insertion, and graph-maintenance.
 
-Note on `screen_dot_avx2`: the existing widening-to-i16 path (`cvtepu8_epi16`, `cvtepi8_epi16`, `sub_epi16`, `mullo_epi16`, `madd_epi16`) is the correctness baseline and must not be replaced with `_mm256_maddubs_epi16` without proving that adjacent-pair sums cannot exceed `i16::MAX` (32767). `maddubs` saturates: `255×127 + 255×127 = 64770` overflows. This rewrite is deferred.
+**`screen_dot_avx2` status:** the existing widening-to-i16 path is the correctness baseline and must not be replaced with `_mm256_maddubs_epi16` without proving adjacent-pair sums cannot exceed `i16::MAX` (32767). `maddubs` saturates: `255×127 + 255×127 = 64770` overflows. This rewrite is deferred out of scope.
 
 ### `annex-multivector` — MaxSim/FDE kernels (`fde.rs`)
 
-| Kernel | ARM64 | x86-64 |
-|---|---|---|
-| `dot` | NEON FMA ✓ | scalar only — no x86 path |
-| `maxsim_flat` | NEON ✓ + dim=128 specialization | scalar only — no x86 path |
+| Kernel | ARM64 | AVX2+FMA | AVX-512 |
+|---|---|---|---|
+| `dot` | NEON FMA ✓ | — scalar only | — |
+| `maxsim_flat` | NEON ✓ + dim=128 | — scalar only | — |
 
 ### Benchmarks
 
@@ -46,17 +46,15 @@ Note on `screen_dot_avx2`: the existing widening-to-i16 path (`cvtepu8_epi16`, `
 
 ## Dispatch Architecture
 
-### What changes — and why
+### What Rust already does
 
-Rust's `std_detect` already caches CPU feature flags in an atomic initialized on first use. Each `is_x86_feature_detected!("avx2")` call is an atomic load + bit test — not a CPUID. A `OnceLock<CpuLevel>` replacing it would add a second atomic load on top of the first, with no net benefit.
+`std_detect` caches CPU feature flags in an atomic initialized on first use. Each `is_x86_feature_detected!("avx2")` call is an atomic load + bit test — not a CPUID re-execution. Adding a `OnceLock<CpuLevel>` on top reduces nothing.
 
-**The real overhead** is that the dispatch branch lives inside functions called per candidate (HNSW) or per token (MaxSim). Even with perfect branch prediction, this is a branch in the hot inner loop.
+**The real overhead** is that dispatch branches live inside functions called per candidate or per token. The goal is to select the kernel function *once per search* (outside the candidate loop) rather than once per candidate.
 
-**Fix:** select a function pointer *before* the candidate/token loop; call it unconditionally inside the loop. The selection itself uses the existing `is_x86_feature_detected!` machinery (already cached).
+### `CpuLevel` enum
 
-### `CpuLevel` enum — for selection, not detection
-
-A `CpuLevel` enum provides a clean way to select function pointers at the call site. It is computed once by the caller outside the loop, not stored globally.
+A `CpuLevel` value is computed by the caller outside the hot loop to select a function pointer; it is not stored globally.
 
 ```rust
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,106 +67,147 @@ pub enum CpuLevel {
     Avx2,         // avx2 only
     Scalar,
 }
-
-pub fn cpu_level() -> CpuLevel { /* one call, result used by caller */ }
+pub fn cpu_level() -> CpuLevel { /* detects once per call; std_detect already caches */ }
 ```
 
-**Per-kernel selection, not a global ranking.** A single `CpuLevel` value does not mean "use AVX-512 for everything." Each kernel selects its best implementation independently based on the available feature set:
+### Per-kernel dispatch table
 
-- `screen_dot`: `Avx512Vnni` → VNNI path; `Avx2Fma | Avx2` → existing widening path; else scalar.
-- `dot_product` / `l2_squared`: `Avx512F | Avx512Vnni` → AVX-512 path; `Avx2Fma` → existing `dot_avx2_fma`; else scalar.
-- `maxsim_flat`: same as `dot_product`.
+Each kernel selects its best implementation independently. The complete dispatch for all new and existing kernels:
 
-**Measure dispatch overhead before and after.** The criterion bench must show whether hoisting outside the loop produces a measurable improvement. If the difference is within noise, the hoist is still correct but the spec should not claim a specific speedup.
+**`dot_product` / `l2_squared`:**
+- `Avx512Vnni | Avx512F` → new `dot_avx512` / `l2_avx512`
+- `Avx2Fma` → existing `dot_avx2_fma` / `l2_avx2_fma`
+- `Avx2` → existing `dot_avx2` / `l2_avx2` ← **must not regress**
+- `NeonDotprod | Neon` → existing `dot_neon` / `l2_neon`
+- `Scalar` → scalar
 
-### Location
+**`screen_dot`:**
+- `Avx512Vnni` → new `screen_dot_avx512_vnni`
+- `Avx2Fma | Avx2` → existing `screen_dot_avx2` (widening, unchanged)
+- `NeonDotprod` → existing `screen_dot_neon_sdot`
+- `Neon | Scalar` → scalar
 
-New file `crates/annex-core/src/vector/simd.rs`. `annex-multivector` imports `cpu_level` from `annex` (the existing dep on `annex-core`).
+**`fde::dot` / `maxsim_flat`:**
+- `Avx512Vnni | Avx512F` → new `dot_avx512` / `maxsim_flat_avx512`
+- `Avx2Fma` → new `dot_avx2_fma` / `maxsim_flat_avx2_fma`
+- `Avx2` → new `dot_avx2` / `maxsim_flat_avx2` (2-accumulator variant, no FMA)
+- `NeonDotprod | Neon` → existing NEON paths
+- `Scalar` → scalar
+
+### Hoisting `fast_score` dispatch in `HNSWIndex`
+
+`fast_score` is a method on `HNSWIndex` calling `dot_product`/`l2_squared` at 14 call sites across search, insertion, and graph-maintenance paths. Hoisting dispatch at each call site individually is fragile and incomplete.
+
+**Design:** store a scorer on the `HNSWIndex` struct, selected once at construction/open time:
+
+```rust
+struct HNSWIndex {
+    ...
+    dot_fn: fn(&[f32], &[f32]) -> f32,
+    l2_fn:  fn(&[f32], &[f32]) -> f32,
+}
+```
+
+`fast_score` calls `self.dot_fn` or `self.l2_fn` directly. All 14 call sites are covered with no signature changes to search paths.
+
+**Indirect-call caveat.** An indirect function-pointer call may cost as much as or more than the current predictable branch on a well-trained predictor. **Measure before claiming a win.** The acceptance criterion is:
+
+> Keep the struct-stored scorer only if it produces no statistically meaningful regression vs. the current dispatch at representative dimensions. If indirect-call overhead is measurable, retain cached branch dispatch (`is_x86_feature_detected!`) in `dot_product`/`l2_squared` and specialize the enclosing loop instead.
+
+The benchmark section below specifies how to measure this.
 
 ---
 
 ## Kernel Additions
 
-All throughput figures below are theoretical maximums based on register widths. Actual performance depends on memory bandwidth, loop structure, and unrolling — **treat as hypotheses to validate with generated assembly and measurement, not assertions.**
+All throughput figures are theoretical maximums based on register widths. Treat as hypotheses; validate with generated assembly and Criterion numbers before asserting improvement.
 
 ### `annex-core/src/vector/hnsw/core.rs`
 
 #### `dot_avx512` / `l2_avx512`
 
-`#[target_feature(enable = "avx512f")]` kernels using `_mm512_fmadd_ps` (16 f32/register).
+`#[target_feature(enable = "avx512f")]`. Use `_mm512_fmadd_ps` with multiple `__m512` accumulators across the loop. Reduction: accumulate at loop end; `_mm512_reduce_add_ps` is a multi-instruction convenience — inspect generated assembly and replace with an explicit extract-and-add tree if the compiler emits suboptimal code. Scalar tail for `len % 16`.
 
-Reduction: accumulate into multiple `__m512` registers across the loop; reduce to scalar at the end. `_mm512_reduce_add_ps` is a multi-instruction reduction convenience — if the compiler emits suboptimal code, replace with explicit extract-and-add tree. Determine final form after inspecting generated assembly.
-
-Tail: scalar loop for `len % 16` elements.
-
-Required features: `avx512f`. No VNNI dependency.
+Number of accumulators: start with 8 (matching NEON's register count), adjust after benchmarking.
 
 #### `screen_dot_avx512_vnni`
 
-`#[target_feature(enable = "avx512f,avx512vnni")]` kernel using `_mm512_dpbusd_epi32`.
+`#[target_feature(enable = "avx512f,avx512vnni")]`. Uses `_mm512_dpbusd_epi32(acc, u8_stored, i8_query)` which computes `acc += sum(u8[i] * i8[i])` over 64 elements per call.
 
-`_mm512_dpbusd_epi32(acc, a, b)` computes `acc += sum(a[i] * b[i])` where `a` is **u8** and `b` is **i8**, 64 elements per call. This matches the operand types (stored = u8, query = i8) but not the centering.
-
-**Centering correction.** The existing contract computes `sum(query_i8[i] × (stored_u8[i] − 128))`. Expanding:
+**Centering correction.** The kernel contract is `sum(query_i8[i] × (stored_u8[i] − 128))`. Expanding:
 
 ```
 sum(query_i8[i] × stored_u8[i]) − 128 × sum(query_i8[i])
 ```
 
-The VNNI accumulator computes the first term directly. The correction `128 × sum(query_i8[i])` is a scalar computed once per query vector (outside the document loop) and subtracted from the VNNI result after reduction. This must handle:
+The VNNI accumulator computes the first term. The second term — `128 × sum(query_i8)` — is a scalar precomputed **once per query** (outside the document loop) and subtracted from the VNNI result after reduction.
 
-- The existing slice-length contract: `n = query_i8.len().min(stored.len())` — correction sum must cover exactly the same `n` elements.
-- Overflow: `sum(query_i8)` for a 768-dim vector with all values at +127 = 97536, times 128 = 12M — fits in i32 (max ~2.1B). Document this bound.
+**Length contract.** Precomputing the correction once per query is only valid when every stored vector has the same dimension as the query. In the HNSW index this is an invariant (all vectors share `self.dim`). The public `screen_dot` function must document: when called via the HNSW path, `query_i8.len() == stored.len()` is guaranteed. When lengths differ (the existing `min` contract), fall through to scalar.
 
-4 accumulators, each covering 64 elements per iteration = 256 elements/iteration before tail.
+**Overflow safety.** Correction value = `128 × sum(query_i8)`. Worst case: `dim=4096`, all values at `+127`. `4096 × 127 × 128 = 66,584,576 < i32::MAX (2,147,483,647)`. Safe. VNNI accumulator worst case: `4096 × 255 × 127 = 132,464,640 < i32::MAX`. Document both bounds in the implementation.
 
-Required features: `avx512f` + `avx512vnni`.
+4 accumulators covering 64 elements each = 256 elements/iteration before tail.
 
 ### `annex-multivector/src/fde.rs`
 
 #### `dot_avx2_fma` / `dot_avx512`
 
-Mirror the NEON `dot_neon_multiple_of_16` structure. Multiple accumulators to cover the multiple-of-16 prefix; scalar tail for remainder. Reduction without `_mm256_hadd_ps`: use `_mm256_extractf128_ps` + `_mm_add_ps` + `_mm_shuffle_ps` or `_mm_movehl_ps`.
+Mirror `dot_neon_multiple_of_16`. Multiple accumulators over the multiple-of-16 prefix; scalar tail. Reduction without `_mm256_hadd_ps`: use `_mm256_extractf128_ps` + `_mm_add_ps` + `_mm_movehl_ps` + `_mm_add_ss`.
 
-The number of accumulators and unroll depth is a tuning decision — start with 4 (matching NEON), adjust after benchmarking.
+`dot_avx2` (no-FMA variant): 2 accumulators using `_mm256_add_ps(_mm256_mul_ps(...))`.
 
 #### `maxsim_flat_avx2_fma` / `maxsim_flat_avx512`
 
-Mirror `maxsim_flat_neon`:
-- General path: call per-doc-token dot on each doc chunk.
-- dim=128 specialization: const-length variant allowing full unrolling.
-
-Dispatch: call `cpu_level()` once before the query-token outer loop; pass a function pointer into the inner loop.
+Mirror `maxsim_flat_neon`. General path calls per-doc-token dot; dim=128 specialization uses a const-length variant allowing full loop unrolling. Dispatch: call `cpu_level()` once before the query-token outer loop; use a function pointer inside the inner loop.
 
 ---
 
 ## Correctness
 
-### Problem with dispatch-path testing
-
-Testing `dot_product(...)` on Ice Lake with `RUSTFLAGS=-C target-cpu=native` exercises the AVX-512 path. It does not test AVX2, AVX2+FMA, or scalar. The same is true for `screen_dot` and `maxsim_flat`.
-
 ### Required: direct per-backend tests
 
-Each kernel function (`dot_avx2`, `dot_avx2_fma`, `dot_avx512`, `l2_avx2`, `l2_avx2_fma`, `l2_avx512`, `screen_dot_avx2`, `screen_dot_avx512_vnni`, `maxsim_flat_avx2_fma`, `maxsim_flat_avx512`) needs its own test calling the function directly, gated by `#[cfg(target_arch = "x86_64")]` and a runtime feature check.
+Tests must call each kernel function directly (not through public dispatch), gated by `#[cfg(target_arch = "x86_64")]` with a runtime feature check. Testing `dot_product(...)` on AVX-512 hardware does not test the AVX2 or scalar paths.
 
-**For screen_dot (integer kernels) — required cases:**
-- Empty input (len = 0)
-- Lengths below SIMD width: 1, 4, 15, 16, 31, 32
-- Lengths at SIMD boundaries: 32, 64, 128, 256
-- Integer extremes: `query_i8 = [127; N]`, `stored_u8 = [255; N]` and `[0; N]`
-- Adversarial adjacent pairs designed to expose saturation bugs in any future `maddubs` attempt: `q=[127,127,...]`, `s=[255,255,...]`
-- Correctness: assert exact integer equality with `screen_dot_scalar` for all cases
+**For `screen_dot` integer kernels — required cases per backend:**
+- Empty input (`len = 0`)
+- Below SIMD width: lengths 1, 4, 15, 16, 31, 32
+- SIMD boundaries: 32, 64, 128, 256
+- Integer extremes: `query_i8 = [127; N]` with `stored_u8 = [255; N]` and `[0; N]`
+- Adversarial pairs: `q=[127,127,…]`, `s=[255,255,…]` (validates saturation behavior of any future rewrite)
+- Correctness: exact integer equality with `screen_dot_scalar`
 
-**For f32 kernels — required cases:**
-- Lengths below SIMD width: 1, 4, 7, 8, 15, 16, 31, 32
-- Lengths at SIMD boundaries: 16, 32, 64, 128, 256, 512
-- Floating-point cancellation: alternating +1.0 and -1.0
-- Tolerance: ≤ 1e-3 absolute difference vs scalar, with dimension-appropriate scaling
+**For f32 kernels — required cases per backend:**
+- Below SIMD width: 1, 4, 7, 8, 15, 16, 31, 32
+- SIMD boundaries: 16, 32, 64, 128, 256, 512
+- Floating-point cancellation: alternating `+1.0` and `-1.0`
+- Tolerance formula: `abs(actual − reference) ≤ 1e-3 × max(1.0, abs(reference))`
 
 ### Benchmark access for `screen_dot`
 
-`screen_dot` is currently `pub(crate)` in `annex-core`. To benchmark it in the Criterion bench (which lives in `annex-multivector`), add a thin `pub` re-export in `annex-core` behind a `#[cfg(any(test, feature = "bench-internals"))]` gate. The `bench-internals` Cargo feature is activated only in the benchmark binary. Do not expose it in the public library API.
+`screen_dot` is `pub(crate)` in `annex-core`. Add a thin re-export in `annex-core` behind a Cargo feature:
+
+```toml
+# annex-core/Cargo.toml
+[features]
+bench-internals = []
+```
+
+```rust
+// annex-core/src/lib.rs or vector/mod.rs
+#[cfg(feature = "bench-internals")]
+pub use crate::vector::hnsw::core::{screen_dot, screen_dot_scalar};
+```
+
+`annex-multivector/Cargo.toml` enables this feature for the bench binary only:
+
+```toml
+[[bench]]
+name = "kernels"
+required-features = []  # bench-internals enabled via dev-dependency feature activation
+
+[dev-dependencies]
+annex = { path = "../annex-core", version = "0.2.0", features = ["bench-internals"] }
+```
 
 ---
 
@@ -176,38 +215,67 @@ Each kernel function (`dot_avx2`, `dot_avx2_fma`, `dot_avx512`, `l2_avx2`, `l2_a
 
 ### Criterion (`benches/kernels.rs`)
 
-New group `bench_screen_dot`:
-- Call `screen_dot` dispatch (via `bench-internals` feature) for dim=128, dim=256, dim=768
-- This gives the first Criterion coverage of the SQ8 screening kernel
+The benchmark must measure dispatch overhead directly, not just kernel throughput. For each of `screen_dot` and `maxsim_flat`, benchmark four variants at representative dimensions:
 
-`bench_maxsim_flat` gains dim=512 and dim=768.
+1. **Existing public dispatch** — current behavior baseline
+2. **Hoisted function pointer** — selected before the loop, called unconditionally inside
+3. **Direct backend invocation** — call the SIMD function directly (requires `bench-internals`)
+4. **Scalar reference**
 
-**Expected outputs:** absolute timing with Criterion confidence intervals. Claim no speedup until numbers are in hand.
+This produces a 4-row table per dimension that shows whether the hoist helps, hurts, or is within noise vs. the current dispatch. Use this data to make the hoist/no-hoist decision.
+
+**New group `bench_screen_dot`:** dim=128, dim=256, dim=768, four variants each.
+
+**`bench_maxsim_flat` additions:** dim=512, dim=768 added to existing dim=128, dim=384 cases; four variants each where practical.
+
+**`maxsim-bench` binary** (Stage 1): run the existing `maxsim_bench` binary on EC2 to compare scalar, AVX2, AVX-512 paths at the ColBERT workload shape (10K docs × 200 tokens × 128 dims, 250 candidates). This isolates raw kernel throughput before the full pipeline.
 
 ---
 
-## Stages 2 and 3
+## Stage 2 — EC2 End-to-End Validation
 
-### Stage 2 — EC2 end-to-end validation
+Run after all Stage 1 kernels pass backend tests and the Criterion bench shows no regression.
 
-Run after stage 1 kernels pass all backend tests.
+### HNSW kernel validation
 
-**HNSW kernel validation:** ANNex baseline (current `master`) vs patched (this branch) on NYT-256-angular. Same M=16 + SQ8 screening + RCM config. Metric: recall@10 vs median query latency at matched recall. Expected: no regression in recall; latency improvement measurable at ≥2× criterion sample count for statistical significance.
+ANNex `master` vs. patched branch on NYT-256-angular. Same M=16 + SQ8 screening + RCM config. Warm up with at least 3 full query sweeps before recording. Fix CPU affinity and thread count. Randomize baseline/patched run order. Report:
 
-**MaxSim kernel validation:** Use the existing `maxsim_bench` binary workload (10K docs × 200 tokens × 128 dims, 250 candidates). Compare scalar vs AVX2 vs AVX-512 paths directly. NYT-256 is single-vector retrieval and does **not** exercise `maxsim_flat`.
+- Recall@10 at matched ef_search settings
+- Median query latency with confidence interval over paired query deltas
+- No improvement is claimed if the CI overlaps zero
 
-### Stage 3 — Competitor comparison (separate project)
+### MaxSim kernel validation
 
-Comparing ANNex against Qdrant, Weaviate, and pgvector requires:
+Use the real BEIR/ColBERT harness — `maxsim-bench` is synthetic and belongs in Stage 1:
 
-- Controlled dataset (NYT-256-angular, same version)
-- Each system configured at comparable `M` and `ef_construction`
-- Warmup rounds documented
-- Network/client overhead separated from pure index latency (test with local UNIX socket or loopback where possible)
-- Resource limits (RAM, CPU threads) equalized or reported
-- Published configurations (not default-tuned for one system)
+```bash
+benchmark/headtohead.py \
+  --dataset beir/fiqa/test \
+  --engines annex_exact,annex_hnsw \
+  --annex-candidates 250
+```
 
-This is a non-trivial methodology effort. It belongs in a separate spec, not as a tail of the kernel work. When the kernel stages are complete and validated, open a new brainstorm for the competitor comparison.
+Run with identical cached ColBERT embeddings, query partition, candidate count, and settings for both baseline and patched builds. Record:
+
+- MaxSim-stage time via `MULTIVECTOR_TIMING` instrumentation
+- Total query p50/p95
+- Ranking agreement (NDCG@10, MRR) between baseline and patched
+- Exact baseline and patched commit SHAs in the report
+
+Claim no improvement unless the MaxSim-stage CI does not overlap zero.
+
+---
+
+## Stage 3 — Competitor Comparison (Separate Project)
+
+Comparing ANNex against Qdrant, Weaviate, and pgvector requires its own spec covering:
+- Controlled dataset version pinning (NYT-256-angular, BEIR)
+- Equal `M`, `ef_construction`, thread count, and RAM limits per system
+- Network/client overhead isolated (loopback or UNIX socket where available)
+- Warmup protocol and measurement window
+- Published configurations commited to the repo
+
+This is a non-trivial methodology effort. Open a new brainstorm when Stage 2 is complete.
 
 ---
 
@@ -215,12 +283,13 @@ This is a non-trivial methodology effort. It belongs in a separate spec, not as 
 
 | File | Change |
 |---|---|
-| `crates/annex-core/src/vector/simd.rs` | **New** — `CpuLevel` enum + `cpu_level()` detection function |
+| `crates/annex-core/src/vector/simd.rs` | **New** — `CpuLevel` enum + `cpu_level()` |
 | `crates/annex-core/src/vector/mod.rs` | Re-export `simd::cpu_level` |
-| `crates/annex-core/src/vector/hnsw/core.rs` | Add `dot_avx512`, `l2_avx512`, `screen_dot_avx512_vnni`; hoist dispatch outside candidate loop; per-backend correctness tests |
-| `crates/annex-core/Cargo.toml` | Add `bench-internals` feature flag |
-| `crates/annex-multivector/src/fde.rs` | Add `dot_avx2_fma`, `dot_avx512`, `maxsim_flat_avx2_fma`, `maxsim_flat_avx512`; hoist dispatch outside token loop |
-| `crates/annex-multivector/benches/kernels.rs` | Add `bench_screen_dot` group; extend `bench_maxsim_flat` dims |
+| `crates/annex-core/src/vector/hnsw/core.rs` | Add `dot_avx512`, `l2_avx512`, `screen_dot_avx512_vnni`; store scorer on `HNSWIndex`; per-backend correctness tests; `bench-internals` re-export |
+| `crates/annex-core/Cargo.toml` | Add `bench-internals` feature |
+| `crates/annex-multivector/src/fde.rs` | Add `dot_avx2`, `dot_avx2_fma`, `dot_avx512`, `maxsim_flat_avx2`, `maxsim_flat_avx2_fma`, `maxsim_flat_avx512`; hoist dispatch |
+| `crates/annex-multivector/benches/kernels.rs` | Add `bench_screen_dot`; extend `bench_maxsim_flat`; add dispatch-overhead variants |
+| `crates/annex-multivector/Cargo.toml` | Enable `annex/bench-internals` in dev-dependencies for bench binary |
 
 ---
 
@@ -231,4 +300,4 @@ This is a non-trivial methodology effort. It belongs in a separate spec, not as 
 - ARM SVE / SVE2
 - BF16 / FP16 kernels
 - Cosine-specific normalize+dot fusion
-- Competitor comparison (Stage 3 is a separate project)
+- Competitor comparison (Stage 3 — separate project)

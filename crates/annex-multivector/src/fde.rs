@@ -1,3 +1,5 @@
+use annex::vector::simd::{CpuLevel, cpu_level};
+
 pub type Vector = Vec<f32>;
 
 pub fn normalize(vector: &[f32]) -> Vector {
@@ -48,6 +50,18 @@ pub fn dot(left: &[f32], right: &[f32]) -> f32 {
                 return head;
             }
             return head + dot_scalar(&left[prefix..n], &right[prefix..n]);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if n > 0 {
+        match cpu_level() {
+            CpuLevel::Avx512Vnni | CpuLevel::Avx512F => {
+                return unsafe { dot_avx512_len(left.as_ptr(), right.as_ptr(), n) };
+            }
+            CpuLevel::Avx2Fma | CpuLevel::Avx2 => {
+                return unsafe { dot_avx2_fma_len(left.as_ptr(), right.as_ptr(), n) };
+            }
+            _ => {}
         }
     }
     dot_scalar(&left[..n], &right[..n])
@@ -120,6 +134,79 @@ unsafe fn dot_neon_128(a: *const f32, b: *const f32) -> f32 {
     }
 }
 
+/// AVX2+FMA dot product for arbitrary length. 4 accumulators × 8 f32 = 32 f/iter.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_avx2_fma_len(a: *const f32, b: *const f32, len: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut s0 = _mm256_setzero_ps();
+    let mut s1 = _mm256_setzero_ps();
+    let mut s2 = _mm256_setzero_ps();
+    let mut s3 = _mm256_setzero_ps();
+    let mut i = 0usize;
+    while i + 32 <= len {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i)),      _mm256_loadu_ps(b.add(i)),      s0);
+        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i + 8)),  _mm256_loadu_ps(b.add(i + 8)),  s1);
+        s2 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i + 16)), _mm256_loadu_ps(b.add(i + 16)), s2);
+        s3 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i + 24)), _mm256_loadu_ps(b.add(i + 24)), s3);
+        i += 32;
+    }
+    while i + 8 <= len {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i)), _mm256_loadu_ps(b.add(i)), s0);
+        i += 8;
+    }
+    s0 = _mm256_add_ps(s0, s1);
+    s2 = _mm256_add_ps(s2, s3);
+    s0 = _mm256_add_ps(s0, s2);
+    // Reduce without hadd: extract high 128, add, shuffle down.
+    let hi  = _mm256_extractf128_ps(s0, 1);
+    let lo  = _mm256_castps256_ps128(s0);
+    let sum = _mm_add_ps(hi, lo);
+    let shuf = _mm_movehl_ps(sum, sum);
+    let sums = _mm_add_ps(sum, shuf);
+    let shuf2 = _mm_shuffle_ps(sums, sums, 1);
+    let mut acc = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+    while i < len {
+        acc += *a.add(i) * *b.add(i);
+        i += 1;
+    }
+    acc
+}
+
+/// AVX-512 dot product for arbitrary length. 4 accumulators × 16 f32 = 64 f/iter.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_avx512_len(a: *const f32, b: *const f32, len: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut s0 = _mm512_setzero_ps();
+    let mut s1 = _mm512_setzero_ps();
+    let mut s2 = _mm512_setzero_ps();
+    let mut s3 = _mm512_setzero_ps();
+    let mut i = 0usize;
+    while i + 64 <= len {
+        s0 = _mm512_fmadd_ps(_mm512_loadu_ps(a.add(i)),      _mm512_loadu_ps(b.add(i)),      s0);
+        s1 = _mm512_fmadd_ps(_mm512_loadu_ps(a.add(i + 16)), _mm512_loadu_ps(b.add(i + 16)), s1);
+        s2 = _mm512_fmadd_ps(_mm512_loadu_ps(a.add(i + 32)), _mm512_loadu_ps(b.add(i + 32)), s2);
+        s3 = _mm512_fmadd_ps(_mm512_loadu_ps(a.add(i + 48)), _mm512_loadu_ps(b.add(i + 48)), s3);
+        i += 64;
+    }
+    while i + 16 <= len {
+        s0 = _mm512_fmadd_ps(_mm512_loadu_ps(a.add(i)), _mm512_loadu_ps(b.add(i)), s0);
+        i += 16;
+    }
+    s0 = _mm512_add_ps(s0, s1);
+    s2 = _mm512_add_ps(s2, s3);
+    s0 = _mm512_add_ps(s0, s2);
+    let mut acc = _mm512_reduce_add_ps(s0);
+    while i < len {
+        acc += *a.add(i) * *b.add(i);
+        i += 1;
+    }
+    acc
+}
+
 /// ColBERT's late-interaction score: sum of per-query-token maxima.
 pub fn maxsim(query: &[Vector], document: &[Vector]) -> f32 {
     if query.is_empty() || document.is_empty() {
@@ -144,11 +231,22 @@ pub fn maxsim(query: &[Vector], document: &[Vector]) -> f32 {
 /// aarch64 (covers the standard ColBERT/E5/MPNet embedding sizes 128, 384,
 /// 512, 768, 1024). Falls back to the scalar path everywhere else.
 pub fn maxsim_flat(query: &[Vector], document: &[f32], dimension: usize) -> f32 {
+    if dimension == 0 {
+        return maxsim_flat_scalar(query, document, dimension);
+    }
     #[cfg(target_arch = "aarch64")]
-    {
-        if dimension > 0 && dimension.is_multiple_of(16) && dimension <= 4096 {
-            return maxsim_flat_neon(query, document, dimension);
+    if dimension.is_multiple_of(16) && dimension <= 4096 {
+        return maxsim_flat_neon(query, document, dimension);
+    }
+    #[cfg(target_arch = "x86_64")]
+    match cpu_level() {
+        CpuLevel::Avx512Vnni | CpuLevel::Avx512F => {
+            return maxsim_flat_avx512(query, document, dimension);
         }
+        CpuLevel::Avx2Fma | CpuLevel::Avx2 => {
+            return maxsim_flat_avx2_fma(query, document, dimension);
+        }
+        _ => {}
     }
     maxsim_flat_scalar(query, document, dimension)
 }
@@ -214,6 +312,46 @@ fn maxsim_flat_neon(query: &[Vector], document: &[f32], dimension: usize) -> f32
         .sum()
 }
 
+#[cfg(target_arch = "x86_64")]
+fn maxsim_flat_avx2_fma(query: &[Vector], document: &[f32], dimension: usize) -> f32 {
+    let dot_fn: unsafe fn(*const f32, *const f32, usize) -> f32 = dot_avx2_fma_len;
+    query
+        .iter()
+        .map(|q| {
+            debug_assert_eq!(q.len(), dimension);
+            let qp = q.as_ptr();
+            let mut best = f32::NEG_INFINITY;
+            for doc in document.chunks_exact(dimension) {
+                let s = unsafe { dot_fn(qp, doc.as_ptr(), dimension) };
+                if s > best {
+                    best = s;
+                }
+            }
+            best
+        })
+        .sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn maxsim_flat_avx512(query: &[Vector], document: &[f32], dimension: usize) -> f32 {
+    let dot_fn: unsafe fn(*const f32, *const f32, usize) -> f32 = dot_avx512_len;
+    query
+        .iter()
+        .map(|q| {
+            debug_assert_eq!(q.len(), dimension);
+            let qp = q.as_ptr();
+            let mut best = f32::NEG_INFINITY;
+            for doc in document.chunks_exact(dimension) {
+                let s = unsafe { dot_fn(qp, doc.as_ptr(), dimension) };
+                if s > best {
+                    best = s;
+                }
+            }
+            best
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +402,33 @@ mod tests {
         let s = maxsim_flat_scalar(&query, &flat_doc, dim);
         let d = maxsim_flat(&query, &flat_doc, dim);
         assert!((s - d).abs() < 1e-6, "scalar={s} dispatch={d}");
+    }
+
+    #[test]
+    fn dot_agrees_scalar_short_lengths() {
+        for &len in &[0usize, 1, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33] {
+            let left: Vec<f32> = (0..len).map(|i| i as f32 * 0.1).collect();
+            let right: Vec<f32> = (0..len).map(|i| (len.saturating_sub(i)) as f32 * 0.1).collect();
+            let ref_val = dot_scalar(&left, &right);
+            let dispatch_val = dot(&left, &right);
+            let tol = 1e-3_f32 * ref_val.abs().max(1.0);
+            assert!(
+                (dispatch_val - ref_val).abs() <= tol,
+                "len={len}: ref={ref_val} dispatch={dispatch_val}"
+            );
+        }
+    }
+
+    #[test]
+    fn maxsim_flat_agrees_scalar_dim512_dim768() {
+        for &dim in &[512usize, 768] {
+            let query: Vec<_> = (0..8).map(|i| deterministic(0xAA + i, dim)).collect();
+            let doc_tokens: Vec<_> = (0..20).map(|i| deterministic(0xBB00 + i, dim)).collect();
+            let (flat_doc, _) = flat(&doc_tokens);
+            let s = maxsim_flat_scalar(&query, &flat_doc, dim);
+            let d = maxsim_flat(&query, &flat_doc, dim);
+            let tol = 1e-3_f32 * s.abs().max(1.0);
+            assert!((s - d).abs() <= tol, "dim={dim}: scalar={s} dispatch={d}");
+        }
     }
 }

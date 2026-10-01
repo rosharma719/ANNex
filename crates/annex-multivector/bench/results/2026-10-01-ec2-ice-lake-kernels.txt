@@ -1,0 +1,173 @@
+   Compiling annex v0.2.0 (/home/ec2-user/vectordb/crates/annex-core)
+   Compiling ciborium-io v0.2.2
+   Compiling bytemuck v1.25.2
+   Compiling rustix v1.1.5
+   Compiling plotters-backend v0.3.7
+   Compiling regex-automata v0.4.9
+   Compiling ciborium-ll v0.2.2
+   Compiling plotters-svg v0.3.7
+   Compiling itertools v0.10.5
+   Compiling linux-raw-sys v0.12.1
+   Compiling same-file v1.0.6
+   Compiling bitflags v2.9.0
+   Compiling cast v0.3.0
+warning: function `screen_dot_avx512_vnni` is never used
+    --> crates/annex-core/src/vector/hnsw/core.rs:1721:11
+     |
+1721 | unsafe fn screen_dot_avx512_vnni(query_i8: &[i8], stored: &[u8]) -> i32 {
+     |           ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling criterion-plot v0.5.0
+   Compiling regex v1.11.1
+   Compiling annex-multivector v0.2.0 (/home/ec2-user/vectordb/crates/annex-multivector)
+   Compiling walkdir v2.5.0
+   Compiling plotters v0.3.7
+   Compiling ciborium v0.2.2
+   Compiling tinytemplate v1.2.1
+   Compiling is-terminal v0.4.16
+   Compiling fastrand v2.5.0
+   Compiling anes v0.1.6
+   Compiling oorandom v11.1.5
+   Compiling criterion v0.5.1
+   Compiling tempfile v3.27.0
+warning: `annex` (lib) generated 1 warning
+    Finished `bench` profile [optimized] target(s) in 48.98s
+     Running benches/kernels.rs (target/release/deps/kernels-235459aefb6f4377)
+Gnuplot not found, using plotters backend
+Benchmarking maxsim_flat/dim=128/doc_tokens=200/query_tokens=32
+Benchmarking maxsim_flat/dim=128/doc_tokens=200/query_tokens=32: Warming up for 3.0000 s
+Benchmarking maxsim_flat/dim=128/doc_tokens=200/query_tokens=32: Collecting 100 samples in estimated 5.2150 s (106k iterations)
+Benchmarking maxsim_flat/dim=128/doc_tokens=200/query_tokens=32: Analyzing
+maxsim_flat/dim=128/doc_tokens=200/query_tokens=32
+                        time:   [48.879 µs 48.998 µs 49.127 µs]
+                        thrpt:  [33.350 Gelem/s 33.438 Gelem/s 33.519 Gelem/s]
+Found 6 outliers among 100 measurements (6.00%)
+  1 (1.00%) low mild
+  1 (1.00%) high mild
+  4 (4.00%) high severe
+Benchmarking maxsim_flat/dim=128/doc_tokens=100/query_tokens=32
+Benchmarking maxsim_flat/dim=128/doc_tokens=100/query_tokens=32: Warming up for 3.0000 s
+Benchmarking maxsim_flat/dim=128/doc_tokens=100/query_tokens=32: Collecting 100 samples in estimated 5.0819 s (207k iterations)
+Benchmarking maxsim_flat/dim=128/doc_tokens=100/query_tokens=32: Analyzing
+maxsim_flat/dim=128/doc_tokens=100/query_tokens=32
+                        time:   [23.831 µs 23.897 µs 23.962 µs]
+                        thrpt:  [34.188 Gelem/s 34.281 Gelem/s 34.375 Gelem/s]
+Found 6 outliers among 100 measurements (6.00%)
+  2 (2.00%) low mild
+  4 (4.00%) high mild
+Benchmarking maxsim_flat/dim=384/doc_tokens=200/query_tokens=32
+Benchmarking maxsim_flat/dim=384/doc_tokens=200/query_tokens=32: Warming up for 3.0000 s
+Benchmarking maxsim_flat/dim=384/doc_tokens=200/query_tokens=32: Collecting 100 samples in estimated 6.0893 s (25k iterations)
+Benchmarking maxsim_flat/dim=384/doc_tokens=200/query_tokens=32: Analyzing
+maxsim_flat/dim=384/doc_tokens=200/query_tokens=32
+                        time:   [241.13 µs 241.14 µs 241.16 µs]
+                        thrpt:  [20.381 Gelem/s 20.383 Gelem/s 20.384 Gelem/s]
+Found 16 outliers among 100 measurements (16.00%)
+  5 (5.00%) low severe
+  5 (5.00%) low mild
+  3 (3.00%) high mild
+  3 (3.00%) high severe
+Benchmarking maxsim_flat/dim=512/doc_tokens=200/query_tokens=32
+Benchmarking maxsim_flat/dim=512/doc_tokens=200/query_tokens=32: Warming up for 3.0000 s
+Benchmarking maxsim_flat/dim=512/doc_tokens=200/query_tokens=32: Collecting 100 samples in estimated 6.4556 s (20k iterations)
+Benchmarking maxsim_flat/dim=512/doc_tokens=200/query_tokens=32: Analyzing
+maxsim_flat/dim=512/doc_tokens=200/query_tokens=32
+                        time:   [319.58 µs 319.63 µs 319.69 µs]
+                        thrpt:  [20.500 Gelem/s 20.504 Gelem/s 20.507 Gelem/s]
+Found 12 outliers among 100 measurements (12.00%)
+  3 (3.00%) low severe
+  2 (2.00%) high mild
+  7 (7.00%) high severe
+Benchmarking maxsim_flat/dim=768/doc_tokens=200/query_tokens=32
+Benchmarking maxsim_flat/dim=768/doc_tokens=200/query_tokens=32: Warming up for 3.0000 s
+Benchmarking maxsim_flat/dim=768/doc_tokens=200/query_tokens=32: Collecting 100 samples in estimated 7.3135 s (15k iterations)
+Benchmarking maxsim_flat/dim=768/doc_tokens=200/query_tokens=32: Analyzing
+maxsim_flat/dim=768/doc_tokens=200/query_tokens=32
+                        time:   [482.67 µs 482.80 µs 483.06 µs]
+                        thrpt:  [20.350 Gelem/s 20.361 Gelem/s 20.367 Gelem/s]
+Found 11 outliers among 100 measurements (11.00%)
+  3 (3.00%) low severe
+  2 (2.00%) low mild
+  4 (4.00%) high mild
+  2 (2.00%) high severe
+
+Benchmarking maxsim_naive/dim=128/q=8/d=8
+Benchmarking maxsim_naive/dim=128/q=8/d=8: Warming up for 3.0000 s
+Benchmarking maxsim_naive/dim=128/q=8/d=8: Collecting 100 samples in estimated 5.0082 s (1.4M iterations)
+Benchmarking maxsim_naive/dim=128/q=8/d=8: Analyzing
+maxsim_naive/dim=128/q=8/d=8
+                        time:   [3.5680 µs 3.5814 µs 3.5929 µs]
+                        thrpt:  [4.5601 Gelem/s 4.5747 Gelem/s 4.5919 Gelem/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking screen_dot/scalar/dim=128
+Benchmarking screen_dot/scalar/dim=128: Warming up for 3.0000 s
+Benchmarking screen_dot/scalar/dim=128: Collecting 100 samples in estimated 5.0001 s (81M iterations)
+Benchmarking screen_dot/scalar/dim=128: Analyzing
+screen_dot/scalar/dim=128
+                        time:   [61.692 ns 61.722 ns 61.756 ns]
+                        thrpt:  [2.0727 Gelem/s 2.0738 Gelem/s 2.0748 Gelem/s]
+Found 8 outliers among 100 measurements (8.00%)
+  2 (2.00%) low mild
+  3 (3.00%) high mild
+  3 (3.00%) high severe
+Benchmarking screen_dot/dispatch/dim=128
+Benchmarking screen_dot/dispatch/dim=128: Warming up for 3.0000 s
+Benchmarking screen_dot/dispatch/dim=128: Collecting 100 samples in estimated 5.0000 s (600M iterations)
+Benchmarking screen_dot/dispatch/dim=128: Analyzing
+screen_dot/dispatch/dim=128
+                        time:   [8.3170 ns 8.3276 ns 8.3421 ns]
+                        thrpt:  [15.344 Gelem/s 15.371 Gelem/s 15.390 Gelem/s]
+Found 14 outliers among 100 measurements (14.00%)
+  1 (1.00%) low severe
+  1 (1.00%) low mild
+  1 (1.00%) high mild
+  11 (11.00%) high severe
+Benchmarking screen_dot/scalar/dim=256
+Benchmarking screen_dot/scalar/dim=256: Warming up for 3.0000 s
+Benchmarking screen_dot/scalar/dim=256: Collecting 100 samples in estimated 5.0001 s (63M iterations)
+Benchmarking screen_dot/scalar/dim=256: Analyzing
+screen_dot/scalar/dim=256
+                        time:   [78.796 ns 78.869 ns 78.949 ns]
+                        thrpt:  [3.2426 Gelem/s 3.2459 Gelem/s 3.2489 Gelem/s]
+Found 10 outliers among 100 measurements (10.00%)
+  1 (1.00%) low severe
+  3 (3.00%) low mild
+  4 (4.00%) high mild
+  2 (2.00%) high severe
+Benchmarking screen_dot/dispatch/dim=256
+Benchmarking screen_dot/dispatch/dim=256: Warming up for 3.0000 s
+Benchmarking screen_dot/dispatch/dim=256: Collecting 100 samples in estimated 5.0001 s (305M iterations)
+Benchmarking screen_dot/dispatch/dim=256: Analyzing
+screen_dot/dispatch/dim=256
+                        time:   [16.408 ns 16.425 ns 16.443 ns]
+                        thrpt:  [15.569 Gelem/s 15.586 Gelem/s 15.602 Gelem/s]
+Found 6 outliers among 100 measurements (6.00%)
+  1 (1.00%) low mild
+  3 (3.00%) high mild
+  2 (2.00%) high severe
+Benchmarking screen_dot/scalar/dim=768
+Benchmarking screen_dot/scalar/dim=768: Warming up for 3.0000 s
+Benchmarking screen_dot/scalar/dim=768: Collecting 100 samples in estimated 5.0002 s (34M iterations)
+Benchmarking screen_dot/scalar/dim=768: Analyzing
+screen_dot/scalar/dim=768
+                        time:   [148.00 ns 148.06 ns 148.12 ns]
+                        thrpt:  [5.1848 Gelem/s 5.1872 Gelem/s 5.1893 Gelem/s]
+Found 8 outliers among 100 measurements (8.00%)
+  5 (5.00%) high mild
+  3 (3.00%) high severe
+Benchmarking screen_dot/dispatch/dim=768
+Benchmarking screen_dot/dispatch/dim=768: Warming up for 3.0000 s
+Benchmarking screen_dot/dispatch/dim=768: Collecting 100 samples in estimated 5.0001 s (94M iterations)
+Benchmarking screen_dot/dispatch/dim=768: Analyzing
+screen_dot/dispatch/dim=768
+                        time:   [53.214 ns 53.236 ns 53.260 ns]
+                        thrpt:  [14.420 Gelem/s 14.426 Gelem/s 14.432 Gelem/s]
+Found 5 outliers among 100 measurements (5.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+

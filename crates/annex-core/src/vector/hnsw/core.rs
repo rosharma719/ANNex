@@ -142,6 +142,8 @@ pub struct HNSWIndex {
     pub(crate) dot_fn: fn(&[f32], &[f32]) -> f32,
     /// Pre-selected L2-squared kernel; set at construction from cpu_level().
     pub(crate) l2_fn: fn(&[f32], &[f32]) -> f32,
+    /// Pre-selected batched dot-product kernel (4 vectors simultaneously).
+    pub(crate) dot_many_fn: unsafe fn(&[f32], &[&[f32]], &mut [f32]),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -197,6 +199,19 @@ impl HNSWIndex {
                 |q: &[f32], v: &[f32]| unsafe { l2_neon(q, v) }
             }
             _ => l2_scalar,
+        }
+    }
+
+    pub(crate) fn select_dot_many_fn() -> unsafe fn(&[f32], &[&[f32]], &mut [f32]) {
+        use crate::vector::simd::{CpuLevel, cpu_level};
+        match cpu_level() {
+            #[cfg(target_arch = "x86_64")]
+            CpuLevel::Avx512Vnni | CpuLevel::Avx512F => dot_many_avx512,
+            #[cfg(target_arch = "x86_64")]
+            CpuLevel::Avx2Fma | CpuLevel::Avx2 => dot_many_avx2_fma,
+            #[cfg(target_arch = "aarch64")]
+            CpuLevel::NeonDotprod | CpuLevel::Neon => dot_many_neon,
+            _ => dot_many_scalar,
         }
     }
 
@@ -258,6 +273,7 @@ impl HNSWIndex {
                 .unwrap_or(DEFAULT_EXACT_FALLBACK_THRESHOLD),
             dot_fn: Self::select_dot_fn(),
             l2_fn: Self::select_l2_fn(),
+            dot_many_fn: Self::select_dot_many_fn(),
         }
     }
 
@@ -386,6 +402,33 @@ impl HNSWIndex {
             }
             DistanceMetric::Dot => (self.dot_fn)(query, vec),
             DistanceMetric::Euclidean => (self.l2_fn)(query, vec),
+        }
+    }
+
+    /// Score `vecs.len()` candidate vectors against `query` in one batched call.
+    /// Uses the pre-selected `dot_many_fn` kernel for 4-wide throughput on the
+    /// Cosine and Dot paths; falls back to per-vector `l2_fn` for Euclidean.
+    #[inline]
+    pub(crate) fn fast_score_many(&self, query: &[f32], vecs: &[&[f32]], out: &mut [f32]) {
+        debug_assert!(out.len() >= vecs.len());
+        match self.metric {
+            DistanceMetric::Cosine => {
+                // SAFETY: dot_many_fn was selected at construction based on cpu_level().
+                unsafe { (self.dot_many_fn)(query, vecs, &mut out[..vecs.len()]) };
+                for o in &mut out[..vecs.len()] {
+                    *o = 1.0 - (*o).clamp(-1.0, 1.0);
+                }
+            }
+            DistanceMetric::Dot => {
+                // SAFETY: same as above.
+                unsafe { (self.dot_many_fn)(query, vecs, &mut out[..vecs.len()]) };
+            }
+            DistanceMetric::Euclidean => {
+                // Batched L2 is a future optimisation; scalar per-vector for now.
+                for (o, v) in out[..vecs.len()].iter_mut().zip(vecs) {
+                    *o = (self.l2_fn)(query, v);
+                }
+            }
         }
     }
 
@@ -1065,6 +1108,115 @@ unsafe fn l2_avx512(query: &[f32], vec: &[f32]) -> f32 {
         i += 1;
     }
     acc
+}
+
+// ── Batched dot kernels (4-vector simultaneous) ───────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_many_avx512(query: &[f32], vecs: &[&[f32]], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let n = query.len();
+    let q = query.as_ptr();
+    let mut g = 0;
+    while g < vecs.len() {
+        let group = &vecs[g..(g + 4).min(vecs.len())];
+        if group.len() < 4 || group.iter().any(|v| v.len() < n) {
+            for (o, v) in out[g..].iter_mut().zip(group) {
+                *o = dot_avx512(query, v);
+            }
+            g += group.len();
+            continue;
+        }
+        let p = [group[0].as_ptr(), group[1].as_ptr(), group[2].as_ptr(), group[3].as_ptr()];
+        let mut a = [_mm512_setzero_ps(); 4];
+        let mut b = [_mm512_setzero_ps(); 4];
+        let mut i = 0;
+        while i + 32 <= n {
+            let q0 = _mm512_loadu_ps(q.add(i));
+            let q1 = _mm512_loadu_ps(q.add(i + 16));
+            for j in 0..4 {
+                a[j] = _mm512_fmadd_ps(q0, _mm512_loadu_ps(p[j].add(i)),      a[j]);
+                b[j] = _mm512_fmadd_ps(q1, _mm512_loadu_ps(p[j].add(i + 16)), b[j]);
+            }
+            i += 32;
+        }
+        while i + 16 <= n {
+            let q0 = _mm512_loadu_ps(q.add(i));
+            for j in 0..4 { a[j] = _mm512_fmadd_ps(q0, _mm512_loadu_ps(p[j].add(i)), a[j]); }
+            i += 16;
+        }
+        let tail_start = i;
+        for j in 0..4 {
+            let s = _mm512_add_ps(a[j], b[j]);
+            let mut acc = _mm512_reduce_add_ps(s);
+            let mut k = tail_start;
+            while k < n { acc += *q.add(k) * *p[j].add(k); k += 1; }
+            out[g + j] = acc;
+        }
+        g += 4;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_many_avx2_fma(query: &[f32], vecs: &[&[f32]], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let n = query.len();
+    let q = query.as_ptr();
+    let mut g = 0;
+    while g < vecs.len() {
+        let group = &vecs[g..(g + 4).min(vecs.len())];
+        if group.len() < 4 || group.iter().any(|v| v.len() < n) {
+            for (o, v) in out[g..].iter_mut().zip(group) { *o = dot_avx2_fma(query, v); }
+            g += group.len();
+            continue;
+        }
+        let p = [group[0].as_ptr(), group[1].as_ptr(), group[2].as_ptr(), group[3].as_ptr()];
+        let mut a = [_mm256_setzero_ps(); 4];
+        let mut b = [_mm256_setzero_ps(); 4];
+        let mut i = 0;
+        while i + 16 <= n {
+            let q0 = _mm256_loadu_ps(q.add(i));
+            let q1 = _mm256_loadu_ps(q.add(i + 8));
+            for j in 0..4 {
+                a[j] = _mm256_fmadd_ps(q0, _mm256_loadu_ps(p[j].add(i)),     a[j]);
+                b[j] = _mm256_fmadd_ps(q1, _mm256_loadu_ps(p[j].add(i + 8)), b[j]);
+            }
+            i += 16;
+        }
+        let tail_start = i;
+        for j in 0..4 {
+            let s  = _mm256_add_ps(a[j], b[j]);
+            let hi = _mm256_extractf128_ps(s, 1);
+            let lo = _mm256_castps256_ps128(s);
+            let sum = _mm_add_ps(hi, lo);
+            let shuf = _mm_movehl_ps(sum, sum);
+            let sums = _mm_add_ps(sum, shuf);
+            let shuf2 = _mm_shuffle_ps(sums, sums, 1);
+            let mut acc = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+            let mut k = tail_start;
+            while k < n { acc += *q.add(k) * *p[j].add(k); k += 1; }
+            out[g + j] = acc;
+        }
+        g += 4;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_many_neon(query: &[f32], vecs: &[&[f32]], out: &mut [f32]) {
+    for (o, v) in out.iter_mut().zip(vecs) {
+        *o = dot_neon(query, v);
+    }
+}
+
+unsafe fn dot_many_scalar(query: &[f32], vecs: &[&[f32]], out: &mut [f32]) {
+    for (o, v) in out.iter_mut().zip(vecs) {
+        *o = dot_scalar(query, v);
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2030,6 +2182,29 @@ mod tests {
             "screen_dot dim={} vecs={} iters={} total={} ns/call={:.2} acc={}",
             dim, vecs, iters, total, ns_per, acc
         );
+    }
+
+    #[test]
+    fn fast_score_many_matches_fast_score_individually() {
+        let idx = HNSWIndex::new(DistanceMetric::Cosine, 4, 8, 4, 4);
+        let q = vec![1.0f32, 0.0, 0.0, 0.0];
+        let vs: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.707, 0.707, 0.0, 0.0],
+        ];
+        let vref: Vec<&[f32]> = vs.iter().map(|v| v.as_slice()).collect();
+        let mut out = [0.0f32; 4];
+        idx.fast_score_many(&q, &vref, &mut out);
+        for (i, v) in vs.iter().enumerate() {
+            let single = idx.fast_score(&q, v);
+            assert!(
+                (out[i] - single).abs() < 1e-5,
+                "mismatch at i={i}: many={} single={}",
+                out[i],
+                single
+            );
+        }
     }
 
     #[test]

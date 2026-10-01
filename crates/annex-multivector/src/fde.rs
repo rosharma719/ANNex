@@ -4,7 +4,7 @@ use annex::vector::simd::{CpuLevel, cpu_level};
 pub type Vector = Vec<f32>;
 
 pub fn normalize(vector: &[f32]) -> Vector {
-    let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm = dot(vector, vector).sqrt();
     if !norm.is_finite() {
         let norm = vector
             .iter()

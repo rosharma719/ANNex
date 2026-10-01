@@ -286,6 +286,7 @@ impl HNSWIndex {
                 .unwrap_or(snapshot.exact_fallback_threshold),
             dot_fn: HNSWIndex::select_dot_fn(),
             l2_fn: HNSWIndex::select_l2_fn(),
+            dot_many_fn: HNSWIndex::select_dot_many_fn(),
         }
     }
 

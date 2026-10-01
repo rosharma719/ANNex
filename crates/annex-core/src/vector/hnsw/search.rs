@@ -446,8 +446,16 @@ impl HNSWIndex {
                                 batch[batch_len] = neighbor;
                                 batch_len += 1;
                                 if batch_len == BATCH {
-                                    for &idx in batch.iter().take(batch_len) {
-                                        let raw = self.fast_score(query, vec_view.get(idx));
+                                    let mut raws = [0.0f32; BATCH];
+                                    {
+                                        let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
+                                            if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                        });
+                                        self.fast_score_many(query, &vecs[..batch_len], &mut raws);
+                                    }
+                                    for i in 0..batch_len {
+                                        let idx = batch[i];
+                                        let raw = raws[i];
                                         let score_val = if normalize {
                                             self.normalize_score(raw)
                                         } else {
@@ -481,8 +489,16 @@ impl HNSWIndex {
                                 }
                             }
                             if batch_len > 0 {
-                                for &idx in batch.iter().take(batch_len) {
-                                    let raw = self.fast_score(query, vec_view.get(idx));
+                                let mut raws = [0.0f32; BATCH];
+                                {
+                                    let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
+                                        if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                    });
+                                    self.fast_score_many(query, &vecs[..batch_len], &mut raws);
+                                }
+                                for i in 0..batch_len {
+                                    let idx = batch[i];
+                                    let raw = raws[i];
                                     let score_val = if normalize {
                                         self.normalize_score(raw)
                                     } else {
@@ -499,7 +515,7 @@ impl HNSWIndex {
                                             raw_score: raw,
                                             sort_key: score_val,
                                         };
-                                        scratch.candidate_queue.push(sp.clone());
+                                        scratch.candidate_queue.push(sp);
 
                                         if improves_result_set {
                                             scratch.result_set.push(NodeResult(sp));
@@ -548,8 +564,16 @@ impl HNSWIndex {
                                 batch[batch_len] = neighbor;
                                 batch_len += 1;
                                 if batch_len == BATCH {
-                                    for &idx in batch.iter().take(batch_len) {
-                                        let raw = self.fast_score(query, vec_view.get(idx));
+                                    let mut raws = [0.0f32; BATCH];
+                                    {
+                                        let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
+                                            if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                        });
+                                        self.fast_score_many(query, &vecs[..batch_len], &mut raws);
+                                    }
+                                    for i in 0..batch_len {
+                                        let idx = batch[i];
+                                        let raw = raws[i];
                                         let score_val = if normalize {
                                             self.normalize_score(raw)
                                         } else {
@@ -580,8 +604,16 @@ impl HNSWIndex {
                                 }
                             }
                             if batch_len > 0 {
-                                for &idx in batch.iter().take(batch_len) {
-                                    let raw = self.fast_score(query, vec_view.get(idx));
+                                let mut raws = [0.0f32; BATCH];
+                                {
+                                    let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
+                                        if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                    });
+                                    self.fast_score_many(query, &vecs[..batch_len], &mut raws);
+                                }
+                                for i in 0..batch_len {
+                                    let idx = batch[i];
+                                    let raw = raws[i];
                                     let score_val = if normalize {
                                         self.normalize_score(raw)
                                     } else {
@@ -596,7 +628,7 @@ impl HNSWIndex {
                                             raw_score: raw,
                                             sort_key: score_val,
                                         };
-                                        scratch.candidate_queue.push(sp.clone());
+                                        scratch.candidate_queue.push(sp);
                                         if improves_result_set {
                                             scratch.result_set.push(NodeResult(sp));
                                             if scratch.result_set.len() > ef {
@@ -657,8 +689,16 @@ impl HNSWIndex {
                                 batch[batch_len] = neighbor;
                                 batch_len += 1;
                                 if batch_len == BATCH {
-                                    for &idx in batch.iter().take(batch_len) {
-                                        let raw = self.fast_score(query, vec_view.get(idx));
+                                    let mut raws = [0.0f32; BATCH];
+                                    {
+                                        let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
+                                            if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                        });
+                                        self.fast_score_many(query, &vecs[..batch_len], &mut raws);
+                                    }
+                                    for i in 0..batch_len {
+                                        let idx = batch[i];
+                                        let raw = raws[i];
                                         let score_val = if normalize {
                                             self.normalize_score(raw)
                                         } else {
@@ -694,8 +734,16 @@ impl HNSWIndex {
                                 }
                             }
                             if batch_len > 0 {
-                                for &idx in batch.iter().take(batch_len) {
-                                    let raw = self.fast_score(query, vec_view.get(idx));
+                                let mut raws = [0.0f32; BATCH];
+                                {
+                                    let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
+                                        if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                    });
+                                    self.fast_score_many(query, &vecs[..batch_len], &mut raws);
+                                }
+                                for i in 0..batch_len {
+                                    let idx = batch[i];
+                                    let raw = raws[i];
                                     let score_val = if normalize {
                                         self.normalize_score(raw)
                                     } else {
@@ -710,7 +758,7 @@ impl HNSWIndex {
                                             raw_score: raw,
                                             sort_key: score_val,
                                         };
-                                        scratch.candidate_queue.push(sp.clone());
+                                        scratch.candidate_queue.push(sp);
                                         if improves_result_set {
                                             scratch.result_set.push(NodeResult(sp));
                                             if scratch.result_set.len() > ef {
@@ -780,11 +828,19 @@ impl HNSWIndex {
                                     batch[batch_len] = neighbor;
                                     batch_len += 1;
                                     if batch_len == BATCH {
-                                        for &idx in batch.iter().take(batch_len) {
-                                            if collect_counters {
-                                                distance_computations += 1;
-                                            }
-                                            let raw = self.fast_score(query, vec_view.get(idx));
+                                        if collect_counters {
+                                            distance_computations += batch_len;
+                                        }
+                                        let mut raws = [0.0f32; BATCH];
+                                        {
+                                            let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
+                                                if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                            });
+                                            self.fast_score_many(query, &vecs[..batch_len], &mut raws);
+                                        }
+                                        for i in 0..batch_len {
+                                            let idx = batch[i];
+                                            let raw = raws[i];
                                             let score_val = if normalize {
                                                 self.normalize_score(raw)
                                             } else {
@@ -837,11 +893,19 @@ impl HNSWIndex {
                                     }
                                 }
                                 if !patience_triggered && batch_len > 0 {
-                                    for &idx in batch.iter().take(batch_len) {
-                                        if collect_counters {
-                                            distance_computations += 1;
-                                        }
-                                        let raw = self.fast_score(query, vec_view.get(idx));
+                                    if collect_counters {
+                                        distance_computations += batch_len;
+                                    }
+                                    let mut raws = [0.0f32; BATCH];
+                                    {
+                                        let vecs: [&[f32]; BATCH] = std::array::from_fn(|i| {
+                                            if i < batch_len { vec_view.get(batch[i]) } else { &[] }
+                                        });
+                                        self.fast_score_many(query, &vecs[..batch_len], &mut raws);
+                                    }
+                                    for i in 0..batch_len {
+                                        let idx = batch[i];
+                                        let raw = raws[i];
                                         let score_val = if normalize {
                                             self.normalize_score(raw)
                                         } else {
@@ -858,7 +922,7 @@ impl HNSWIndex {
                                                 raw_score: raw,
                                                 sort_key: score_val,
                                             };
-                                            scratch.candidate_queue.push(sp.clone());
+                                            scratch.candidate_queue.push(sp);
 
                                             if improves_result_set {
                                                 scratch.result_set.push(NodeResult(sp));

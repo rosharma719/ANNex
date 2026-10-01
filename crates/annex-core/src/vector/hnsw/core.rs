@@ -1661,7 +1661,76 @@ unsafe fn screen_dot_avx2(query_i8: &[i8], stored: &[u8]) -> i32 {
     result
 }
 
+/// AVX-512 VNNI path. `_mm512_dpbusd_epi32(acc, u8_stored, i8_query)` computes
+/// `acc += sum(u8[i] * i8[i])` over 64 elements per call.
+///
+/// Centering correction: sum(q*(s-128)) = sum(q*s) - 128*sum(q).
+/// VNNI accumulates sum(q*s); subtract 128*sum(q) afterward.
+///
+/// Length contract: when called from the HNSW path both slices have equal
+/// length (index invariant). The `min` fallback handles mismatched slices
+/// correctly via the scalar tail.
+///
+/// Overflow proof: max correction = dim*127*128 ≤ 4096*127*128 = 66_584_576 << i32::MAX.
+#[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,avx512vnni")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn screen_dot_avx512_vnni(query_i8: &[i8], stored: &[u8]) -> i32 {
+    use std::arch::x86_64::*;
+    let n = query_i8.len().min(stored.len());
+    // Precompute centering correction once per query.
+    let query_sum: i32 = query_i8[..n].iter().map(|&x| x as i32).sum();
+
+    let mut acc0 = _mm512_setzero_si512();
+    let mut acc1 = _mm512_setzero_si512();
+    let mut acc2 = _mm512_setzero_si512();
+    let mut acc3 = _mm512_setzero_si512();
+    let mut i = 0usize;
+
+    while i + 256 <= n {
+        let s0 = _mm512_loadu_si512(stored.as_ptr().add(i) as *const __m512i);
+        let s1 = _mm512_loadu_si512(stored.as_ptr().add(i + 64) as *const __m512i);
+        let s2 = _mm512_loadu_si512(stored.as_ptr().add(i + 128) as *const __m512i);
+        let s3 = _mm512_loadu_si512(stored.as_ptr().add(i + 192) as *const __m512i);
+        let q0 = _mm512_loadu_si512(query_i8.as_ptr().add(i) as *const __m512i);
+        let q1 = _mm512_loadu_si512(query_i8.as_ptr().add(i + 64) as *const __m512i);
+        let q2 = _mm512_loadu_si512(query_i8.as_ptr().add(i + 128) as *const __m512i);
+        let q3 = _mm512_loadu_si512(query_i8.as_ptr().add(i + 192) as *const __m512i);
+        // stored (u8) in `a` position, query (i8) in `b` position per Intel spec.
+        acc0 = _mm512_dpbusd_epi32(acc0, s0, q0);
+        acc1 = _mm512_dpbusd_epi32(acc1, s1, q1);
+        acc2 = _mm512_dpbusd_epi32(acc2, s2, q2);
+        acc3 = _mm512_dpbusd_epi32(acc3, s3, q3);
+        i += 256;
+    }
+    while i + 64 <= n {
+        let s = _mm512_loadu_si512(stored.as_ptr().add(i) as *const __m512i);
+        let q = _mm512_loadu_si512(query_i8.as_ptr().add(i) as *const __m512i);
+        acc0 = _mm512_dpbusd_epi32(acc0, s, q);
+        i += 64;
+    }
+    acc0 = _mm512_add_epi32(acc0, acc1);
+    acc2 = _mm512_add_epi32(acc2, acc3);
+    acc0 = _mm512_add_epi32(acc0, acc2);
+    let mut result = _mm512_reduce_add_epi32(acc0);
+
+    while i < n {
+        result += (*query_i8.get_unchecked(i) as i32) * (*stored.get_unchecked(i) as i32);
+        i += 1;
+    }
+    result - 128 * query_sum
+}
+
 impl HNSWIndex {}
+
+/// Re-exports for micro-benchmarks. Not part of the public API.
+#[cfg(feature = "bench-internals")]
+pub mod bench_access {
+    pub use super::screen_dot_scalar;
+    #[cfg(target_arch = "x86_64")]
+    pub use super::{screen_dot_avx2, screen_dot_avx512_vnni};
+    pub use super::HNSWIndex;
+}
 
 #[cfg(test)]
 mod tests {
@@ -1902,5 +1971,57 @@ mod tests {
             "screen_dot dim={} vecs={} iters={} total={} ns/call={:.2} acc={}",
             dim, vecs, iters, total, ns_per, acc
         );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn screen_dot_all_paths_agree() {
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        let avx512f = std::arch::is_x86_feature_detected!("avx512f");
+        let avx512vnni = std::arch::is_x86_feature_detected!("avx512vnni");
+
+        // Build a variety of (query_i8, stored_u8) test cases.
+        let empty_q: Vec<i8> = vec![];
+        let empty_s: Vec<u8> = vec![];
+        let cases: Vec<(Vec<i8>, Vec<u8>)> = vec![
+            // empty
+            (empty_q.clone(), empty_s.clone()),
+            // length 1
+            (vec![1i8], vec![129u8]),
+            // short mixed
+            (vec![127i8, -128, 0, 1], vec![255u8, 0, 128, 200]),
+            // extremes: all max
+            (vec![127i8; 32], vec![255u8; 32]),
+            // extremes: all min
+            (vec![-128i8; 32], vec![0u8; 32]),
+            // adversarial pairs (validates saturation safety of any future rewrite)
+            (vec![127i8; 64], vec![255u8; 64]),
+            // standard dims
+            (vec![42i8; 128], vec![200u8; 128]),
+            (vec![-1i8; 256], vec![128u8; 256]),
+            // cycle through extreme values across 256 elements
+            (
+                (0..256).map(|i| [-128i8, -127, -1, 0, 1, 126, 127][i % 7]).collect(),
+                (0..256).map(|i| [0u8, 1, 127, 128, 129, 254, 255][i % 7]).collect(),
+            ),
+            // mismatched lengths (min contract)
+            (vec![10i8; 17], vec![130u8; 32]),
+            // boundary lengths around SIMD widths
+            (vec![5i8; 63], vec![133u8; 63]),
+            (vec![5i8; 64], vec![133u8; 64]),
+            (vec![5i8; 65], vec![133u8; 65]),
+        ];
+
+        for (q, s) in &cases {
+            let reference = screen_dot_scalar(q, s);
+            if avx2 {
+                let result = unsafe { screen_dot_avx2(q, s) };
+                assert_eq!(result, reference, "AVX2 mismatch: q_len={} s_len={}", q.len(), s.len());
+            }
+            if avx512f && avx512vnni {
+                let result = unsafe { screen_dot_avx512_vnni(q, s) };
+                assert_eq!(result, reference, "VNNI mismatch: q_len={} s_len={}", q.len(), s.len());
+            }
+        }
     }
 }

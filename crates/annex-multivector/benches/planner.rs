@@ -33,6 +33,7 @@ fn fixture(documents: usize) -> Fixture {
                 id: format!("doc-{position}"),
                 metadata: json!({
                     "tenant": if position % 10 == 0 { "selected" } else { "other" },
+                    "bucket": position % 100,
                     "position": position,
                 }),
                 text: Some(format!(
@@ -170,5 +171,67 @@ fn bench_planner(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(planner, bench_planner);
+fn bench_filtered_execution(c: &mut Criterion) {
+    let fixture = fixture(10_000);
+    fixture
+        .index
+        .build_dense_ann("semantic", 16, 100)
+        .expect("build dense ANN for execution benchmark");
+    let mut vector = vec![0.0; DIMENSION];
+    vector[0] = 1.0;
+    let cases = [
+        ("exact/unfiltered", "exact", None),
+        ("hnsw/unfiltered", "hnsw", None),
+        (
+            "exact/filtered_10pct",
+            "exact",
+            Some(json!({"op": "eq", "field": "tenant", "value": "selected"})),
+        ),
+        (
+            "hnsw/filtered_10pct",
+            "hnsw",
+            Some(json!({"op": "eq", "field": "tenant", "value": "selected"})),
+        ),
+        (
+            "exact/filtered_1pct",
+            "exact",
+            Some(json!({"op": "eq", "field": "bucket", "value": 0})),
+        ),
+        (
+            "hnsw/filtered_1pct",
+            "hnsw",
+            Some(json!({"op": "eq", "field": "bucket", "value": 0})),
+        ),
+    ];
+    let mut group = c.benchmark_group("query_execution");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(3));
+    for (name, backend, filter) in cases {
+        let request = request(json!({
+            "prefetch": [{
+                "kind": "dense",
+                "field": "semantic",
+                "vector": vector,
+                "limit": 100,
+                "backend": backend,
+                "ef_search": 64
+            }],
+            "filter": filter,
+            "limit": 10
+        }));
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(
+                    fixture
+                        .index
+                        .retrieve(black_box(&request))
+                        .expect("execute benchmark request"),
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(planner, bench_planner, bench_filtered_execution);
 criterion_main!(planner);

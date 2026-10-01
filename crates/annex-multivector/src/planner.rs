@@ -105,6 +105,7 @@ pub enum PlanReason {
 #[serde(rename_all = "snake_case")]
 pub enum FilterStrategy {
     None,
+    MetadataIndex,
     MetadataScan,
 }
 
@@ -392,22 +393,25 @@ impl MultiVectorIndex {
         let state = self.snapshot();
         let (effective_request, policy_plan) = self.prepare_request(&state, request);
         let request = effective_request.as_ref();
-        let eligible = request
-            .filter
-            .as_ref()
-            .map_or(state.documents.len(), |filter| {
-                state
-                    .retrieval
-                    .indexed_filter_count(filter)
-                    .unwrap_or_else(|| {
-                        state
-                            .documents
-                            .values()
-                            .filter(|document| filter.matches(&document.metadata))
-                            .count()
-                    })
-            });
-        let mut plan = self.compile_plan(&state, request, eligible)?;
+        let (eligible, filter_strategy) = request.filter.as_ref().map_or(
+            (state.documents.len(), FilterStrategy::None),
+            |filter| {
+                state.retrieval.indexed_filter_count(filter).map_or_else(
+                    || {
+                        (
+                            state
+                                .documents
+                                .values()
+                                .filter(|document| filter.matches(&document.metadata))
+                                .count(),
+                            FilterStrategy::MetadataScan,
+                        )
+                    },
+                    |count| (count, FilterStrategy::MetadataIndex),
+                )
+            },
+        );
+        let mut plan = self.compile_plan(&state, request, eligible, filter_strategy)?;
         plan.policy = policy_plan;
         Ok(plan)
     }
@@ -417,13 +421,17 @@ impl MultiVectorIndex {
         state: &State,
         request: &RetrieveRequest,
         eligible_documents: usize,
+        filter_strategy: FilterStrategy,
     ) -> Result<RetrievalPlan, IndexError> {
         validate_request(request)?;
 
         let stats = planner_stats(
             state,
             self.fde.output_dimension(),
-            request.filter.as_ref().map(|_| eligible_documents),
+            request
+                .filter
+                .as_ref()
+                .map(|_| (eligible_documents, filter_strategy)),
         );
 
         let logical_channels = request
@@ -775,11 +783,7 @@ impl MultiVectorIndex {
             logical,
             stats,
             eligible_documents,
-            filter: if request.filter.is_some() {
-                FilterStrategy::MetadataScan
-            } else {
-                FilterStrategy::None
-            },
+            filter: filter_strategy,
             stages,
             estimate: PlanEstimate {
                 critical_path_cost: parallel_critical_path
@@ -796,7 +800,7 @@ impl MultiVectorIndex {
 pub(super) fn planner_stats(
     state: &State,
     fde_dimension: usize,
-    eligible_documents: Option<usize>,
+    eligible_documents: Option<(usize, FilterStrategy)>,
 ) -> PlannerStats {
     let fields = state
         .retrieval
@@ -828,7 +832,7 @@ pub(super) fn planner_stats(
         })
         .collect();
     let n = state.documents.len();
-    let filter_stats = eligible_documents.map(|eligible| {
+    let filter_stats = eligible_documents.map(|(eligible, filter_operator)| {
         let selectivity = if n == 0 {
             1.0_f32
         } else {
@@ -836,7 +840,7 @@ pub(super) fn planner_stats(
         };
         FilterStats {
             selectivity: selectivity.clamp(0.0, 1.0),
-            filter_operator: FilterStrategy::MetadataScan,
+            filter_operator,
         }
     });
     PlannerStats {
@@ -872,6 +876,9 @@ fn choose_ann_with_cost(
     }
     if !ann_supported {
         return (exact, PlanReason::FilterRequiresExact);
+    }
+    if backend == "hnsw" {
+        return (ann, PlanReason::AnnReady);
     }
     // ANN is available — choose by cost model.
     if cost_exact <= cost_hnsw {

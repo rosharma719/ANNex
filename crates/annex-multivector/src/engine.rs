@@ -1318,7 +1318,7 @@ impl MultiVectorIndex {
         s: &State,
         normalized: &[Vector],
         cap: Option<usize>,
-        eligible: Option<&HashSet<&str>>,
+        eligible: Option<&retrieval::DocSet>,
     ) -> Result<Vec<(String, f32)>, IndexError> {
         if !s.documents.values().any(|d| d.tokens > 0) {
             return Ok(Vec::new());
@@ -1342,8 +1342,11 @@ impl MultiVectorIndex {
         };
         let approximate_results: Result<Vec<_>, io::Error> = match eligible {
             Some(eligible) => eligible
-                .par_iter()
-                .filter_map(|&id| s.documents.get(id).and_then(|record| score(id, record)))
+                .iter()
+                .filter_map(|number| s.retrieval.external_id(number))
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .filter_map(|id| s.documents.get(id).and_then(|record| score(id, record)))
                 .collect(),
             None => s
                 .documents
@@ -1542,24 +1545,13 @@ impl MultiVectorIndex {
         count: usize,
         ef_search: usize,
         filter: Option<&Filter>,
-        eligible: Option<&HashSet<&str>>,
+        eligible: Option<&retrieval::DocSet>,
     ) -> Result<Vec<(String, f32)>, IndexError> {
         let ann = s.fde_ann.as_ref().ok_or_else(|| {
             IndexError::Invalid("FDE ANN is not built; call /v1/fde/index".into())
         })?;
         self.ann_scores_filtered(s, ann, query_fde, count, ef_search, filter, eligible)
     }
-    fn ann_scores(
-        &self,
-        s: &State,
-        ann: &FdeAnn,
-        query_fde: &Vector,
-        count: usize,
-        ef_search: usize,
-    ) -> Result<Vec<(String, f32)>, IndexError> {
-        self.ann_scores_filtered(s, ann, query_fde, count, ef_search, None, None)
-    }
-
     fn ann_scores_filtered(
         &self,
         s: &State,
@@ -1568,7 +1560,7 @@ impl MultiVectorIndex {
         count: usize,
         ef_search: usize,
         filter: Option<&Filter>,
-        eligible: Option<&HashSet<&str>>,
+        eligible: Option<&retrieval::DocSet>,
     ) -> Result<Vec<(String, f32)>, IndexError> {
         if ann.generation != s.generation {
             return Err(IndexError::Invalid(
@@ -1619,7 +1611,9 @@ impl MultiVectorIndex {
         }
         if !ann.delta.is_empty() {
             for id in &ann.delta {
-                if eligible.is_some_and(|eligible| !eligible.contains(id.as_str())) {
+                if eligible
+                    .is_some_and(|eligible| !s.retrieval.contains_external(eligible, id.as_str()))
+                {
                     continue;
                 }
                 let record = s

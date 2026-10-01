@@ -199,6 +199,7 @@ pub fn maxsim_flat(query: &[Vector], document: &[f32], dimension: usize) -> f32 
 /// [`maxsim_flat`].
 pub struct MaxSimQuery<'a> {
     tokens: &'a [Vector],
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     dimension: usize,
     #[cfg(target_arch = "x86_64")]
     packed: Option<(x86::PackedKernel, x86::Panel)>,

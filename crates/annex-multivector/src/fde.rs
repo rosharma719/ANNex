@@ -249,18 +249,42 @@ unsafe fn dot_avx512_bf16_len(a: *const f32, b: *const f32, len: usize) -> f32 {
     let mut acc3 = _mm512_setzero_ps();
     let mut i = 0usize;
     while i + 128 <= len {
-        let a0 = _mm512_loadu_ps(a.add(i));       let a1 = _mm512_loadu_ps(a.add(i + 16));
-        let b0 = _mm512_loadu_ps(b.add(i));       let b1 = _mm512_loadu_ps(b.add(i + 16));
-        acc0 = _mm512_dpbf16_ps(acc0, _mm512_cvtne2ps_pbh(a1, a0), _mm512_cvtne2ps_pbh(b1, b0));
-        let a2 = _mm512_loadu_ps(a.add(i + 32));  let a3 = _mm512_loadu_ps(a.add(i + 48));
-        let b2 = _mm512_loadu_ps(b.add(i + 32));  let b3 = _mm512_loadu_ps(b.add(i + 48));
-        acc1 = _mm512_dpbf16_ps(acc1, _mm512_cvtne2ps_pbh(a3, a2), _mm512_cvtne2ps_pbh(b3, b2));
-        let a4 = _mm512_loadu_ps(a.add(i + 64));  let a5 = _mm512_loadu_ps(a.add(i + 80));
-        let b4 = _mm512_loadu_ps(b.add(i + 64));  let b5 = _mm512_loadu_ps(b.add(i + 80));
-        acc2 = _mm512_dpbf16_ps(acc2, _mm512_cvtne2ps_pbh(a5, a4), _mm512_cvtne2ps_pbh(b5, b4));
-        let a6 = _mm512_loadu_ps(a.add(i + 96));  let a7 = _mm512_loadu_ps(a.add(i + 112));
-        let b6 = _mm512_loadu_ps(b.add(i + 96));  let b7 = _mm512_loadu_ps(b.add(i + 112));
-        acc3 = _mm512_dpbf16_ps(acc3, _mm512_cvtne2ps_pbh(a7, a6), _mm512_cvtne2ps_pbh(b7, b6));
+        let a0 = _mm512_loadu_ps(a.add(i));
+        let a1 = _mm512_loadu_ps(a.add(i + 16));
+        let b0 = _mm512_loadu_ps(b.add(i));
+        let b1 = _mm512_loadu_ps(b.add(i + 16));
+        acc0 = _mm512_dpbf16_ps(
+            acc0,
+            _mm512_cvtne2ps_pbh(a1, a0),
+            _mm512_cvtne2ps_pbh(b1, b0),
+        );
+        let a2 = _mm512_loadu_ps(a.add(i + 32));
+        let a3 = _mm512_loadu_ps(a.add(i + 48));
+        let b2 = _mm512_loadu_ps(b.add(i + 32));
+        let b3 = _mm512_loadu_ps(b.add(i + 48));
+        acc1 = _mm512_dpbf16_ps(
+            acc1,
+            _mm512_cvtne2ps_pbh(a3, a2),
+            _mm512_cvtne2ps_pbh(b3, b2),
+        );
+        let a4 = _mm512_loadu_ps(a.add(i + 64));
+        let a5 = _mm512_loadu_ps(a.add(i + 80));
+        let b4 = _mm512_loadu_ps(b.add(i + 64));
+        let b5 = _mm512_loadu_ps(b.add(i + 80));
+        acc2 = _mm512_dpbf16_ps(
+            acc2,
+            _mm512_cvtne2ps_pbh(a5, a4),
+            _mm512_cvtne2ps_pbh(b5, b4),
+        );
+        let a6 = _mm512_loadu_ps(a.add(i + 96));
+        let a7 = _mm512_loadu_ps(a.add(i + 112));
+        let b6 = _mm512_loadu_ps(b.add(i + 96));
+        let b7 = _mm512_loadu_ps(b.add(i + 112));
+        acc3 = _mm512_dpbf16_ps(
+            acc3,
+            _mm512_cvtne2ps_pbh(a7, a6),
+            _mm512_cvtne2ps_pbh(b7, b6),
+        );
         i += 128;
     }
     while i + 32 <= len {
@@ -268,7 +292,11 @@ unsafe fn dot_avx512_bf16_len(a: *const f32, b: *const f32, len: usize) -> f32 {
         let a1 = _mm512_loadu_ps(a.add(i + 16));
         let b0 = _mm512_loadu_ps(b.add(i));
         let b1 = _mm512_loadu_ps(b.add(i + 16));
-        acc0 = _mm512_dpbf16_ps(acc0, _mm512_cvtne2ps_pbh(a1, a0), _mm512_cvtne2ps_pbh(b1, b0));
+        acc0 = _mm512_dpbf16_ps(
+            acc0,
+            _mm512_cvtne2ps_pbh(a1, a0),
+            _mm512_cvtne2ps_pbh(b1, b0),
+        );
         i += 32;
     }
     acc0 = _mm512_add_ps(acc0, acc1);
@@ -747,34 +775,54 @@ mod tests {
 
     #[test]
     fn maxsim_flat_bf16_agrees_with_scalar_on_dim128() {
-        if cfg!(not(target_arch = "x86_64")) { return; }
+        if cfg!(not(target_arch = "x86_64")) {
+            return;
+        }
         #[cfg(target_arch = "x86_64")]
-        if !std::arch::is_x86_feature_detected!("avx512bf16") { return; }
+        if !std::arch::is_x86_feature_detected!("avx512bf16") {
+            return;
+        }
 
         let mut rng = 0xcafe_babe_u64;
         let mut next = || -> f32 {
-            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
             (rng as f32 / u64::MAX as f32) * 2.0 - 1.0
         };
-        let query: Vec<_> = (0..8).map(|_| (0..128).map(|_| next()).collect::<Vec<f32>>()).collect();
-        let doc_tokens: Vec<_> = (0..50).map(|_| (0..128).map(|_| next()).collect::<Vec<f32>>()).collect();
+        let query: Vec<_> = (0..8)
+            .map(|_| (0..128).map(|_| next()).collect::<Vec<f32>>())
+            .collect();
+        let doc_tokens: Vec<_> = (0..50)
+            .map(|_| (0..128).map(|_| next()).collect::<Vec<f32>>())
+            .collect();
         let flat_doc: Vec<f32> = doc_tokens.iter().flat_map(|v| v.iter().copied()).collect();
         let scalar = maxsim_flat_scalar(&query, &flat_doc, 128);
         let dispatch = maxsim_flat(&query, &flat_doc, 128);
         let tol = 1e-3_f32 * scalar.abs().max(1.0);
-        assert!((dispatch - scalar).abs() <= tol, "bf16 maxsim mismatch: scalar={scalar} dispatch={dispatch}");
+        assert!(
+            (dispatch - scalar).abs() <= tol,
+            "bf16 maxsim mismatch: scalar={scalar} dispatch={dispatch}"
+        );
     }
 
     #[test]
     fn dot_self_is_near_one_after_normalize_on_bf16() {
-        if cfg!(not(target_arch = "x86_64")) { return; }
+        if cfg!(not(target_arch = "x86_64")) {
+            return;
+        }
         #[cfg(target_arch = "x86_64")]
-        if !std::arch::is_x86_feature_detected!("avx512bf16") { return; }
+        if !std::arch::is_x86_feature_detected!("avx512bf16") {
+            return;
+        }
         for dim in [64usize, 128, 384, 768] {
             let raw: Vec<f32> = (0..dim).map(|i| (i as f32 + 1.0).recip()).collect();
             let normed = normalize(&raw);
             let self_dot = dot(&normed, &normed);
-            assert!((self_dot - 1.0).abs() < 1e-3, "dim={dim}: self_dot={self_dot}");
+            assert!(
+                (self_dot - 1.0).abs() < 1e-3,
+                "dim={dim}: self_dot={self_dot}"
+            );
         }
     }
 }

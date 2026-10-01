@@ -764,7 +764,7 @@ impl MultiVectorIndex {
         let mut ordered: Vec<_> = documents.iter().collect();
         ordered.sort_by(|a, b| a.0.cmp(b.0));
         for (id, d) in ordered {
-            retrieval.insert(id, &d.fields)?;
+            retrieval.insert(id, &d.fields, &d.metadata)?;
         }
         let planner_stats =
             planner::CachedPlannerStats::from_documents(&documents, retrieval.schema());
@@ -1028,7 +1028,7 @@ impl MultiVectorIndex {
         for document in batch {
             let fields = Arc::new(Fields::prepare(&document, &next.stores)?);
             let id = document.id;
-            Arc::make_mut(&mut next.retrieval).insert(&id, &fields)?;
+            Arc::make_mut(&mut next.retrieval).insert(&id, &fields, &document.metadata)?;
             if let Some(old) = next.documents.get(&id) {
                 next.planner_stats.remove(old, next.retrieval.schema());
             }

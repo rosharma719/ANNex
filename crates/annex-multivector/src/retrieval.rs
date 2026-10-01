@@ -72,7 +72,68 @@ pub(super) struct RetrievalState {
     schema: BTreeMap<String, FieldSchema>,
     document_chunks: HashMap<u64, Chunk>,
     chunks: HashMap<String, BTreeMap<u32, BTreeSet<String>>>,
+    metadata_eq: HashMap<MetadataKey, HashSet<u64>>,
+    metadata_membership: HashMap<MetadataKey, HashSet<u64>>,
+    metadata_keys: HashMap<u64, (Vec<MetadataKey>, Vec<MetadataKey>)>,
     analyzer: Analyzer,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MetadataKey {
+    pointer: String,
+    value: String,
+}
+
+fn pointer_escape(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+fn predicate_pointer(field: &str) -> String {
+    if field.starts_with('/') {
+        field.to_owned()
+    } else {
+        format!("/{}", pointer_escape(field))
+    }
+}
+
+fn scalar_key(pointer: &str, value: &Value) -> Option<MetadataKey> {
+    (!value.is_array() && !value.is_object()).then(|| MetadataKey {
+        pointer: pointer.to_owned(),
+        value: serde_json::to_string(value).expect("scalar JSON serialization cannot fail"),
+    })
+}
+
+fn collect_metadata_keys(
+    value: &Value,
+    pointer: &str,
+    equality: &mut Vec<MetadataKey>,
+    membership: &mut Vec<MetadataKey>,
+) {
+    match value {
+        Value::Object(object) => {
+            for (name, child) in object {
+                let child_pointer = format!("{pointer}/{}", pointer_escape(name));
+                collect_metadata_keys(child, &child_pointer, equality, membership);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                if let Some(key) = scalar_key(pointer, child) {
+                    membership.push(key);
+                }
+            }
+            for (index, child) in values.iter().enumerate() {
+                let child_pointer = format!("{pointer}/{index}");
+                collect_metadata_keys(child, &child_pointer, equality, membership);
+            }
+        }
+        _ => {
+            if let Some(key) = scalar_key(pointer, value) {
+                equality.push(key.clone());
+                membership.push(key);
+            }
+        }
+    }
 }
 
 fn invalid(message: impl Into<String>) -> IndexError {
@@ -140,9 +201,32 @@ impl RetrievalState {
             for index in self.sparse.values() {
                 index.delete(number);
             }
+            if let Some((equality, membership)) = self.metadata_keys.remove(&number) {
+                for key in equality {
+                    if let Some(ids) = self.metadata_eq.get_mut(&key) {
+                        ids.remove(&number);
+                        if ids.is_empty() {
+                            self.metadata_eq.remove(&key);
+                        }
+                    }
+                }
+                for key in membership {
+                    if let Some(ids) = self.metadata_membership.get_mut(&key) {
+                        ids.remove(&number);
+                        if ids.is_empty() {
+                            self.metadata_membership.remove(&key);
+                        }
+                    }
+                }
+            }
         }
     }
-    pub(super) fn insert(&mut self, id: &str, fields: &Fields) -> Result<(), IndexError> {
+    pub(super) fn insert(
+        &mut self,
+        id: &str,
+        fields: &Fields,
+        metadata: &Value,
+    ) -> Result<(), IndexError> {
         self.remove(id);
         let number = self.next_id;
         self.next_id = number
@@ -150,6 +234,34 @@ impl RetrievalState {
             .ok_or_else(|| invalid("document IDs exhausted"))?;
         self.by_id.insert(id.to_owned(), number);
         self.ids.insert(number, id.to_owned());
+        let mut equality = Vec::new();
+        let mut membership = Vec::new();
+        collect_metadata_keys(metadata, "", &mut equality, &mut membership);
+        equality.sort_by(|a, b| {
+            a.pointer
+                .cmp(&b.pointer)
+                .then_with(|| a.value.cmp(&b.value))
+        });
+        equality.dedup();
+        membership.sort_by(|a, b| {
+            a.pointer
+                .cmp(&b.pointer)
+                .then_with(|| a.value.cmp(&b.value))
+        });
+        membership.dedup();
+        for key in &equality {
+            self.metadata_eq
+                .entry(key.clone())
+                .or_default()
+                .insert(number);
+        }
+        for key in &membership {
+            self.metadata_membership
+                .entry(key.clone())
+                .or_default()
+                .insert(number);
+        }
+        self.metadata_keys.insert(number, (equality, membership));
         if let Some(chunk) = &fields.chunk {
             self.chunks
                 .entry(chunk.parent.clone())
@@ -199,6 +311,66 @@ impl RetrievalState {
             self.schema.insert(name.clone(), shape);
         }
         Ok(())
+    }
+
+    fn indexed_filter_numbers(&self, filter: &Predicate) -> Option<HashSet<u64>> {
+        match filter {
+            Predicate::Eq { field, value } => {
+                let key = scalar_key(&predicate_pointer(field), value)?;
+                Some(self.metadata_eq.get(&key).cloned().unwrap_or_default())
+            }
+            Predicate::In { field, values } => {
+                let pointer = predicate_pointer(field);
+                let mut ids = HashSet::new();
+                for value in values {
+                    let key = scalar_key(&pointer, value)?;
+                    if let Some(matches) = self.metadata_membership.get(&key) {
+                        ids.extend(matches);
+                    }
+                }
+                Some(ids)
+            }
+            Predicate::And { filters } => {
+                let mut children = filters.iter();
+                let mut ids = self.indexed_filter_numbers(children.next()?)?;
+                for child in children {
+                    let matches = self.indexed_filter_numbers(child)?;
+                    ids.retain(|id| matches.contains(id));
+                }
+                Some(ids)
+            }
+            Predicate::Or { filters } => {
+                let mut ids = HashSet::new();
+                for child in filters {
+                    ids.extend(self.indexed_filter_numbers(child)?);
+                }
+                Some(ids)
+            }
+            Predicate::Not { filter } => {
+                let excluded = self.indexed_filter_numbers(filter)?;
+                Some(
+                    self.ids
+                        .keys()
+                        .filter(|id| !excluded.contains(id))
+                        .copied()
+                        .collect(),
+                )
+            }
+            Predicate::Range { .. } => None,
+        }
+    }
+
+    pub(super) fn indexed_filter_count(&self, filter: &Predicate) -> Option<usize> {
+        self.indexed_filter_numbers(filter).map(|ids| ids.len())
+    }
+
+    pub(super) fn indexed_filter_ids<'a>(&'a self, filter: &Predicate) -> Option<HashSet<&'a str>> {
+        Some(
+            self.indexed_filter_numbers(filter)?
+                .into_iter()
+                .filter_map(|number| self.ids.get(&number).map(String::as_str))
+                .collect(),
+        )
     }
 
     fn neighbors<'a>(&'a self, chunk: &Chunk, radius: u32) -> impl Iterator<Item = &'a str> {
@@ -720,11 +892,13 @@ impl MultiVectorIndex {
         // state implicit: materializing a HashSet of every ID makes an HNSW
         // query O(collection size) before graph traversal even begins.
         let eligible: Option<HashSet<_>> = request.filter.as_ref().map(|filter| {
-            s.documents
-                .iter()
-                .filter(|(_, document)| filter.matches(&document.metadata))
-                .map(|(id, _)| id.as_str())
-                .collect()
+            s.retrieval.indexed_filter_ids(filter).unwrap_or_else(|| {
+                s.documents
+                    .iter()
+                    .filter(|(_, document)| filter.matches(&document.metadata))
+                    .map(|(id, _)| id.as_str())
+                    .collect()
+            })
         });
         let eligible_documents = eligible.as_ref().map_or(s.documents.len(), HashSet::len);
         let mut plan = self.compile_plan(&s, request, eligible_documents)?;
@@ -1424,6 +1598,102 @@ mod tests {
         drop(index);
         let reopened = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
         assert_eq!(reopened.plan(&query).unwrap().stats, updated);
+    }
+
+    #[test]
+    fn metadata_index_matches_predicate_evaluation_across_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut nested = document("nested", "indexed metadata", vec![0., 1.], "b", 0);
+        nested.metadata = json!({
+            "tenant": "b",
+            "tags": ["rust", "search"],
+            "owner": {"team": "retrieval"},
+            "year": 2025
+        });
+        index.upsert_records(vec![nested]).unwrap();
+
+        let predicates = vec![
+            Predicate::Eq {
+                field: "tenant".into(),
+                value: json!("a"),
+            },
+            Predicate::In {
+                field: "tags".into(),
+                values: vec![json!("rust")],
+            },
+            Predicate::Eq {
+                field: "/owner/team".into(),
+                value: json!("retrieval"),
+            },
+            Predicate::And {
+                filters: vec![
+                    Predicate::Eq {
+                        field: "tenant".into(),
+                        value: json!("b"),
+                    },
+                    Predicate::In {
+                        field: "tags".into(),
+                        values: vec![json!("search")],
+                    },
+                ],
+            },
+            Predicate::Or {
+                filters: vec![
+                    Predicate::Eq {
+                        field: "tenant".into(),
+                        value: json!("denied"),
+                    },
+                    Predicate::Eq {
+                        field: "tenant".into(),
+                        value: json!("b"),
+                    },
+                ],
+            },
+            Predicate::Not {
+                filter: Box::new(Predicate::Eq {
+                    field: "tenant".into(),
+                    value: json!("a"),
+                }),
+            },
+        ];
+
+        let assert_index_matches_scan = |index: &MultiVectorIndex| {
+            let state = index.snapshot();
+            for predicate in &predicates {
+                let expected: HashSet<_> = state
+                    .documents
+                    .iter()
+                    .filter(|(_, document)| predicate.matches(&document.metadata))
+                    .map(|(id, _)| id.as_str())
+                    .collect();
+                assert_eq!(
+                    state.retrieval.indexed_filter_ids(predicate).unwrap(),
+                    expected
+                );
+            }
+            assert!(
+                state
+                    .retrieval
+                    .indexed_filter_ids(&Predicate::Range {
+                        field: "year".into(),
+                        gte: Some(2025.),
+                        lte: None,
+                    })
+                    .is_none()
+            );
+        };
+
+        assert_index_matches_scan(&index);
+        let mut replacement = document("nested", "replacement", vec![1., 0.], "a", 0);
+        replacement.metadata = json!({"tenant": "a", "tags": ["database"]});
+        index.upsert_records(vec![replacement]).unwrap();
+        index.delete("c").unwrap();
+        assert_index_matches_scan(&index);
+
+        drop(index);
+        let reopened = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
+        assert_index_matches_scan(&reopened);
     }
 
     #[test]

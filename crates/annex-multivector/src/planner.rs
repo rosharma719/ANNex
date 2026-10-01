@@ -397,10 +397,15 @@ impl MultiVectorIndex {
             .as_ref()
             .map_or(state.documents.len(), |filter| {
                 state
-                    .documents
-                    .values()
-                    .filter(|document| filter.matches(&document.metadata))
-                    .count()
+                    .retrieval
+                    .indexed_filter_count(filter)
+                    .unwrap_or_else(|| {
+                        state
+                            .documents
+                            .values()
+                            .filter(|document| filter.matches(&document.metadata))
+                            .count()
+                    })
             });
         let mut plan = self.compile_plan(&state, request, eligible)?;
         plan.policy = policy_plan;

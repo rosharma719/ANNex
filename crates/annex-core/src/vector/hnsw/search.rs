@@ -122,13 +122,44 @@ fn prefetch_read<T>(ptr: *const T) {
     let _ = ptr;
 }
 
+/// L2-targeted prefetch hint. Used for cache lines beyond the first 128 bytes of
+/// a vector so that the early lines land in L1 (immediately useful) while the tail
+/// lands in L2 (available in time without evicting other L1 occupants). On x86 this
+/// is PREFETCHT1; on aarch64 PRFM PLDL2KEEP. Functionally identical to a no-op
+/// from a correctness standpoint.
+#[inline(always)]
+fn prefetch_read_l2<T>(ptr: *const T) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl2keep, [{addr}]", addr = in(reg) ptr,
+            options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(ptr.cast(), std::arch::x86_64::_MM_HINT_T1);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = ptr;
+}
+
 #[inline(always)]
 fn prefetch_from_view(view: &crate::vector::hnsw::arena::VectorArenaView, idx: usize) {
     let vector = view.get(idx);
-    for offset in [0, 16, 32, 48] {
+    // Prefetch every cache line (16 f32 = 64 bytes) of the full vector.
+    // Previously only the first 4 lines (256 bytes) were covered; a 256-dim f32
+    // vector is 1024 bytes = 16 lines, leaving 12 lines as uncovered demand fetches.
+    // First two lines (128 bytes) → L1 (scored immediately for short dimensions).
+    // Remaining lines → L2 to avoid evicting L1 occupants while batching 16 vectors.
+    let mut offset = 0;
+    while offset < vector.len() {
         if let Some(value) = vector.get(offset) {
-            prefetch_read(value);
+            if offset < 32 {
+                prefetch_read(value);
+            } else {
+                prefetch_read_l2(value);
+            }
         }
+        offset += 16; // 16 f32 = 64 bytes = one cache line
     }
 }
 
@@ -572,11 +603,24 @@ impl HNSWIndex {
                             // SQ8 threshold: 127.5² × (1 − worst_score) × safety_margin (0.85).
                             let mut sq8_thresh =
                                 ((1.0 - worst_score) * 127.5 * 127.5 * 0.85) as i32;
+                            let quant_stride = self.dim;
                             for (position, &neighbor) in neighbors.iter().enumerate() {
                                 if let Some(&next) = neighbors.get(position + 2)
                                     && let Some(entry) = scratch.visited_epoch.get(next)
                                 {
                                     prefetch_read(entry);
+                                }
+                                // Prefetch the quantized slice for the neighbor 2 ahead so the
+                                // SQ8 screen load (quantized_slice) is in L1 by the time we
+                                // need it, hiding the same DRAM latency as the f32 prefetch does.
+                                if let Some(&next_q) = neighbors.get(position + 2) {
+                                    let q_start = next_q * quant_stride;
+                                    if next_q < node_bound && q_start < self.quantized.len() {
+                                        // SAFETY: non-faulting hint; q_start < len checked above.
+                                        prefetch_read(unsafe {
+                                            self.quantized.as_ptr().add(q_start)
+                                        });
+                                    }
                                 }
                                 if neighbor >= node_bound
                                     || !is_live_via(&state_view, neighbor)

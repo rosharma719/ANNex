@@ -233,5 +233,102 @@ fn bench_filtered_execution(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(planner, bench_planner, bench_filtered_execution);
+/// Planner regret: for each selectivity band, compare the auto-chosen plan
+/// against forced-exact. Reports recall@k overlap and latency ratio so future
+/// cost-model changes can be calibrated against real performance.
+fn bench_planner_regret(c: &mut Criterion) {
+    let fixture = fixture(10_000);
+    fixture
+        .index
+        .build_dense_ann("semantic", 16, 100)
+        .expect("build dense ANN for regret benchmark");
+    let mut vector = vec![0.0; DIMENSION];
+    vector[0] = 1.0;
+
+    let cases = [
+        ("unfiltered", None),
+        (
+            "filtered_10pct",
+            Some(serde_json::json!({"op": "eq", "field": "tenant", "value": "selected"})),
+        ),
+        (
+            "filtered_1pct",
+            Some(serde_json::json!({"op": "eq", "field": "bucket", "value": 0})),
+        ),
+    ];
+
+    let mut group = c.benchmark_group("planner_regret");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(3));
+
+    for (name, filter) in cases {
+        let auto_req = request(serde_json::json!({
+            "prefetch": [{"kind": "dense", "field": "semantic",
+                          "vector": vector, "limit": 10, "backend": "auto", "ef_search": 64}],
+            "filter": filter,
+            "limit": 10
+        }));
+        let exact_req = request(serde_json::json!({
+            "prefetch": [{"kind": "dense", "field": "semantic",
+                          "vector": vector, "limit": 10, "backend": "exact"}],
+            "filter": filter,
+            "limit": 10
+        }));
+
+        // Measure recall@10: |auto ∩ exact| / |exact|.
+        // Printed once before the timed loop so it appears in bench output.
+        let exact_ids: std::collections::HashSet<String> = fixture
+            .index
+            .retrieve(&exact_req)
+            .expect("exact baseline")
+            .matches
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let auto_ids: std::collections::HashSet<String> = fixture
+            .index
+            .retrieve(&auto_req)
+            .expect("auto plan")
+            .matches
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let recall = if exact_ids.is_empty() {
+            1.0
+        } else {
+            auto_ids.intersection(&exact_ids).count() as f64 / exact_ids.len() as f64
+        };
+        eprintln!("regret/{name}: recall@10={recall:.3}");
+
+        group.throughput(criterion::Throughput::Elements(1));
+        group.bench_with_input(BenchmarkId::new("auto", name), &auto_req, |b, req| {
+            b.iter(|| {
+                black_box(
+                    fixture
+                        .index
+                        .retrieve(black_box(req))
+                        .expect("auto retrieve"),
+                )
+            })
+        });
+        group.bench_with_input(BenchmarkId::new("exact", name), &exact_req, |b, req| {
+            b.iter(|| {
+                black_box(
+                    fixture
+                        .index
+                        .retrieve(black_box(req))
+                        .expect("exact retrieve"),
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    planner,
+    bench_planner,
+    bench_filtered_execution,
+    bench_planner_regret
+);
 criterion_main!(planner);

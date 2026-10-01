@@ -1150,15 +1150,44 @@ impl MultiVectorIndex {
                         ..
                     } => {
                         if planned.operator == PhysicalOperator::HnswDense {
-                            self.ann_scores_filtered(
+                            let q = normalize(vector);
+                            let ann = &s.named_ann[field];
+                            let expected = limit.min(eligible_documents);
+                            let mut scores = self.ann_scores_filtered(
                                 &s,
-                                &s.named_ann[field],
-                                &normalize(vector),
+                                ann,
+                                &q,
                                 limit,
                                 *ef_search,
                                 ann_filter.as_ref(),
                                 eligible.as_ref(),
-                            )?
+                            )?;
+                            // Progressive widening: if short of expected, retry at
+                            // 2× ef before falling through to exact.
+                            if scores.len() < expected {
+                                let wider = (ef_search * 2).min(4 * limit).max(*ef_search + 1);
+                                scores = self.ann_scores_filtered(
+                                    &s,
+                                    ann,
+                                    &q,
+                                    limit,
+                                    wider,
+                                    ann_filter.as_ref(),
+                                    eligible.as_ref(),
+                                )?;
+                            }
+                            if scores.len() < expected {
+                                self.named_scores(
+                                    &s,
+                                    field,
+                                    std::slice::from_ref(vector),
+                                    false,
+                                    eligible.as_ref(),
+                                    limit,
+                                )?
+                            } else {
+                                scores
+                            }
                         } else {
                             self.named_scores(
                                 &s,
@@ -1183,14 +1212,37 @@ impl MultiVectorIndex {
                     } => {
                         let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
                         if planned.operator == PhysicalOperator::HnswFde {
-                            self.ann_fde_scores_filtered(
+                            let encoded = self.fde.encode_query(&normalized);
+                            let expected = limit.min(eligible_documents);
+                            let mut scores = self.ann_fde_scores_filtered(
                                 &s,
-                                &self.fde.encode_query(&normalized),
+                                &encoded,
                                 limit,
                                 *ef_search,
                                 ann_filter.as_ref(),
                                 eligible.as_ref(),
-                            )?
+                            )?;
+                            if scores.len() < expected {
+                                let wider = (ef_search * 2).min(4 * limit).max(*ef_search + 1);
+                                scores = self.ann_fde_scores_filtered(
+                                    &s,
+                                    &encoded,
+                                    limit,
+                                    wider,
+                                    ann_filter.as_ref(),
+                                    eligible.as_ref(),
+                                )?;
+                            }
+                            if scores.len() < expected {
+                                self.exact_fde_scores_filtered(
+                                    &s,
+                                    &normalized,
+                                    Some(limit),
+                                    eligible.as_ref(),
+                                )?
+                            } else {
+                                scores
+                            }
                         } else {
                             self.exact_fde_scores_filtered(
                                 &s,
@@ -1727,7 +1779,7 @@ mod tests {
 
         index.build_dense_ann("semantic", 4, 16).unwrap();
         let ann = index.plan(&query).unwrap();
-        // 3-doc corpus, dim=2: cost_exact=12 < cost_hnsw=3072 → exact chosen by cost model.
+        // 3-doc corpus, dim=2: cost_exact=156 < cost_hnsw=2435 → exact chosen by cost model.
         assert_eq!(
             ann.parallel_channels()[0].operator,
             PhysicalOperator::ExactDense

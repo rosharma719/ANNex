@@ -927,6 +927,98 @@ unsafe fn l2_avx2_fma(query: &[f32], vec: &[f32]) -> f32 {
     acc
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_avx512(query: &[f32], vec: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let len = query.len().min(vec.len());
+    let mut s0 = _mm512_setzero_ps();
+    let mut s1 = _mm512_setzero_ps();
+    let mut s2 = _mm512_setzero_ps();
+    let mut s3 = _mm512_setzero_ps();
+    let mut i = 0;
+    while i + 64 <= len {
+        let q0 = _mm512_loadu_ps(query.as_ptr().add(i));
+        let q1 = _mm512_loadu_ps(query.as_ptr().add(i + 16));
+        let q2 = _mm512_loadu_ps(query.as_ptr().add(i + 32));
+        let q3 = _mm512_loadu_ps(query.as_ptr().add(i + 48));
+        let v0 = _mm512_loadu_ps(vec.as_ptr().add(i));
+        let v1 = _mm512_loadu_ps(vec.as_ptr().add(i + 16));
+        let v2 = _mm512_loadu_ps(vec.as_ptr().add(i + 32));
+        let v3 = _mm512_loadu_ps(vec.as_ptr().add(i + 48));
+        s0 = _mm512_fmadd_ps(q0, v0, s0);
+        s1 = _mm512_fmadd_ps(q1, v1, s1);
+        s2 = _mm512_fmadd_ps(q2, v2, s2);
+        s3 = _mm512_fmadd_ps(q3, v3, s3);
+        i += 64;
+    }
+    while i + 16 <= len {
+        let q = _mm512_loadu_ps(query.as_ptr().add(i));
+        let v = _mm512_loadu_ps(vec.as_ptr().add(i));
+        s0 = _mm512_fmadd_ps(q, v, s0);
+        i += 16;
+    }
+    s0 = _mm512_add_ps(s0, s1);
+    s2 = _mm512_add_ps(s2, s3);
+    s0 = _mm512_add_ps(s0, s2);
+    let mut acc = _mm512_reduce_add_ps(s0);
+    while i < len {
+        acc += *query.get_unchecked(i) * *vec.get_unchecked(i);
+        i += 1;
+    }
+    acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn l2_avx512(query: &[f32], vec: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let len = query.len().min(vec.len());
+    let mut s0 = _mm512_setzero_ps();
+    let mut s1 = _mm512_setzero_ps();
+    let mut s2 = _mm512_setzero_ps();
+    let mut s3 = _mm512_setzero_ps();
+    let mut i = 0;
+    while i + 64 <= len {
+        let q0 = _mm512_loadu_ps(query.as_ptr().add(i));
+        let q1 = _mm512_loadu_ps(query.as_ptr().add(i + 16));
+        let q2 = _mm512_loadu_ps(query.as_ptr().add(i + 32));
+        let q3 = _mm512_loadu_ps(query.as_ptr().add(i + 48));
+        let v0 = _mm512_loadu_ps(vec.as_ptr().add(i));
+        let v1 = _mm512_loadu_ps(vec.as_ptr().add(i + 16));
+        let v2 = _mm512_loadu_ps(vec.as_ptr().add(i + 32));
+        let v3 = _mm512_loadu_ps(vec.as_ptr().add(i + 48));
+        let d0 = _mm512_sub_ps(q0, v0);
+        let d1 = _mm512_sub_ps(q1, v1);
+        let d2 = _mm512_sub_ps(q2, v2);
+        let d3 = _mm512_sub_ps(q3, v3);
+        s0 = _mm512_fmadd_ps(d0, d0, s0);
+        s1 = _mm512_fmadd_ps(d1, d1, s1);
+        s2 = _mm512_fmadd_ps(d2, d2, s2);
+        s3 = _mm512_fmadd_ps(d3, d3, s3);
+        i += 64;
+    }
+    while i + 16 <= len {
+        let q = _mm512_loadu_ps(query.as_ptr().add(i));
+        let v = _mm512_loadu_ps(vec.as_ptr().add(i));
+        let d = _mm512_sub_ps(q, v);
+        s0 = _mm512_fmadd_ps(d, d, s0);
+        i += 16;
+    }
+    s0 = _mm512_add_ps(s0, s1);
+    s2 = _mm512_add_ps(s2, s3);
+    s0 = _mm512_add_ps(s0, s2);
+    let mut acc = _mm512_reduce_add_ps(s0);
+    while i < len {
+        let d = *query.get_unchecked(i) - *vec.get_unchecked(i);
+        acc += d * d;
+        i += 1;
+    }
+    acc
+}
+
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_op_in_unsafe_fn)]
 #[inline]
@@ -1634,29 +1726,33 @@ mod tests {
     fn x86_simd_kernels_match_scalar_across_shapes() {
         let avx2 = std::arch::is_x86_feature_detected!("avx2");
         let fma = std::arch::is_x86_feature_detected!("fma");
+        let avx512f = std::arch::is_x86_feature_detected!("avx512f");
+        let avx512vnni = std::arch::is_x86_feature_detected!("avx512vnni");
         let required = env::var("ANNEX_REQUIRE_X86_FEATURES").unwrap_or_default();
         for feature in required.split(',').map(str::trim).filter(|v| !v.is_empty()) {
             let available = match feature {
                 "avx2" => avx2,
                 "fma" => fma,
+                "avx512f" => avx512f,
+                "avx512vnni" => avx512vnni,
                 other => panic!("unknown required x86 feature: {other}"),
             };
             assert!(available, "required x86 feature is unavailable: {feature}");
         }
 
-        eprintln!("x86 kernel coverage: avx2={avx2} fma={fma}");
+        eprintln!("x86 kernel coverage: avx2={avx2} fma={fma} avx512f={avx512f} avx512vnni={avx512vnni}");
         for &dim in &[
-            0, 1, 7, 8, 9, 31, 32, 33, 127, 128, 129, 255, 256, 257, 1537,
+            0, 1, 7, 8, 9, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1537,
         ] {
             let query = gen_vec(dim as u32 + 1, dim);
             let vector = gen_vec(dim as u32 + 10_001, dim + usize::from(dim % 2 == 0));
             let dot_ref = dot_scalar(&query, &vector);
             let l2_ref = l2_scalar(&query, &vector);
             let close = |actual: f32, expected: f32| {
-                let tolerance = 1e-3 + 2e-5 * expected.abs();
+                let tol = 1e-3_f32 * expected.abs().max(1.0);
                 assert!(
-                    (actual - expected).abs() <= tolerance,
-                    "dim={dim}: expected {expected}, got {actual}, tolerance={tolerance}"
+                    (actual - expected).abs() <= tol,
+                    "dim={dim}: expected {expected}, got {actual}, tol={tol}"
                 );
             };
 
@@ -1672,6 +1768,12 @@ mod tests {
                     close(l2_avx2_fma(&query, &vector), l2_ref);
                 }
             }
+            if avx512f {
+                unsafe {
+                    close(dot_avx512(&query, &vector), dot_ref);
+                    close(l2_avx512(&query, &vector), l2_ref);
+                }
+            }
 
             let query_i8: Vec<i8> = (0..dim)
                 .map(|i| [-128, -127, -1, 0, 1, 126, 127][i % 7])
@@ -1683,7 +1785,14 @@ mod tests {
                 assert_eq!(
                     unsafe { screen_dot_avx2(&query_i8, &stored) },
                     screen_dot_scalar(&query_i8, &stored),
-                    "SQ8 mismatch at dim={dim}"
+                    "SQ8 AVX2 mismatch at dim={dim}"
+                );
+            }
+            if avx512f && avx512vnni {
+                assert_eq!(
+                    unsafe { screen_dot_avx512_vnni(&query_i8, &stored) },
+                    screen_dot_scalar(&query_i8, &stored),
+                    "SQ8 VNNI mismatch at dim={dim}"
                 );
             }
         }

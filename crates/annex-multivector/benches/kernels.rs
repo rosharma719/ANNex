@@ -66,7 +66,7 @@ fn bench_dot(c: &mut Criterion) {
 }
 
 fn bench_screen_dot(c: &mut Criterion) {
-    use annex::bench_access::screen_dot_scalar;
+    use annex::bench_access::{screen_dot_scalar, screen_dot_dispatch};
 
     let mut group = c.benchmark_group("screen_dot");
 
@@ -99,12 +99,12 @@ fn bench_screen_dot(c: &mut Criterion) {
             b.iter(|| screen_dot_scalar(black_box(&q), black_box(&s)))
         });
 
-        // Public dispatch (routes to best available kernel).
+        // Full dispatch (routes to best available kernel: VNNI on Ice Lake, AVX2 elsewhere).
         let q2 = query_i8.clone();
         let s2 = stored_u8.clone();
         let label = format!("dispatch/dim={dim}");
         group.bench_function(&label, |b| {
-            b.iter(|| annex::vector::hnsw::HNSWIndex::screen_dot(black_box(&q2), black_box(&s2)))
+            b.iter(|| screen_dot_dispatch(black_box(&q2), black_box(&s2)))
         });
     }
     group.finish();

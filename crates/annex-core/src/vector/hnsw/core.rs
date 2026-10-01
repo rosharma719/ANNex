@@ -374,6 +374,11 @@ impl HNSWIndex {
 
     #[inline]
     pub(crate) fn fast_score(&self, query: &[f32], vec: &[f32]) -> f32 {
+        // dot_fn / l2_fn are function pointers selected once at construction.
+        // The indirect-branch predictor learns the target within the first few
+        // calls, after which the overhead is equivalent to a correctly-predicted
+        // direct branch. TODO: add a micro-bench comparing this path against the
+        // old inline is_x86_feature_detected dispatch to confirm no regression.
         match self.metric {
             DistanceMetric::Cosine => {
                 let dot = (self.dot_fn)(query, vec).clamp(-1.0, 1.0);
@@ -1584,14 +1589,22 @@ impl HNSWIndex {
     /// Dispatches to NEON sdot on aarch64 (4 cache lines vs 16 for f32), scalar fallback
     /// elsewhere. Monotone with true cosine similarity — higher = closer.
     #[inline]
-    pub fn screen_dot(query_i8: &[i8], stored: &[u8]) -> i32 {
+    pub(crate) fn screen_dot(query_i8: &[i8], stored: &[u8]) -> i32 {
         #[cfg(target_arch = "aarch64")]
         if std::arch::is_aarch64_feature_detected!("dotprod") {
             return unsafe { screen_dot_neon_sdot(query_i8, stored) };
         }
         #[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return unsafe { screen_dot_avx2(query_i8, stored) };
+        {
+            // VNNI before AVX2: Ice Lake and later get the VNNI kernel.
+            if std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512vnni")
+            {
+                return unsafe { screen_dot_avx512_vnni(query_i8, stored) };
+            }
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return unsafe { screen_dot_avx2(query_i8, stored) };
+            }
         }
         screen_dot_scalar(query_i8, stored)
     }
@@ -1771,6 +1784,11 @@ impl HNSWIndex {}
 pub mod bench_access {
     pub use super::screen_dot_scalar;
     pub use super::HNSWIndex;
+
+    /// Thin public wrapper around the crate-private `screen_dot` dispatch.
+    pub fn screen_dot_dispatch(query_i8: &[i8], stored: &[u8]) -> i32 {
+        super::HNSWIndex::screen_dot(query_i8, stored)
+    }
 }
 
 #[cfg(test)]

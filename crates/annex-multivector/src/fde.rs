@@ -59,8 +59,11 @@ pub fn dot(left: &[f32], right: &[f32]) -> f32 {
             CpuLevel::Avx512Vnni | CpuLevel::Avx512F => {
                 return unsafe { dot_avx512_len(left.as_ptr(), right.as_ptr(), n) };
             }
-            CpuLevel::Avx2Fma | CpuLevel::Avx2 => {
+            CpuLevel::Avx2Fma => {
                 return unsafe { dot_avx2_fma_len(left.as_ptr(), right.as_ptr(), n) };
+            }
+            CpuLevel::Avx2 => {
+                return unsafe { dot_avx2_len(left.as_ptr(), right.as_ptr(), n) };
             }
             _ => {}
         }
@@ -133,6 +136,40 @@ unsafe fn dot_neon_128(a: *const f32, b: *const f32) -> f32 {
         let acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
         vaddvq_f32(acc)
     }
+}
+
+/// AVX2-only dot product (no FMA). 2 accumulators × 8 f32 = 16 f/iter.
+/// Used when AVX2 is available but FMA is not (some pre-Broadwell or AMD Jaguar).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_avx2_len(a: *const f32, b: *const f32, len: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut s0 = _mm256_setzero_ps();
+    let mut s1 = _mm256_setzero_ps();
+    let mut i = 0usize;
+    while i + 16 <= len {
+        s0 = _mm256_add_ps(s0, _mm256_mul_ps(_mm256_loadu_ps(a.add(i)),     _mm256_loadu_ps(b.add(i))));
+        s1 = _mm256_add_ps(s1, _mm256_mul_ps(_mm256_loadu_ps(a.add(i + 8)), _mm256_loadu_ps(b.add(i + 8))));
+        i += 16;
+    }
+    while i + 8 <= len {
+        s0 = _mm256_add_ps(s0, _mm256_mul_ps(_mm256_loadu_ps(a.add(i)), _mm256_loadu_ps(b.add(i))));
+        i += 8;
+    }
+    s0 = _mm256_add_ps(s0, s1);
+    let hi  = _mm256_extractf128_ps(s0, 1);
+    let lo  = _mm256_castps256_ps128(s0);
+    let sum = _mm_add_ps(hi, lo);
+    let shuf = _mm_movehl_ps(sum, sum);
+    let sums = _mm_add_ps(sum, shuf);
+    let shuf2 = _mm_shuffle_ps(sums, sums, 1);
+    let mut acc = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+    while i < len {
+        acc += *a.add(i) * *b.add(i);
+        i += 1;
+    }
+    acc
 }
 
 /// AVX2+FMA dot product for arbitrary length. 4 accumulators × 8 f32 = 32 f/iter.
@@ -244,8 +281,11 @@ pub fn maxsim_flat(query: &[Vector], document: &[f32], dimension: usize) -> f32 
         CpuLevel::Avx512Vnni | CpuLevel::Avx512F => {
             return maxsim_flat_avx512(query, document, dimension);
         }
-        CpuLevel::Avx2Fma | CpuLevel::Avx2 => {
+        CpuLevel::Avx2Fma => {
             return maxsim_flat_avx2_fma(query, document, dimension);
+        }
+        CpuLevel::Avx2 => {
+            return maxsim_flat_avx2(query, document, dimension);
         }
         _ => {}
     }
@@ -304,6 +344,26 @@ fn maxsim_flat_neon(query: &[Vector], document: &[f32], dimension: usize) -> f32
                 // (maxsim_flat), q and doc are contiguous slices of `dimension`
                 // f32 values, so the NEON loads stay in-bounds.
                 let s = unsafe { dot_neon_multiple_of_16(qp, doc.as_ptr(), dimension) };
+                if s > best {
+                    best = s;
+                }
+            }
+            best
+        })
+        .sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn maxsim_flat_avx2(query: &[Vector], document: &[f32], dimension: usize) -> f32 {
+    let dot_fn: unsafe fn(*const f32, *const f32, usize) -> f32 = dot_avx2_len;
+    query
+        .iter()
+        .map(|q| {
+            debug_assert_eq!(q.len(), dimension);
+            let qp = q.as_ptr();
+            let mut best = f32::NEG_INFINITY;
+            for doc in document.chunks_exact(dimension) {
+                let s = unsafe { dot_fn(qp, doc.as_ptr(), dimension) };
                 if s > best {
                     best = s;
                 }

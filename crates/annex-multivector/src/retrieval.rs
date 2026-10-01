@@ -72,7 +72,196 @@ pub(super) struct RetrievalState {
     schema: BTreeMap<String, FieldSchema>,
     document_chunks: HashMap<u64, Chunk>,
     chunks: HashMap<String, BTreeMap<u32, BTreeSet<String>>>,
+    metadata_eq: HashMap<MetadataKey, HashSet<u64>>,
+    metadata_membership: HashMap<MetadataKey, HashSet<u64>>,
+    metadata_keys: HashMap<u64, (Vec<MetadataKey>, Vec<MetadataKey>)>,
     analyzer: Analyzer,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MetadataKey {
+    pointer: String,
+    value: String,
+}
+
+/// Candidate document numbers produced by the metadata index. Sparse matches
+/// stay in a sorted vector; dense matches use one bit per allocated document
+/// number. This avoids a `HashSet` allocation per boolean-filter operation and
+/// keeps membership checks cheap for lexical, sparse, exact, and ANN overlays.
+#[derive(Clone, Debug)]
+pub(super) enum DocSet {
+    Sparse(Vec<u64>),
+    Bitmap { words: Vec<u64>, len: usize },
+}
+
+impl DocSet {
+    fn from_numbers<I>(next_id: u64, numbers: I) -> Self
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let mut ids: Vec<_> = numbers.into_iter().collect();
+        let word_count = usize::try_from(next_id.saturating_add(63) / 64).unwrap_or(usize::MAX);
+        // A sparse u64 vector costs eight bytes per match. Prefer a bitmap once
+        // it is no larger, while avoiding a large bitmap after heavy churn.
+        if word_count > 0 && word_count <= ids.len() {
+            let mut words = vec![0; word_count];
+            let mut len = 0;
+            for &id in &ids {
+                let word = (id / 64) as usize;
+                if word < words.len() {
+                    let mask = 1_u64 << (id % 64);
+                    if words[word] & mask == 0 {
+                        words[word] |= mask;
+                        len += 1;
+                    }
+                }
+            }
+            Self::Bitmap { words, len }
+        } else {
+            ids.sort_unstable();
+            ids.dedup();
+            Self::Sparse(ids)
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        match self {
+            Self::Sparse(ids) => ids.len(),
+            Self::Bitmap { len, .. } => *len,
+        }
+    }
+
+    pub(super) fn contains(&self, id: u64) -> bool {
+        match self {
+            Self::Sparse(ids) => ids.binary_search(&id).is_ok(),
+            Self::Bitmap { words, .. } => words
+                .get((id / 64) as usize)
+                .is_some_and(|word| word & (1_u64 << (id % 64)) != 0),
+        }
+    }
+
+    pub(super) fn iter(&self) -> Box<dyn Iterator<Item = u64> + '_> {
+        match self {
+            Self::Sparse(ids) => Box::new(ids.iter().copied()),
+            Self::Bitmap { words, .. } => {
+                Box::new(words.iter().enumerate().flat_map(|(word_index, &word)| {
+                    (0..64).filter_map(move |bit| {
+                        (word & (1_u64 << bit) != 0).then_some((word_index as u64) * 64 + bit)
+                    })
+                }))
+            }
+        }
+    }
+
+    fn intersection(self, other: &Self, next_id: u64) -> Self {
+        Self::from_numbers(next_id, self.iter().filter(|id| other.contains(*id)))
+    }
+
+    fn union(self, other: Self, next_id: u64) -> Self {
+        Self::from_numbers(next_id, self.iter().chain(other.iter()))
+    }
+}
+
+fn pointer_escape(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+fn predicate_pointer(field: &str) -> String {
+    if field.starts_with('/') {
+        field.to_owned()
+    } else {
+        format!("/{}", pointer_escape(field))
+    }
+}
+
+fn scalar_key(pointer: &str, value: &Value) -> Option<MetadataKey> {
+    (!value.is_array() && !value.is_object()).then(|| MetadataKey {
+        pointer: pointer.to_owned(),
+        value: serde_json::to_string(value).expect("scalar JSON serialization cannot fail"),
+    })
+}
+
+fn collect_metadata_keys(
+    value: &Value,
+    pointer: &str,
+    equality: &mut Vec<MetadataKey>,
+    membership: &mut Vec<MetadataKey>,
+) {
+    match value {
+        Value::Object(object) => {
+            for (name, child) in object {
+                let child_pointer = format!("{pointer}/{}", pointer_escape(name));
+                collect_metadata_keys(child, &child_pointer, equality, membership);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                if let Some(key) = scalar_key(pointer, child) {
+                    membership.push(key);
+                }
+            }
+            for (index, child) in values.iter().enumerate() {
+                let child_pointer = format!("{pointer}/{index}");
+                collect_metadata_keys(child, &child_pointer, equality, membership);
+            }
+        }
+        _ => {
+            if let Some(key) = scalar_key(pointer, value) {
+                equality.push(key.clone());
+                membership.push(key);
+            }
+        }
+    }
+}
+
+fn ann_payload_value(value: &Value) -> Option<annex::PayloadValue> {
+    match value {
+        Value::Bool(value) => Some(annex::PayloadValue::Bool(*value)),
+        Value::Number(value) => value
+            .as_i64()
+            .map(annex::PayloadValue::Int)
+            .or_else(|| {
+                value
+                    .as_u64()
+                    .and_then(|value| i64::try_from(value).ok())
+                    .map(annex::PayloadValue::Int)
+            })
+            .or_else(|| {
+                value
+                    .as_f64()
+                    .map(|value| annex::PayloadValue::Float(value.into()))
+            }),
+        Value::String(value) => Some(annex::PayloadValue::Str(value.clone())),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+fn collect_ann_payload(value: &Value, pointer: &str, payload: &mut annex::Payload) {
+    match value {
+        Value::Object(object) => {
+            for (name, child) in object {
+                let child_pointer = format!("{pointer}/{}", pointer_escape(name));
+                collect_ann_payload(child, &child_pointer, payload);
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                let child_pointer = format!("{pointer}/{index}");
+                collect_ann_payload(child, &child_pointer, payload);
+            }
+        }
+        _ => {
+            if let Some(value) = ann_payload_value(value) {
+                payload.set(pointer, value);
+            }
+        }
+    }
+}
+
+pub(super) fn metadata_ann_payload(metadata: &Value) -> annex::Payload {
+    let mut payload = annex::Payload::default();
+    collect_ann_payload(metadata, "", &mut payload);
+    payload
 }
 
 fn invalid(message: impl Into<String>) -> IndexError {
@@ -140,9 +329,32 @@ impl RetrievalState {
             for index in self.sparse.values() {
                 index.delete(number);
             }
+            if let Some((equality, membership)) = self.metadata_keys.remove(&number) {
+                for key in equality {
+                    if let Some(ids) = self.metadata_eq.get_mut(&key) {
+                        ids.remove(&number);
+                        if ids.is_empty() {
+                            self.metadata_eq.remove(&key);
+                        }
+                    }
+                }
+                for key in membership {
+                    if let Some(ids) = self.metadata_membership.get_mut(&key) {
+                        ids.remove(&number);
+                        if ids.is_empty() {
+                            self.metadata_membership.remove(&key);
+                        }
+                    }
+                }
+            }
         }
     }
-    pub(super) fn insert(&mut self, id: &str, fields: &Fields) -> Result<(), IndexError> {
+    pub(super) fn insert(
+        &mut self,
+        id: &str,
+        fields: &Fields,
+        metadata: &Value,
+    ) -> Result<(), IndexError> {
         self.remove(id);
         let number = self.next_id;
         self.next_id = number
@@ -150,6 +362,34 @@ impl RetrievalState {
             .ok_or_else(|| invalid("document IDs exhausted"))?;
         self.by_id.insert(id.to_owned(), number);
         self.ids.insert(number, id.to_owned());
+        let mut equality = Vec::new();
+        let mut membership = Vec::new();
+        collect_metadata_keys(metadata, "", &mut equality, &mut membership);
+        equality.sort_by(|a, b| {
+            a.pointer
+                .cmp(&b.pointer)
+                .then_with(|| a.value.cmp(&b.value))
+        });
+        equality.dedup();
+        membership.sort_by(|a, b| {
+            a.pointer
+                .cmp(&b.pointer)
+                .then_with(|| a.value.cmp(&b.value))
+        });
+        membership.dedup();
+        for key in &equality {
+            self.metadata_eq
+                .entry(key.clone())
+                .or_default()
+                .insert(number);
+        }
+        for key in &membership {
+            self.metadata_membership
+                .entry(key.clone())
+                .or_default()
+                .insert(number);
+        }
+        self.metadata_keys.insert(number, (equality, membership));
         if let Some(chunk) = &fields.chunk {
             self.chunks
                 .entry(chunk.parent.clone())
@@ -199,6 +439,93 @@ impl RetrievalState {
             self.schema.insert(name.clone(), shape);
         }
         Ok(())
+    }
+
+    fn indexed_filter_numbers(&self, filter: &Predicate) -> Option<DocSet> {
+        match filter {
+            Predicate::Eq { field, value } => {
+                let key = scalar_key(&predicate_pointer(field), value)?;
+                Some(DocSet::from_numbers(
+                    self.next_id,
+                    self.metadata_eq
+                        .get(&key)
+                        .into_iter()
+                        .flat_map(|ids| ids.iter().copied()),
+                ))
+            }
+            Predicate::In { field, values } => {
+                let pointer = predicate_pointer(field);
+                let mut ids = Vec::new();
+                for value in values {
+                    let key = scalar_key(&pointer, value)?;
+                    if let Some(matches) = self.metadata_membership.get(&key) {
+                        ids.extend(matches.iter().copied());
+                    }
+                }
+                Some(DocSet::from_numbers(self.next_id, ids))
+            }
+            Predicate::And { filters } => {
+                let mut children = filters.iter();
+                let mut ids = self.indexed_filter_numbers(children.next()?)?;
+                for child in children {
+                    let matches = self.indexed_filter_numbers(child)?;
+                    ids = ids.intersection(&matches, self.next_id);
+                }
+                Some(ids)
+            }
+            Predicate::Or { filters } => {
+                let mut ids = DocSet::Sparse(Vec::new());
+                for child in filters {
+                    ids = ids.union(self.indexed_filter_numbers(child)?, self.next_id);
+                }
+                Some(ids)
+            }
+            Predicate::Not { filter } => {
+                let excluded = self.indexed_filter_numbers(filter)?;
+                Some(DocSet::from_numbers(
+                    self.next_id,
+                    self.ids
+                        .keys()
+                        .filter(|id| !excluded.contains(**id))
+                        .copied(),
+                ))
+            }
+            Predicate::Range { .. } => None,
+        }
+    }
+
+    pub(super) fn indexed_filter_set(&self, filter: &Predicate) -> Option<DocSet> {
+        self.indexed_filter_numbers(filter)
+    }
+
+    pub(super) fn number(&self, id: &str) -> Option<u64> {
+        self.by_id.get(id).copied()
+    }
+
+    pub(super) fn external_id(&self, number: u64) -> Option<&str> {
+        self.ids.get(&number).map(String::as_str)
+    }
+
+    pub(super) fn contains_external(&self, set: &DocSet, id: &str) -> bool {
+        self.number(id).is_some_and(|number| set.contains(number))
+    }
+
+    pub(super) fn indexed_filter_count(&self, filter: &Predicate) -> Option<usize> {
+        if let Predicate::Eq { field, value } = filter {
+            let key = scalar_key(&predicate_pointer(field), value)?;
+            return Some(self.metadata_eq.get(&key).map_or(0, HashSet::len));
+        }
+        self.indexed_filter_numbers(filter).map(|ids| ids.len())
+    }
+
+    #[cfg(test)]
+    pub(super) fn indexed_filter_ids<'a>(&'a self, filter: &Predicate) -> Option<HashSet<&'a str>> {
+        Some(
+            self.indexed_filter_numbers(filter)?
+                .iter()
+                .filter_map(|number| self.ids.get(&number).map(String::as_str))
+                .collect(),
+        )
     }
 
     fn neighbors<'a>(&'a self, chunk: &Chunk, radius: u32) -> impl Iterator<Item = &'a str> {
@@ -302,6 +629,30 @@ impl Predicate {
             Self::And { filters } => filters.iter().all(|f| f.matches(metadata)),
             Self::Or { filters } => filters.iter().any(|f| f.matches(metadata)),
             Self::Not { filter } => !filter.matches(metadata),
+        }
+    }
+
+    /// Translate the predicate only when the ANN payload evaluator has exactly
+    /// the same semantics. Unsupported shapes retain exact filtered execution.
+    pub(super) fn ann_filter(&self) -> Option<annex::Filter> {
+        match self {
+            Self::Eq { field, value } => Some(annex::Filter::Match {
+                key: predicate_pointer(field),
+                value: ann_payload_value(value)?,
+            }),
+            Self::And { filters } => Some(annex::Filter::And(
+                filters
+                    .iter()
+                    .map(Self::ann_filter)
+                    .collect::<Option<Vec<_>>>()?,
+            )),
+            Self::Or { filters } => Some(annex::Filter::Or(
+                filters
+                    .iter()
+                    .map(Self::ann_filter)
+                    .collect::<Option<Vec<_>>>()?,
+            )),
+            Self::In { .. } | Self::Range { .. } | Self::Not { .. } => None,
         }
     }
 }
@@ -716,18 +1067,28 @@ impl MultiVectorIndex {
         let s = self.snapshot();
         let (effective_request, policy_plan) = self.prepare_request(&s, request);
         let request = effective_request.as_ref();
-        let eligible: HashSet<_> = s
-            .documents
-            .iter()
-            .filter(|(_, d)| {
-                request
-                    .filter
-                    .as_ref()
-                    .is_none_or(|f| f.matches(&d.metadata))
-            })
-            .map(|(id, _)| id.as_str())
-            .collect();
-        let mut plan = self.compile_plan(&s, request, eligible.len())?;
+        // An unfiltered query means every live document is eligible. Keep that
+        // state implicit: materializing a HashSet of every ID makes an HNSW
+        // query O(collection size) before graph traversal even begins.
+        let mut filter_strategy = FilterStrategy::None;
+        let eligible: Option<DocSet> = request.filter.as_ref().map(|filter| {
+            if let Some(indexed) = s.retrieval.indexed_filter_set(filter) {
+                filter_strategy = FilterStrategy::MetadataIndex;
+                indexed
+            } else {
+                filter_strategy = FilterStrategy::MetadataScan;
+                DocSet::from_numbers(
+                    s.retrieval.next_id,
+                    s.documents
+                        .iter()
+                        .filter(|(_, document)| filter.matches(&document.metadata))
+                        .filter_map(|(id, _)| s.retrieval.number(id)),
+                )
+            }
+        });
+        let eligible_documents = eligible.as_ref().map_or(s.documents.len(), DocSet::len);
+        let ann_filter = request.filter.as_ref().and_then(Predicate::ann_filter);
+        let mut plan = self.compile_plan(&s, request, eligible_documents, filter_strategy)?;
         plan.policy = policy_plan;
         let mut per_stage_actual_ms: Vec<f64> = Vec::with_capacity(plan.stages.len());
 
@@ -745,10 +1106,9 @@ impl MultiVectorIndex {
                 let at = Instant::now();
                 let limit = planned.limit;
                 let allowed = |number: u64| {
-                    s.retrieval
-                        .ids
-                        .get(&number)
-                        .is_some_and(|id| eligible.contains(id.as_str()))
+                    eligible
+                        .as_ref()
+                        .is_none_or(|eligible| eligible.contains(number))
                 };
                 let external = |hits: Vec<(u64, f32)>| -> Vec<(String, f32)> {
                     hits.into_iter()
@@ -790,12 +1150,14 @@ impl MultiVectorIndex {
                         ..
                     } => {
                         if planned.operator == PhysicalOperator::HnswDense {
-                            self.ann_scores(
+                            self.ann_scores_filtered(
                                 &s,
                                 &s.named_ann[field],
                                 &normalize(vector),
                                 limit,
                                 *ef_search,
+                                ann_filter.as_ref(),
+                                eligible.as_ref(),
                             )?
                         } else {
                             self.named_scores(
@@ -803,7 +1165,7 @@ impl MultiVectorIndex {
                                 field,
                                 std::slice::from_ref(vector),
                                 false,
-                                &eligible,
+                                eligible.as_ref(),
                                 limit,
                             )?
                         }
@@ -812,7 +1174,7 @@ impl MultiVectorIndex {
                         field: Some(field),
                         vectors,
                         ..
-                    } => self.named_scores(&s, field, vectors, true, &eligible, limit)?,
+                    } => self.named_scores(&s, field, vectors, true, eligible.as_ref(), limit)?,
                     Channel::Multivector {
                         field: None,
                         vectors,
@@ -821,18 +1183,20 @@ impl MultiVectorIndex {
                     } => {
                         let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
                         if planned.operator == PhysicalOperator::HnswFde {
-                            self.ann_fde_scores(
+                            self.ann_fde_scores_filtered(
                                 &s,
                                 &self.fde.encode_query(&normalized),
                                 limit,
                                 *ef_search,
+                                ann_filter.as_ref(),
+                                eligible.as_ref(),
                             )?
                         } else {
                             self.exact_fde_scores_filtered(
                                 &s,
                                 &normalized,
                                 Some(limit),
-                                Some(&eligible),
+                                eligible.as_ref(),
                             )?
                         }
                     }
@@ -928,9 +1292,12 @@ impl MultiVectorIndex {
             ranked.truncate(budget);
             reranked = ranked.len();
             if let Some(field) = &rerank.field {
-                let pool: HashSet<_> = ranked.iter().map(|(id, _)| id.as_str()).collect();
+                let pool = DocSet::from_numbers(
+                    s.retrieval.next_id,
+                    ranked.iter().filter_map(|(id, _)| s.retrieval.number(id)),
+                );
                 ranked =
-                    self.named_scores(&s, field, &rerank.vectors, true, &pool, rerank.limit)?;
+                    self.named_scores(&s, field, &rerank.vectors, true, Some(&pool), rerank.limit)?;
                 if ranked.len() != reranked {
                     return Err(invalid("rerank field missing from a candidate"));
                 }
@@ -952,7 +1319,8 @@ impl MultiVectorIndex {
         }
 
         let context_stage_start = Instant::now();
-        let (matches, signals) = self.context(&s, ranked, &fused, &eligible, request, agreement)?;
+        let (matches, signals) =
+            self.context(&s, ranked, &fused, eligible.as_ref(), request, agreement)?;
         per_stage_actual_ms.push(context_stage_start.elapsed().as_secs_f64() * 1000.);
 
         Ok(RetrievalResponse {
@@ -960,7 +1328,7 @@ impl MultiVectorIndex {
             trace: RetrievalTrace {
                 plan,
                 generation: s.generation,
-                eligible_documents: eligible.len(),
+                eligible_documents,
                 channels,
                 fused_candidates,
                 reranked_candidates: reranked,
@@ -978,7 +1346,7 @@ impl MultiVectorIndex {
         field: &str,
         query: &[Vector],
         multivector: bool,
-        eligible: &HashSet<&str>,
+        eligible: Option<&DocSet>,
         limit: usize,
     ) -> Result<Vec<(String, f32)>, IndexError> {
         validate_matrix(query)?;
@@ -998,13 +1366,8 @@ impl MultiVectorIndex {
         }
         let normalized: Vec<_> = query.iter().map(|v| normalize(v)).collect();
         let prepared = MaxSimQuery::new(&normalized, query[0].len());
-        let scores = eligible
-            .par_iter()
-            .filter_map(|&id| {
-                let d = s.documents.get(id)?;
-                d.fields.representations.get(field).map(|r| (id, d, r))
-            })
-            .map(|(id, d, r)| {
+        let score = |id: &str, d: &DocumentRecord| {
+            d.fields.representations.get(field).map(|r| {
                 let (location, dimension, count) = match r {
                     StoredRepresentation::Dense {
                         location,
@@ -1025,7 +1388,21 @@ impl MultiVectorIndex {
                 };
                 Ok::<_, IndexError>((id.to_owned(), score))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+        };
+        let scores = match eligible {
+            Some(eligible) => eligible
+                .iter()
+                .filter_map(|number| s.retrieval.external_id(number))
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .filter_map(|id| s.documents.get(id).and_then(|d| score(id, d)))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => s
+                .documents
+                .par_iter()
+                .filter_map(|(id, d)| score(id, d))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         Ok(top(scores, limit))
     }
 
@@ -1034,7 +1411,7 @@ impl MultiVectorIndex {
         s: &State,
         ranked: Vec<(String, f32)>,
         fused: &HashMap<String, (f32, Vec<usize>)>,
-        eligible: &HashSet<&str>,
+        eligible: Option<&DocSet>,
         request: &RetrieveRequest,
         channel_agreement: Option<f32>,
     ) -> Result<(Vec<ContextHit>, RankingSignals), IndexError> {
@@ -1111,7 +1488,7 @@ impl MultiVectorIndex {
                    key: Option<blake3::Hash>|
          -> bool {
             let d = &s.documents[id];
-            if !eligible.contains(id) {
+            if eligible.is_some_and(|eligible| !s.retrieval.contains_external(eligible, id)) {
                 return false;
             }
             let est_tokens = estimate_tokens(id).unwrap_or(0);
@@ -1156,7 +1533,9 @@ impl MultiVectorIndex {
                         continue;
                     }
                     let est_tokens = estimate_tokens(id).unwrap_or(0);
-                    let result = if !eligible.contains(id.as_str()) {
+                    let result = if eligible.is_some_and(|eligible| {
+                        !s.retrieval.contains_external(eligible, id.as_str())
+                    }) {
                         AcceptResult::AlreadyAdded // permanent exclusion
                     } else {
                         selected.accepts(
@@ -1224,7 +1603,10 @@ impl MultiVectorIndex {
                 && let Some(chunk) = &s.documents[id].fields.chunk
             {
                 for neighbor in s.retrieval.neighbors(chunk, options.neighbors) {
-                    if !eligible.contains(neighbor) || selected.ids.contains(neighbor) {
+                    if eligible
+                        .is_some_and(|eligible| !s.retrieval.contains_external(eligible, neighbor))
+                        || selected.ids.contains(neighbor)
+                    {
                         continue;
                     }
                     add(
@@ -1372,10 +1754,145 @@ mod tests {
         );
         assert_eq!(
             filtered.parallel_channels()[0].reason,
-            PlanReason::FilterRequiresExact
+            PlanReason::LowerEstimatedCost
         );
         assert_eq!(filtered.eligible_documents, 2);
     }
+
+    #[test]
+    fn cached_planner_stats_track_replacement_deletion_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut query = request();
+        query.filter = None;
+        query
+            .prefetch
+            .retain(|channel| matches!(channel, Channel::Dense { .. }));
+
+        let initial = index.plan(&query).unwrap().stats;
+        assert_eq!(initial.documents, 3);
+        assert_eq!(initial.text_documents, 3);
+        assert_eq!(initial.fields["semantic"].documents, 3);
+        assert_eq!(initial.fields["tokens"].documents, 3);
+        assert_eq!(initial.fields["sparse"].documents, 3);
+
+        index
+            .upsert_records(vec![RetrievalDocument {
+                id: "a".into(),
+                metadata: json!({"tenant": "a"}),
+                ..RetrievalDocument::default()
+            }])
+            .unwrap();
+        index.delete("b").unwrap();
+
+        let updated = index.plan(&query).unwrap().stats;
+        assert_eq!(updated.documents, 2);
+        assert_eq!(updated.text_documents, 1);
+        assert_eq!(updated.fields["semantic"].documents, 1);
+        assert_eq!(updated.fields["tokens"].documents, 1);
+        assert_eq!(updated.fields["sparse"].documents, 1);
+
+        drop(index);
+        let reopened = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
+        assert_eq!(reopened.plan(&query).unwrap().stats, updated);
+    }
+
+    #[test]
+    fn metadata_index_matches_predicate_evaluation_across_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut nested = document("nested", "indexed metadata", vec![0., 1.], "b", 0);
+        nested.metadata = json!({
+            "tenant": "b",
+            "tags": ["rust", "search"],
+            "owner": {"team": "retrieval"},
+            "year": 2025
+        });
+        index.upsert_records(vec![nested]).unwrap();
+
+        let predicates = vec![
+            Predicate::Eq {
+                field: "tenant".into(),
+                value: json!("a"),
+            },
+            Predicate::In {
+                field: "tags".into(),
+                values: vec![json!("rust")],
+            },
+            Predicate::Eq {
+                field: "/owner/team".into(),
+                value: json!("retrieval"),
+            },
+            Predicate::And {
+                filters: vec![
+                    Predicate::Eq {
+                        field: "tenant".into(),
+                        value: json!("b"),
+                    },
+                    Predicate::In {
+                        field: "tags".into(),
+                        values: vec![json!("search")],
+                    },
+                ],
+            },
+            Predicate::Or {
+                filters: vec![
+                    Predicate::Eq {
+                        field: "tenant".into(),
+                        value: json!("denied"),
+                    },
+                    Predicate::Eq {
+                        field: "tenant".into(),
+                        value: json!("b"),
+                    },
+                ],
+            },
+            Predicate::Not {
+                filter: Box::new(Predicate::Eq {
+                    field: "tenant".into(),
+                    value: json!("a"),
+                }),
+            },
+        ];
+
+        let assert_index_matches_scan = |index: &MultiVectorIndex| {
+            let state = index.snapshot();
+            for predicate in &predicates {
+                let expected: HashSet<_> = state
+                    .documents
+                    .iter()
+                    .filter(|(_, document)| predicate.matches(&document.metadata))
+                    .map(|(id, _)| id.as_str())
+                    .collect();
+                assert_eq!(
+                    state.retrieval.indexed_filter_ids(predicate).unwrap(),
+                    expected
+                );
+            }
+            assert!(
+                state
+                    .retrieval
+                    .indexed_filter_ids(&Predicate::Range {
+                        field: "year".into(),
+                        gte: Some(2025.),
+                        lte: None,
+                    })
+                    .is_none()
+            );
+        };
+
+        assert_index_matches_scan(&index);
+        let mut replacement = document("nested", "replacement", vec![1., 0.], "a", 0);
+        replacement.metadata = json!({"tenant": "a", "tags": ["database"]});
+        index.upsert_records(vec![replacement]).unwrap();
+        index.delete("c").unwrap();
+        assert_index_matches_scan(&index);
+
+        drop(index);
+        let reopened = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
+        assert_index_matches_scan(&reopened);
+    }
+
     #[test]
     fn hybrid_filters_before_top_k_and_preserves_named_fields_on_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -1849,13 +2366,19 @@ mod tests {
                 .unwrap();
         }
         let snapshot = index.snapshot();
+        let pool = DocSet::from_numbers(
+            snapshot.retrieval.next_id,
+            ["a", "b"]
+                .into_iter()
+                .filter_map(|id| snapshot.retrieval.number(id)),
+        );
         let expected = index
             .named_scores(
                 &snapshot,
                 "semantic",
                 &[vec![1., 0.]],
                 false,
-                &HashSet::from(["a", "b"]),
+                Some(&pool),
                 10,
             )
             .unwrap();
@@ -1869,7 +2392,7 @@ mod tests {
                     "semantic",
                     &[vec![1., 0.]],
                     false,
-                    &HashSet::from(["a", "b"]),
+                    Some(&pool),
                     10
                 )
                 .unwrap(),
@@ -1879,14 +2402,21 @@ mod tests {
         assert!(!dir.path().join("fde").exists());
         drop(index);
         let reopened = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
+        let reopened_snapshot = reopened.snapshot();
+        let reopened_pool = DocSet::from_numbers(
+            reopened_snapshot.retrieval.next_id,
+            ["a", "b"]
+                .into_iter()
+                .filter_map(|id| reopened_snapshot.retrieval.number(id)),
+        );
         assert_eq!(
             reopened
                 .named_scores(
-                    &reopened.snapshot(),
+                    &reopened_snapshot,
                     "semantic",
                     &[vec![1., 0.]],
                     false,
-                    &HashSet::from(["a", "b"]),
+                    Some(&reopened_pool),
                     10
                 )
                 .unwrap(),
@@ -2288,11 +2818,26 @@ mod tests {
 
         let plan = index.plan(&query).unwrap();
         let fs = plan.stats.filter_stats.as_ref().unwrap();
+        assert_eq!(plan.filter, FilterStrategy::MetadataIndex);
+        assert_eq!(fs.filter_operator, FilterStrategy::MetadataIndex);
         let expected = 2.0 / 3.0_f32;
         assert!(
             (fs.selectivity - expected).abs() < 0.05,
             "selectivity should be ~{expected:.2}, got {:.2}",
             fs.selectivity
+        );
+
+        let mut range_query = query;
+        range_query.filter = Some(Predicate::Range {
+            field: "year".into(),
+            gte: Some(2026.0),
+            lte: None,
+        });
+        let range_plan = index.plan(&range_query).unwrap();
+        assert_eq!(range_plan.filter, FilterStrategy::MetadataScan);
+        assert_eq!(
+            range_plan.stats.filter_stats.unwrap().filter_operator,
+            FilterStrategy::MetadataScan
         );
     }
 
@@ -2338,6 +2883,149 @@ mod tests {
         assert_eq!(
             plan.parallel_channels()[0].reason,
             PlanReason::LowerEstimatedCost
+        );
+    }
+
+    #[test]
+    fn adaptive_doc_set_uses_sparse_and_bitmap_forms() {
+        let sparse = DocSet::from_numbers(4096, [1, 2048]);
+        assert!(matches!(sparse, DocSet::Sparse(_)));
+        let dense = DocSet::from_numbers(64, 0..64);
+        assert!(matches!(dense, DocSet::Bitmap { .. }));
+        assert_eq!(dense.len(), 64);
+        assert!(dense.contains(37));
+        assert!(!dense.contains(64));
+
+        let evens = DocSet::from_numbers(64, (0..64).filter(|id| id % 2 == 0));
+        let high = DocSet::from_numbers(64, 32..64);
+        let intersection = evens.clone().intersection(&high, 64);
+        assert_eq!(
+            intersection.iter().collect::<Vec<_>>(),
+            (32..64).step_by(2).collect::<Vec<_>>()
+        );
+        let union = evens.union(high, 64);
+        assert_eq!(union.len(), 48);
+    }
+
+    #[test]
+    fn dense_hnsw_filters_in_traversal_and_respects_overlay_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
+        let docs: Vec<_> = (0..50_u32)
+            .map(|i| RetrievalDocument {
+                id: format!("d{i}"),
+                metadata: json!({"tenant": if i % 2 == 0 { "a" } else { "b" }}),
+                representations: BTreeMap::from([(
+                    "semantic".into(),
+                    Representation::Dense {
+                        vector: vec![1.0, i as f32 / 100.0],
+                    },
+                )]),
+                ..RetrievalDocument::default()
+            })
+            .collect();
+        index.upsert_records(docs).unwrap();
+        index.build_dense_ann("semantic", 4, 16).unwrap();
+
+        let query = || -> RetrieveRequest {
+            serde_json::from_value(json!({
+                "prefetch": [{"kind": "dense", "field": "semantic", "vector": [1.0, 0.0],
+                              "limit": 10, "ef_search": 32, "backend": "hnsw"}],
+                "filter": {"op": "eq", "field": "tenant", "value": "a"},
+                "limit": 10
+            }))
+            .unwrap()
+        };
+        let first = index.retrieve(&query()).unwrap();
+        assert_eq!(first.trace.channels[0]["backend"], "hnsw_dense");
+        assert!(
+            first
+                .matches
+                .iter()
+                .all(|hit| hit.metadata["tenant"] == "a")
+        );
+
+        index
+            .upsert_records(vec![RetrievalDocument {
+                id: "d0".into(),
+                metadata: json!({"tenant": "b"}),
+                representations: BTreeMap::from([(
+                    "semantic".into(),
+                    Representation::Dense {
+                        vector: vec![1.0, 0.0],
+                    },
+                )]),
+                ..RetrievalDocument::default()
+            }])
+            .unwrap();
+        let updated = index.retrieve(&query()).unwrap();
+        assert!(updated.matches.iter().all(|hit| hit.id != "d0"));
+        assert!(
+            updated
+                .matches
+                .iter()
+                .all(|hit| hit.metadata["tenant"] == "a")
+        );
+    }
+
+    #[test]
+    fn fde_hnsw_supports_metadata_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = IndexConfig {
+            dimension: 3,
+            centroids: 3,
+            residual_bits: 2,
+            probes: 3,
+            fde_repetitions: 2,
+            fde_ksim: 2,
+            fde_projected: 2,
+            analyzer: TextAnalyzer::plain(),
+        };
+        let index = MultiVectorIndex::open(dir.path(), config).unwrap();
+        index
+            .train(
+                &[
+                    vec![1., 0., 0.],
+                    vec![0., 1., 0.],
+                    vec![0., 0., 1.],
+                    vec![0.8, 0.2, 0.],
+                    vec![0.2, 0.8, 0.],
+                    vec![0.2, 0., 0.8],
+                ],
+                2,
+            )
+            .unwrap();
+        index
+            .upsert_records(
+                (0..24)
+                    .map(|i| RetrievalDocument {
+                        id: format!("m{i}"),
+                        vectors: vec![if i % 2 == 0 {
+                            vec![1., 0., 0.]
+                        } else {
+                            vec![0., 1., 0.]
+                        }],
+                        metadata: json!({"tenant": if i % 3 == 0 { "a" } else { "b" }}),
+                        ..RetrievalDocument::default()
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        index.build_fde_ann(4, 16).unwrap();
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [{"kind": "multivector", "vectors": [[1., 0., 0.]],
+                          "limit": 8, "ef_search": 32, "backend": "hnsw"}],
+            "filter": {"op": "eq", "field": "tenant", "value": "a"},
+            "limit": 8
+        }))
+        .unwrap();
+        let response = index.retrieve(&query).unwrap();
+        assert_eq!(response.trace.channels[0]["backend"], "hnsw_fde");
+        assert!(
+            response
+                .matches
+                .iter()
+                .all(|hit| hit.metadata["tenant"] == "a")
         );
     }
 }

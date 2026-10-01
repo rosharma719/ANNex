@@ -105,6 +105,7 @@ pub enum PlanReason {
 #[serde(rename_all = "snake_case")]
 pub enum FilterStrategy {
     None,
+    MetadataIndex,
     MetadataScan,
 }
 
@@ -146,6 +147,72 @@ pub struct PlannerStats {
     /// Populated when a filter is present; None for unfiltered plans.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter_stats: Option<FilterStats>,
+}
+
+/// Collection-wide statistics maintained with each immutable state generation.
+/// Query planning must not scan the document map to rediscover these values.
+#[derive(Clone, Debug, Default)]
+pub(super) struct CachedPlannerStats {
+    text_documents: usize,
+    token_documents: usize,
+    token_vectors: usize,
+    field_documents: BTreeMap<String, usize>,
+}
+
+impl CachedPlannerStats {
+    pub(super) fn from_documents(
+        documents: &HashMap<String, DocumentRecord>,
+        schema: &BTreeMap<String, FieldSchema>,
+    ) -> Self {
+        let mut stats = Self {
+            field_documents: schema.keys().map(|name| (name.clone(), 0)).collect(),
+            ..Self::default()
+        };
+        for document in documents.values() {
+            stats.add(document, schema);
+        }
+        stats
+    }
+
+    pub(super) fn add(
+        &mut self,
+        document: &DocumentRecord,
+        schema: &BTreeMap<String, FieldSchema>,
+    ) {
+        self.text_documents += usize::from(document.fields.has_text());
+        self.token_documents += usize::from(document.tokens > 0);
+        self.token_vectors += document.tokens;
+        for name in schema.keys() {
+            let count = self.field_documents.entry(name.clone()).or_default();
+            *count += usize::from(document.fields.has_representation(name));
+        }
+    }
+
+    pub(super) fn remove(
+        &mut self,
+        document: &DocumentRecord,
+        schema: &BTreeMap<String, FieldSchema>,
+    ) {
+        self.text_documents = self
+            .text_documents
+            .checked_sub(usize::from(document.fields.has_text()))
+            .expect("cached text-document count is consistent");
+        self.token_documents = self
+            .token_documents
+            .checked_sub(usize::from(document.tokens > 0))
+            .expect("cached token-document count is consistent");
+        self.token_vectors = self
+            .token_vectors
+            .checked_sub(document.tokens)
+            .expect("cached token-vector count is consistent");
+        for name in schema.keys() {
+            let decrement = usize::from(document.fields.has_representation(name));
+            let count = self.field_documents.entry(name.clone()).or_default();
+            *count = count
+                .checked_sub(decrement)
+                .expect("cached field-document count is consistent");
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -326,17 +393,25 @@ impl MultiVectorIndex {
         let state = self.snapshot();
         let (effective_request, policy_plan) = self.prepare_request(&state, request);
         let request = effective_request.as_ref();
-        let eligible = state
-            .documents
-            .values()
-            .filter(|document| {
-                request
-                    .filter
-                    .as_ref()
-                    .is_none_or(|filter| filter.matches(&document.metadata))
-            })
-            .count();
-        let mut plan = self.compile_plan(&state, request, eligible)?;
+        let (eligible, filter_strategy) = request.filter.as_ref().map_or(
+            (state.documents.len(), FilterStrategy::None),
+            |filter| {
+                state.retrieval.indexed_filter_count(filter).map_or_else(
+                    || {
+                        (
+                            state
+                                .documents
+                                .values()
+                                .filter(|document| filter.matches(&document.metadata))
+                                .count(),
+                            FilterStrategy::MetadataScan,
+                        )
+                    },
+                    |count| (count, FilterStrategy::MetadataIndex),
+                )
+            },
+        );
+        let mut plan = self.compile_plan(&state, request, eligible, filter_strategy)?;
         plan.policy = policy_plan;
         Ok(plan)
     }
@@ -346,13 +421,17 @@ impl MultiVectorIndex {
         state: &State,
         request: &RetrieveRequest,
         eligible_documents: usize,
+        filter_strategy: FilterStrategy,
     ) -> Result<RetrievalPlan, IndexError> {
         validate_request(request)?;
 
         let stats = planner_stats(
             state,
             self.fde.output_dimension(),
-            request.filter.as_ref().map(|_| eligible_documents),
+            request
+                .filter
+                .as_ref()
+                .map(|_| (eligible_documents, filter_strategy)),
         );
 
         let logical_channels = request
@@ -458,12 +537,23 @@ impl MultiVectorIndex {
                     let n = stats.documents.max(1) as f64;
                     let f = eligible_documents.max(1) as f64;
                     let filtered = request.filter.is_some();
+                    let filter_supported = request
+                        .filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.ann_filter().is_some());
+                    if backend == "hnsw" && !filter_supported {
+                        return Err(invalid("filter is not supported by dense HNSW"));
+                    }
                     let cost_exact = f * dim * 2.0;
-                    let cost_hnsw = ef * n.log2().ceil().max(1.0) * dim * 3.0;
+                    let mut cost_hnsw = ef * n.log2().ceil().max(1.0) * dim * 3.0;
+                    if filtered {
+                        let selectivity = (f / n).clamp(0.01, 1.0);
+                        cost_hnsw /= selectivity.sqrt();
+                    }
                     let (operator, reason) = choose_ann_with_cost(
                         backend,
-                        filtered,
                         ann_ready,
+                        filter_supported,
                         PhysicalOperator::ExactDense,
                         PhysicalOperator::HnswDense,
                         cost_exact,
@@ -534,12 +624,23 @@ impl MultiVectorIndex {
                     let n = stats.documents.max(1) as f64;
                     let f = eligible_documents.max(1) as f64;
                     let filtered = request.filter.is_some();
+                    let filter_supported = request
+                        .filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.ann_filter().is_some());
+                    if backend == "hnsw" && !filter_supported {
+                        return Err(invalid("filter is not supported by FDE HNSW"));
+                    }
                     let cost_exact = f * fde_dim * 2.0;
-                    let cost_hnsw = ef * n.log2().ceil().max(1.0) * fde_dim * 3.0;
+                    let mut cost_hnsw = ef * n.log2().ceil().max(1.0) * fde_dim * 3.0;
+                    if filtered {
+                        let selectivity = (f / n).clamp(0.01, 1.0);
+                        cost_hnsw /= selectivity.sqrt();
+                    }
                     let (operator, reason) = choose_ann_with_cost(
                         backend,
-                        filtered,
                         ann_ready,
+                        filter_supported,
                         PhysicalOperator::ExactFde,
                         PhysicalOperator::HnswFde,
                         cost_exact,
@@ -682,11 +783,7 @@ impl MultiVectorIndex {
             logical,
             stats,
             eligible_documents,
-            filter: if request.filter.is_some() {
-                FilterStrategy::MetadataScan
-            } else {
-                FilterStrategy::None
-            },
+            filter: filter_strategy,
             stages,
             estimate: PlanEstimate {
                 critical_path_cost: parallel_critical_path
@@ -703,7 +800,7 @@ impl MultiVectorIndex {
 pub(super) fn planner_stats(
     state: &State,
     fde_dimension: usize,
-    eligible_documents: Option<usize>,
+    eligible_documents: Option<(usize, FilterStrategy)>,
 ) -> PlannerStats {
     let fields = state
         .retrieval
@@ -718,10 +815,11 @@ pub(super) fn planner_stats(
                 FieldSchema::Sparse => (RepresentationKind::Sparse, None),
             };
             let documents = state
-                .documents
-                .values()
-                .filter(|document| document.fields.has_representation(name))
-                .count();
+                .planner_stats
+                .field_documents
+                .get(name)
+                .copied()
+                .unwrap_or(0);
             (
                 name.clone(),
                 FieldStats {
@@ -734,7 +832,7 @@ pub(super) fn planner_stats(
         })
         .collect();
     let n = state.documents.len();
-    let filter_stats = eligible_documents.map(|eligible| {
+    let filter_stats = eligible_documents.map(|(eligible, filter_operator)| {
         let selectivity = if n == 0 {
             1.0_f32
         } else {
@@ -742,27 +840,15 @@ pub(super) fn planner_stats(
         };
         FilterStats {
             selectivity: selectivity.clamp(0.0, 1.0),
-            filter_operator: FilterStrategy::MetadataScan,
+            filter_operator,
         }
     });
     PlannerStats {
         generation: state.generation,
         documents: n,
-        text_documents: state
-            .documents
-            .values()
-            .filter(|document| document.fields.has_text())
-            .count(),
-        token_documents: state
-            .documents
-            .values()
-            .filter(|document| document.tokens > 0)
-            .count(),
-        token_vectors: state
-            .documents
-            .values()
-            .map(|document| document.tokens)
-            .sum(),
+        text_documents: state.planner_stats.text_documents,
+        token_documents: state.planner_stats.token_documents,
+        token_vectors: state.planner_stats.token_vectors,
         fde_dimension,
         fde_graph_ready: state.fde_ann.is_some(),
         fields,
@@ -775,8 +861,8 @@ pub(super) fn planner_stats(
 /// or the inline formulas in `compile_plan`).
 fn choose_ann_with_cost(
     backend: &str,
-    filtered: bool,
     ann_ready: bool,
+    ann_supported: bool,
     exact: PhysicalOperator,
     ann: PhysicalOperator,
     cost_exact: f64,
@@ -785,11 +871,14 @@ fn choose_ann_with_cost(
     if backend == "exact" {
         return (exact, PlanReason::RequestedExact);
     }
-    if filtered {
-        return (exact, PlanReason::FilterRequiresExact);
-    }
     if !ann_ready {
         return (exact, PlanReason::AnnUnavailable);
+    }
+    if !ann_supported {
+        return (exact, PlanReason::FilterRequiresExact);
+    }
+    if backend == "hnsw" {
+        return (ann, PlanReason::AnnReady);
     }
     // ANN is available — choose by cost model.
     if cost_exact <= cost_hnsw {

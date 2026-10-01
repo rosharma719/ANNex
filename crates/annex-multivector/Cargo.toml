@@ -43,3 +43,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "kernels"
 harness = false
+
+[[bench]]
+name = "planner"
+harness = false

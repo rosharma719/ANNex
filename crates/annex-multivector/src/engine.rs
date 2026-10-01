@@ -14,6 +14,8 @@ use crate::{
     },
 };
 use annex::{
+    Filter, Payload,
+    payload_storage::stores::PayloadIndex,
     utils::types::DistanceMetric,
     vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
 };
@@ -258,6 +260,8 @@ struct FdeAnnBase {
     ids: Vec<String>,
     by_id: HashMap<String, u64>,
     field: Option<String>,
+    payloads: HashMap<u64, Payload>,
+    payload_index: PayloadIndex,
 }
 
 #[derive(Clone)]
@@ -281,6 +285,7 @@ struct State {
     named_ann: HashMap<String, FdeAnn>,
     stores: Arc<SegmentStores>,
     retrieval: Arc<RetrievalState>,
+    planner_stats: planner::CachedPlannerStats,
     objects_map: Option<Arc<memmap2::Mmap>>,
     fde_map: Option<Arc<memmap2::Mmap>>,
     sealed: HashMap<u64, Arc<SegmentSnapshot>>,
@@ -763,8 +768,10 @@ impl MultiVectorIndex {
         let mut ordered: Vec<_> = documents.iter().collect();
         ordered.sort_by(|a, b| a.0.cmp(b.0));
         for (id, d) in ordered {
-            retrieval.insert(id, &d.fields)?;
+            retrieval.insert(id, &d.fields, &d.metadata)?;
         }
+        let planner_stats =
+            planner::CachedPlannerStats::from_documents(&documents, retrieval.schema());
         Ok(Self {
             fde: if fde_encoding_version == 2 {
                 FdeEncoder::new(
@@ -813,6 +820,7 @@ impl MultiVectorIndex {
                     retired: std::sync::atomic::AtomicBool::new(false),
                 }),
                 retrieval: Arc::new(retrieval),
+                planner_stats,
                 sealed,
             })),
             root,
@@ -1024,7 +1032,10 @@ impl MultiVectorIndex {
         for document in batch {
             let fields = Arc::new(Fields::prepare(&document, &next.stores)?);
             let id = document.id;
-            Arc::make_mut(&mut next.retrieval).insert(&id, &fields)?;
+            Arc::make_mut(&mut next.retrieval).insert(&id, &fields, &document.metadata)?;
+            if let Some(old) = next.documents.get(&id) {
+                next.planner_stats.remove(old, next.retrieval.schema());
+            }
             if let Some(old_ids) = next
                 .documents
                 .get(&id)
@@ -1098,20 +1109,19 @@ impl MultiVectorIndex {
                     ann.delta.remove(&id);
                 }
             }
-            next.documents.insert(
-                id,
-                DocumentRecord {
-                    centroid_ids: ids,
-                    unique_centroids,
-                    location,
-                    fde_location,
-                    metadata: document.metadata,
-                    tokens: vectors.len(),
-                    compressed_bytes: size,
-                    fields,
-                    storage_id: next.stores.id.unwrap_or(0),
-                },
-            );
+            let record = DocumentRecord {
+                centroid_ids: ids,
+                unique_centroids,
+                location,
+                fde_location,
+                metadata: document.metadata,
+                tokens: vectors.len(),
+                compressed_bytes: size,
+                fields,
+                storage_id: next.stores.id.unwrap_or(0),
+            };
+            next.planner_stats.add(&record, next.retrieval.schema());
+            next.documents.insert(id, record);
         }
         self.commit(&s, next)
     }
@@ -1124,6 +1134,7 @@ impl MultiVectorIndex {
         let mut next = (*s).clone();
         let d = next.documents.remove(id).unwrap();
         Arc::make_mut(&mut next.retrieval).remove(id);
+        next.planner_stats.remove(&d, next.retrieval.schema());
         for c in d.unique_centroids {
             next.postings[c as usize].remove(id);
         }
@@ -1307,20 +1318,17 @@ impl MultiVectorIndex {
         s: &State,
         normalized: &[Vector],
         cap: Option<usize>,
-        eligible: Option<&HashSet<&str>>,
+        eligible: Option<&retrieval::DocSet>,
     ) -> Result<Vec<(String, f32)>, IndexError> {
         if !s.documents.values().any(|d| d.tokens > 0) {
             return Ok(Vec::new());
         }
         let query_fde = self.fde.encode_query(normalized);
         let fde_dimension = self.fde.output_dimension();
-        let approximate_results: Result<Vec<_>, io::Error> = s
-            .documents
-            .par_iter()
-            .filter(|(id, d)| d.tokens > 0 && eligible.is_none_or(|ids| ids.contains(id.as_str())))
-            .map(|(id, record)| {
+        let score = |id: &str, record: &DocumentRecord| {
+            (record.tokens > 0).then(|| {
                 Ok((
-                    id.clone(),
+                    id.to_owned(),
                     dot(
                         &query_fde,
                         FixedVectorStore::get(
@@ -1331,7 +1339,21 @@ impl MultiVectorIndex {
                     ),
                 ))
             })
-            .collect();
+        };
+        let approximate_results: Result<Vec<_>, io::Error> = match eligible {
+            Some(eligible) => eligible
+                .iter()
+                .filter_map(|number| s.retrieval.external_id(number))
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .filter_map(|id| s.documents.get(id).and_then(|record| score(id, record)))
+                .collect(),
+            None => s
+                .documents
+                .par_iter()
+                .filter_map(|(id, record)| score(id, record))
+                .collect(),
+        };
         let mut approximate = approximate_results?;
         let n = approximate.len();
         let by_desc =
@@ -1457,6 +1479,13 @@ impl MultiVectorIndex {
             .enumerate()
             .map(|(idx, id)| (id.clone(), idx as u64))
             .collect();
+        let mut payloads = HashMap::with_capacity(ids.len());
+        let mut payload_index = PayloadIndex::new();
+        for (point, id) in ids.iter().enumerate() {
+            let payload = retrieval::metadata_ann_payload(&s.documents[id].metadata);
+            payload_index.insert(point as u64, &payload);
+            payloads.insert(point as u64, payload);
+        }
         let mut next = (*s).clone();
         let ann = FdeAnn {
             base: Arc::new(FdeAnnBase {
@@ -1464,6 +1493,8 @@ impl MultiVectorIndex {
                 ids,
                 by_id,
                 field: field.map(str::to_owned),
+                payloads,
+                payload_index,
             }),
             delta: HashSet::new(),
             tombstones: HashSet::new(),
@@ -1504,18 +1535,32 @@ impl MultiVectorIndex {
         count: usize,
         ef_search: usize,
     ) -> Result<Vec<(String, f32)>, IndexError> {
+        self.ann_fde_scores_filtered(s, query_fde, count, ef_search, None, None)
+    }
+
+    fn ann_fde_scores_filtered(
+        &self,
+        s: &State,
+        query_fde: &Vector,
+        count: usize,
+        ef_search: usize,
+        filter: Option<&Filter>,
+        eligible: Option<&retrieval::DocSet>,
+    ) -> Result<Vec<(String, f32)>, IndexError> {
         let ann = s.fde_ann.as_ref().ok_or_else(|| {
             IndexError::Invalid("FDE ANN is not built; call /v1/fde/index".into())
         })?;
-        self.ann_scores(s, ann, query_fde, count, ef_search)
+        self.ann_scores_filtered(s, ann, query_fde, count, ef_search, filter, eligible)
     }
-    fn ann_scores(
+    fn ann_scores_filtered(
         &self,
         s: &State,
         ann: &FdeAnn,
         query_fde: &Vector,
         count: usize,
         ef_search: usize,
+        filter: Option<&Filter>,
+        eligible: Option<&retrieval::DocSet>,
     ) -> Result<Vec<(String, f32)>, IndexError> {
         if ann.generation != s.generation {
             return Err(IndexError::Invalid(
@@ -1532,11 +1577,21 @@ impl MultiVectorIndex {
                 ef_search: Some(ef_search.max(base_count)),
                 ..SearchRuntimeOptions::default()
             };
-            let points = ann
-                .base
-                .index
-                .search_with_options(query_fde, base_count, &options)
-                .map_err(|error| IndexError::Invalid(format!("HNSW search failed: {error}")))?;
+            let points = match filter {
+                Some(filter) => ann.base.index.in_place_filtered_search(
+                    query_fde,
+                    base_count,
+                    &options,
+                    &ann.base.payloads,
+                    &ann.base.payload_index,
+                    Some(filter),
+                ),
+                None => ann
+                    .base
+                    .index
+                    .search_with_options(query_fde, base_count, &options),
+            }
+            .map_err(|error| IndexError::Invalid(format!("HNSW search failed: {error}")))?;
             for point in points {
                 if ann.tombstones.contains(&point.id) {
                     continue;
@@ -1556,6 +1611,11 @@ impl MultiVectorIndex {
         }
         if !ann.delta.is_empty() {
             for id in &ann.delta {
+                if eligible
+                    .is_some_and(|eligible| !s.retrieval.contains_external(eligible, id.as_str()))
+                {
+                    continue;
+                }
                 let record = s
                     .documents
                     .get(id)

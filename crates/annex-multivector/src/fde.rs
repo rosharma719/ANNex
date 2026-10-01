@@ -1,3 +1,6 @@
+#[cfg(target_arch = "x86_64")]
+use annex::vector::simd::{CpuLevel, cpu_level};
+
 pub type Vector = Vec<f32>;
 
 pub fn normalize(vector: &[f32]) -> Vector {
@@ -51,6 +54,10 @@ pub fn dot(left: &[f32], right: &[f32]) -> f32 {
             return head + dot_scalar(&left[prefix..n], &right[prefix..n]);
         }
         dot_scalar(&left[..n], &right[..n])
+    }
+    #[cfg(target_arch = "x86_64")]
+    if n > 0 && matches!(cpu_level(), CpuLevel::Avx512Bf16) {
+        return unsafe { dot_avx512_bf16_len(left.as_ptr(), right.as_ptr(), n) };
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -161,6 +168,10 @@ pub fn maxsim_flat(query: &[Vector], document: &[f32], dimension: usize) -> f32 
         }
     }
     #[cfg(target_arch = "x86_64")]
+    if dimension > 0 && matches!(cpu_level(), CpuLevel::Avx512Bf16) {
+        return maxsim_flat_avx512_bf16(query, document, dimension);
+    }
+    #[cfg(target_arch = "x86_64")]
     {
         if let Some(kernel) = x86::PackedKernel::detect()
             && x86::applicable(query, document, dimension)
@@ -188,6 +199,7 @@ pub fn maxsim_flat(query: &[Vector], document: &[f32], dimension: usize) -> f32 
 /// [`maxsim_flat`].
 pub struct MaxSimQuery<'a> {
     tokens: &'a [Vector],
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     dimension: usize,
     #[cfg(target_arch = "x86_64")]
     packed: Option<(x86::PackedKernel, x86::Panel)>,
@@ -224,6 +236,98 @@ impl<'a> MaxSimQuery<'a> {
         }
         maxsim_flat(self.tokens, document, dimension)
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bf16")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_avx512_bf16_len(a: *const f32, b: *const f32, len: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut acc2 = _mm512_setzero_ps();
+    let mut acc3 = _mm512_setzero_ps();
+    let mut i = 0usize;
+    while i + 128 <= len {
+        let a0 = _mm512_loadu_ps(a.add(i));
+        let a1 = _mm512_loadu_ps(a.add(i + 16));
+        let b0 = _mm512_loadu_ps(b.add(i));
+        let b1 = _mm512_loadu_ps(b.add(i + 16));
+        acc0 = _mm512_dpbf16_ps(
+            acc0,
+            _mm512_cvtne2ps_pbh(a1, a0),
+            _mm512_cvtne2ps_pbh(b1, b0),
+        );
+        let a2 = _mm512_loadu_ps(a.add(i + 32));
+        let a3 = _mm512_loadu_ps(a.add(i + 48));
+        let b2 = _mm512_loadu_ps(b.add(i + 32));
+        let b3 = _mm512_loadu_ps(b.add(i + 48));
+        acc1 = _mm512_dpbf16_ps(
+            acc1,
+            _mm512_cvtne2ps_pbh(a3, a2),
+            _mm512_cvtne2ps_pbh(b3, b2),
+        );
+        let a4 = _mm512_loadu_ps(a.add(i + 64));
+        let a5 = _mm512_loadu_ps(a.add(i + 80));
+        let b4 = _mm512_loadu_ps(b.add(i + 64));
+        let b5 = _mm512_loadu_ps(b.add(i + 80));
+        acc2 = _mm512_dpbf16_ps(
+            acc2,
+            _mm512_cvtne2ps_pbh(a5, a4),
+            _mm512_cvtne2ps_pbh(b5, b4),
+        );
+        let a6 = _mm512_loadu_ps(a.add(i + 96));
+        let a7 = _mm512_loadu_ps(a.add(i + 112));
+        let b6 = _mm512_loadu_ps(b.add(i + 96));
+        let b7 = _mm512_loadu_ps(b.add(i + 112));
+        acc3 = _mm512_dpbf16_ps(
+            acc3,
+            _mm512_cvtne2ps_pbh(a7, a6),
+            _mm512_cvtne2ps_pbh(b7, b6),
+        );
+        i += 128;
+    }
+    while i + 32 <= len {
+        let a0 = _mm512_loadu_ps(a.add(i));
+        let a1 = _mm512_loadu_ps(a.add(i + 16));
+        let b0 = _mm512_loadu_ps(b.add(i));
+        let b1 = _mm512_loadu_ps(b.add(i + 16));
+        acc0 = _mm512_dpbf16_ps(
+            acc0,
+            _mm512_cvtne2ps_pbh(a1, a0),
+            _mm512_cvtne2ps_pbh(b1, b0),
+        );
+        i += 32;
+    }
+    acc0 = _mm512_add_ps(acc0, acc1);
+    acc2 = _mm512_add_ps(acc2, acc3);
+    acc0 = _mm512_add_ps(acc0, acc2);
+    let mut result = _mm512_reduce_add_ps(acc0);
+    while i < len {
+        result += *a.add(i) * *b.add(i);
+        i += 1;
+    }
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+fn maxsim_flat_avx512_bf16(query: &[Vector], document: &[f32], dimension: usize) -> f32 {
+    let dot_fn: unsafe fn(*const f32, *const f32, usize) -> f32 = dot_avx512_bf16_len;
+    query
+        .iter()
+        .map(|q| {
+            debug_assert_eq!(q.len(), dimension);
+            let qp = q.as_ptr();
+            let mut best = f32::NEG_INFINITY;
+            for doc in document.chunks_exact(dimension) {
+                let s = unsafe { dot_fn(qp, doc.as_ptr(), dimension) };
+                if s > best {
+                    best = s;
+                }
+            }
+            best
+        })
+        .sum()
 }
 
 #[inline]
@@ -667,5 +771,58 @@ mod tests {
         let doc = deterministic(2, 20);
         let want = maxsim_flat_scalar(&q, &doc, 16);
         assert!((maxsim_flat(&q, &doc, 16) - want).abs() < 1e-5);
+    }
+
+    #[test]
+    fn maxsim_flat_bf16_agrees_with_scalar_on_dim128() {
+        if cfg!(not(target_arch = "x86_64")) {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if !std::arch::is_x86_feature_detected!("avx512bf16") {
+            return;
+        }
+
+        let mut rng = 0xcafe_babe_u64;
+        let mut next = || -> f32 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+        let query: Vec<_> = (0..8)
+            .map(|_| (0..128).map(|_| next()).collect::<Vec<f32>>())
+            .collect();
+        let doc_tokens: Vec<_> = (0..50)
+            .map(|_| (0..128).map(|_| next()).collect::<Vec<f32>>())
+            .collect();
+        let flat_doc: Vec<f32> = doc_tokens.iter().flat_map(|v| v.iter().copied()).collect();
+        let scalar = maxsim_flat_scalar(&query, &flat_doc, 128);
+        let dispatch = maxsim_flat(&query, &flat_doc, 128);
+        let tol = 1e-3_f32 * scalar.abs().max(1.0);
+        assert!(
+            (dispatch - scalar).abs() <= tol,
+            "bf16 maxsim mismatch: scalar={scalar} dispatch={dispatch}"
+        );
+    }
+
+    #[test]
+    fn dot_self_is_near_one_after_normalize_on_bf16() {
+        if cfg!(not(target_arch = "x86_64")) {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if !std::arch::is_x86_feature_detected!("avx512bf16") {
+            return;
+        }
+        for dim in [64usize, 128, 384, 768] {
+            let raw: Vec<f32> = (0..dim).map(|i| (i as f32 + 1.0).recip()).collect();
+            let normed = normalize(&raw);
+            let self_dot = dot(&normed, &normed);
+            assert!(
+                (self_dot - 1.0).abs() < 1e-3,
+                "dim={dim}: self_dot={self_dot}"
+            );
+        }
     }
 }

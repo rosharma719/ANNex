@@ -64,11 +64,19 @@ do not establish real-data recall or production performance.
 VECTORDB_BENCH_SIZE=20000 VECTORDB_BENCH_DIM=1536 \
 cargo test --release -p annex --test perf_unfiltered -- --ignored --nocapture
 cargo bench -p annex-multivector --bench kernels
+cargo bench -p annex-multivector --bench planner
 ```
 
 Use `VECTORDB_BENCH_SIZE=1000000` for the same synthetic harness at one million
 vectors. Kernel benchmarks measure kernels, not database throughput. Dedicated
 hardware is required for performance comparisons; CI only checks compilation.
+
+The `planner` Criterion target measures planning overhead at 100 and 10,000
+documents for manual dense, manual hybrid, filtered hybrid, and automatic-policy
+requests. It includes document eligibility and statistics collection performed by
+`MultiVectorIndex::plan`; it does not execute retrieval or measure planner quality
+regret. Use the real-query protocol in `docs/query-planner-spec.md` for quality,
+budget, and Pareto-frontier claims.
 
 The manual `Dedicated x86 benchmark` workflow runs on a self-hosted runner with
 the `annex-benchmark` label. It requires AVX2 and FMA, validates each explicit

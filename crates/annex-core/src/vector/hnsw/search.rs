@@ -142,16 +142,31 @@ fn prefetch_read_l2<T>(ptr: *const T) {
     let _ = ptr;
 }
 
+/// Standard prefetch: covers the first 4 cache lines (256 bytes). Used on the
+/// non-SQ8 path where every passing candidate is prefetched; capping at 4 lines
+/// avoids saturating the prefetch buffer (~20 outstanding misses on Ice Lake) when
+/// all 32 L0 neighbors are batched simultaneously.
 #[inline(always)]
 fn prefetch_from_view(view: &crate::vector::hnsw::arena::VectorArenaView, idx: usize) {
     let vector = view.get(idx);
-    // Prefetch every cache line (16 f32 = 64 bytes) of the full vector.
-    // Previously only the first 4 lines (256 bytes) were covered; a 256-dim f32
-    // vector is 1024 bytes = 16 lines, leaving 12 lines as uncovered demand fetches.
-    // First two lines (128 bytes) → L1 (scored immediately for short dimensions).
-    // Remaining lines → L2 to avoid evicting L1 occupants while batching 16 vectors.
+    for offset in [0, 16, 32, 48] {
+        if let Some(value) = vector.get(offset) {
+            prefetch_read(value);
+        }
+    }
+}
+
+/// Full-coverage prefetch: covers every cache line of the vector, capped at 8 lines
+/// (512 bytes) to fully cover 128-dim and meaningfully cover 256-dim without
+/// overloading the prefetch buffer. Used on the SQ8 path where filtering reduces the
+/// number of vectors prefetched by ~50–70%, making wider per-vector coverage safe.
+/// Lines 0–1 (128B) → L1; lines 2–7 → L2 to preserve L1 for scoring computation.
+#[inline(always)]
+fn prefetch_from_view_sq8(view: &crate::vector::hnsw::arena::VectorArenaView, idx: usize) {
+    let vector = view.get(idx);
     let mut offset = 0;
-    while offset < vector.len() {
+    let limit = vector.len().min(8 * 16); // 8 cache lines max
+    while offset < limit {
         if let Some(value) = vector.get(offset) {
             if offset < 32 {
                 prefetch_read(value);
@@ -159,7 +174,7 @@ fn prefetch_from_view(view: &crate::vector::hnsw::arena::VectorArenaView, idx: u
                 prefetch_read_l2(value);
             }
         }
-        offset += 16; // 16 f32 = 64 bytes = one cache line
+        offset += 16;
     }
 }
 
@@ -638,7 +653,7 @@ impl HNSWIndex {
                                         continue;
                                     }
                                 }
-                                prefetch_from_view(&vec_view, neighbor);
+                                prefetch_from_view_sq8(&vec_view, neighbor);
                                 batch[batch_len] = neighbor;
                                 batch_len += 1;
                                 if batch_len == BATCH {

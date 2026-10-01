@@ -1,20 +1,19 @@
 # Multi-Surface Kernel Optimization
 
-**Date:** 2026-10-01  
-**Branch:** feat/query-planner  
+**Date:** 2026-10-01 (revised after review)
+**Branch:** feat/query-planner
 **Author:** rosharma719
 
 ---
 
 ## Goal
 
-Vectorize all hot kernels for every real deployment surface, eliminate per-call SIMD detection overhead, and produce benchmarks that prove the gains — including a comparison against competing RAG retrieval stacks.
+Vectorize all hot kernels for every real deployment surface, eliminate in-loop dispatch overhead, and produce benchmarks that prove gains — including a structured comparison against competing retrieval stacks.
 
-Success criteria:
-- `maxsim_flat` and `screen_dot` have explicit SIMD implementations on x86-64 (AVX2+FMA and AVX-512 VNNI), not just on aarch64.
-- All dispatch decisions are made once at process startup, not per call.
-- The criterion bench covers `screen_dot` for the first time.
-- An end-to-end RAG comparison (ANNex vs Qdrant, Weaviate, pgvector) runs on the EC2 instance with published recall/latency numbers.
+Three sequential stages:
+1. **Correct kernels + per-backend microbenchmarks** — the bulk of this spec
+2. **EC2 end-to-end validation** — HNSW and MaxSim against ANNex baseline at matched recall
+3. **Competitor comparison** — separate project; methodology defined at end of this doc
 
 ---
 
@@ -22,140 +21,154 @@ Success criteria:
 
 ### `annex-core` — HNSW search kernels (`core.rs`)
 
-| Kernel | ARM64 | AVX2+FMA | AVX-512 | Notes |
-|---|---|---|---|---|
-| `dot_product` | NEON ✓ | AVX2+FMA ✓ | — | |
-| `l2_squared` | NEON ✓ | AVX2+FMA ✓ | — | |
-| `screen_dot` | NEON sdot ✓ | AVX2 ✓ (suboptimal) | — | AVX2 path widens i8/u8 → i16 (6 ops/32B); should use `maddubs` (2 ops/32B) |
+| Kernel | ARM64 | AVX2+FMA | AVX-512 |
+|---|---|---|---|
+| `dot_product` | NEON ✓ | AVX2+FMA ✓ | — |
+| `l2_squared` | NEON ✓ | AVX2+FMA ✓ | — |
+| `screen_dot` | NEON sdot ✓ | AVX2 ✓ (widening, keep as-is) | — |
 
-All three dispatch via `is_x86_feature_detected!()` on every call.
+All three dispatch via `is_x86_feature_detected!()` inside the function body, which is called per candidate in the HNSW inner loop.
+
+Note on `screen_dot_avx2`: the existing widening-to-i16 path (`cvtepu8_epi16`, `cvtepi8_epi16`, `sub_epi16`, `mullo_epi16`, `madd_epi16`) is the correctness baseline and must not be replaced with `_mm256_maddubs_epi16` without proving that adjacent-pair sums cannot exceed `i16::MAX` (32767). `maddubs` saturates: `255×127 + 255×127 = 64770` overflows. This rewrite is deferred.
 
 ### `annex-multivector` — MaxSim/FDE kernels (`fde.rs`)
 
-| Kernel | ARM64 | x86-64 | Notes |
-|---|---|---|---|
-| `dot` | NEON FMA ✓ | scalar only | No x86 path at all |
-| `maxsim_flat` | NEON ✓ + dim=128 specialization | scalar only | No x86 path at all |
+| Kernel | ARM64 | x86-64 |
+|---|---|---|
+| `dot` | NEON FMA ✓ | scalar only — no x86 path |
+| `maxsim_flat` | NEON ✓ + dim=128 specialization | scalar only — no x86 path |
 
 ### Benchmarks
 
-`benches/kernels.rs` (Criterion) covers `maxsim_flat` and `maxsim_naive`. **`screen_dot` has no Criterion benchmark.**
+`benches/kernels.rs` (Criterion) covers `maxsim_flat` and `maxsim_naive`. `screen_dot` has no Criterion benchmark.
 
 ---
 
 ## Dispatch Architecture
 
-### New module: `crates/annex-core/src/vector/simd.rs`
+### What changes — and why
 
-Single source of truth for platform capability, used by both crates.
+Rust's `std_detect` already caches CPU feature flags in an atomic initialized on first use. Each `is_x86_feature_detected!("avx2")` call is an atomic load + bit test — not a CPUID. A `OnceLock<CpuLevel>` replacing it would add a second atomic load on top of the first, with no net benefit.
+
+**The real overhead** is that the dispatch branch lives inside functions called per candidate (HNSW) or per token (MaxSim). Even with perfect branch prediction, this is a branch in the hot inner loop.
+
+**Fix:** select a function pointer *before* the candidate/token loop; call it unconditionally inside the loop. The selection itself uses the existing `is_x86_feature_detected!` machinery (already cached).
+
+### `CpuLevel` enum — for selection, not detection
+
+A `CpuLevel` enum provides a clean way to select function pointers at the call site. It is computed once by the caller outside the loop, not stored globally.
 
 ```rust
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CpuLevel {
-    NeonDotprod,   // aarch64 + dotprod (M-series, Graviton3+)
-    Neon,          // aarch64 baseline
-    Avx512Vnni,    // avx512f + avx512vnni (Ice Lake, Zen4, Sapphire Rapids)
-    Avx512F,       // avx512f only (Skylake-X, Cascade Lake pre-VNNI)
-    Avx2Fma,       // avx2 + fma, no avx512 (most current cloud: c5, m5, c6a)
-    Avx2,          // avx2 only
+    NeonDotprod,  // aarch64 + dotprod
+    Neon,         // aarch64 baseline
+    Avx512Vnni,   // avx512f + avx512vnni
+    Avx512F,      // avx512f, no vnni
+    Avx2Fma,      // avx2 + fma
+    Avx2,         // avx2 only
     Scalar,
 }
 
-static CPU_LEVEL: OnceLock<CpuLevel> = OnceLock::new();
-
-pub fn cpu_level() -> CpuLevel { *CPU_LEVEL.get_or_init(detect) }
+pub fn cpu_level() -> CpuLevel { /* one call, result used by caller */ }
 ```
 
-Detection order (first match wins):
-1. `cfg(target_arch = "aarch64")` → check `is_aarch64_feature_detected!("dotprod")` → `NeonDotprod` else `Neon`
-2. `cfg(target_arch = "x86_64")` → check `avx512vnni` → `Avx512Vnni`; `avx512f` → `Avx512F`; `avx2+fma` → `Avx2Fma`; `avx2` → `Avx2`
-3. Else `Scalar`
+**Per-kernel selection, not a global ranking.** A single `CpuLevel` value does not mean "use AVX-512 for everything." Each kernel selects its best implementation independently based on the available feature set:
 
-`CpuLevel` is `Copy`. Call sites hold no state — `match simd::cpu_level()` is a single load + compare, predicted perfectly after the first two calls.
+- `screen_dot`: `Avx512Vnni` → VNNI path; `Avx2Fma | Avx2` → existing widening path; else scalar.
+- `dot_product` / `l2_squared`: `Avx512F | Avx512Vnni` → AVX-512 path; `Avx2Fma` → existing `dot_avx2_fma`; else scalar.
+- `maxsim_flat`: same as `dot_product`.
 
-`fde.rs` imports `cpu_level` via a re-export from `annex-core`. Since the two crates share a process the `OnceLock` is initialized once and the same `CpuLevel` value is returned everywhere.
+**Measure dispatch overhead before and after.** The criterion bench must show whether hoisting outside the loop produces a measurable improvement. If the difference is within noise, the hoist is still correct but the spec should not claim a specific speedup.
+
+### Location
+
+New file `crates/annex-core/src/vector/simd.rs`. `annex-multivector` imports `cpu_level` from `annex` (the existing dep on `annex-core`).
 
 ---
 
 ## Kernel Additions
 
+All throughput figures below are theoretical maximums based on register widths. Actual performance depends on memory bandwidth, loop structure, and unrolling — **treat as hypotheses to validate with generated assembly and measurement, not assertions.**
+
 ### `annex-core/src/vector/hnsw/core.rs`
 
 #### `dot_avx512` / `l2_avx512`
 
-8 accumulators × 16 f32/register = 128 floats/iteration.
+`#[target_feature(enable = "avx512f")]` kernels using `_mm512_fmadd_ps` (16 f32/register).
 
-```
-#[target_feature(enable = "avx512f")]
-unsafe fn dot_avx512(q: &[f32], v: &[f32]) -> f32
-```
+Reduction: accumulate into multiple `__m512` registers across the loop; reduce to scalar at the end. `_mm512_reduce_add_ps` is a multi-instruction reduction convenience — if the compiler emits suboptimal code, replace with explicit extract-and-add tree. Determine final form after inspecting generated assembly.
 
-Reduction: `_mm512_reduce_add_ps` (single instruction on SKX+).  
-Tail: scalar loop for `len % 16` remainder.
+Tail: scalar loop for `len % 16` elements.
 
-Dispatch: `Avx512Vnni | Avx512F` → `dot_avx512`; `Avx2Fma` → `dot_avx2_fma`; `Avx2` → `dot_avx2`; else scalar.
+Required features: `avx512f`. No VNNI dependency.
 
 #### `screen_dot_avx512_vnni`
 
-```
-#[target_feature(enable = "avx512f,avx512vnni")]
-unsafe fn screen_dot_avx512_vnni(query_i8: &[i8], stored: &[u8]) -> i32
-```
+`#[target_feature(enable = "avx512f,avx512vnni")]` kernel using `_mm512_dpbusd_epi32`.
 
-`_mm512_dpbusd_epi32(acc, u8_stored, i8_query_adjusted)`: 64 bytes/instruction, one cycle throughput on Ice Lake. Handles u8-128 centering by pre-adjusting the i8 query: `q_adj[d] = q[d] - 128_bias_correction` (factored out of the inner loop). 4 accumulators = 256 bytes/iteration before tail.
+`_mm512_dpbusd_epi32(acc, a, b)` computes `acc += sum(a[i] * b[i])` where `a` is **u8** and `b` is **i8**, 64 elements per call. This matches the operand types (stored = u8, query = i8) but not the centering.
 
-Dispatch: `Avx512Vnni` → `screen_dot_avx512_vnni`; `Avx2Fma | Avx2` → `screen_dot_avx2`; else scalar.
-
-#### `screen_dot_avx2` rewrite
-
-Replace the current widen-to-i16 path (extract 128-bit halves, `cvtepu8_epi16`, `cvtepi8_epi16`, subtract bias, `mullo_epi16`, `madd_epi16` — 6 ops per 32 elements) with:
+**Centering correction.** The existing contract computes `sum(query_i8[i] × (stored_u8[i] − 128))`. Expanding:
 
 ```
-maddubs(u8_stored_minus_128_as_u8, i8_query)  // saturating u8×i8 → i16 pairs
-madd(result, ones)                             // horizontal add pairs → i32
-add_epi32(acc, ...)
+sum(query_i8[i] × stored_u8[i]) − 128 × sum(query_i8[i])
 ```
 
-2 ops per 32 elements. The centering `stored[i] - 128` becomes a reinterpretation after subtracting the scalar bias from the u8 values before loading — precomputed as `vsubq_u8(s, vdupq_n_u8(128))` in the NEON version; on AVX2: `_mm256_sub_epi8` after treating the subtracted value as a signed interpretation (needs care: use `_mm256_xor_si256` with `0x80` mask to flip sign bit, making u8-128 behave as signed i8).
+The VNNI accumulator computes the first term directly. The correction `128 × sum(query_i8[i])` is a scalar computed once per query vector (outside the document loop) and subtracted from the VNNI result after reduction. This must handle:
 
----
+- The existing slice-length contract: `n = query_i8.len().min(stored.len())` — correction sum must cover exactly the same `n` elements.
+- Overflow: `sum(query_i8)` for a 768-dim vector with all values at +127 = 97536, times 128 = 12M — fits in i32 (max ~2.1B). Document this bound.
+
+4 accumulators, each covering 64 elements per iteration = 256 elements/iteration before tail.
+
+Required features: `avx512f` + `avx512vnni`.
 
 ### `annex-multivector/src/fde.rs`
 
-#### `dot_avx2_fma`
+#### `dot_avx2_fma` / `dot_avx512`
 
-Mirrors `dot_neon_multiple_of_16`: 4 accumulators × 8 f32 = 32 floats/iteration.
+Mirror the NEON `dot_neon_multiple_of_16` structure. Multiple accumulators to cover the multiple-of-16 prefix; scalar tail for remainder. Reduction without `_mm256_hadd_ps`: use `_mm256_extractf128_ps` + `_mm_add_ps` + `_mm_shuffle_ps` or `_mm_movehl_ps`.
 
-```
-#[target_feature(enable = "avx2,fma")]
-unsafe fn dot_avx2_fma(a: *const f32, b: *const f32, len: usize) -> f32
-```
+The number of accumulators and unroll depth is a tuning decision — start with 4 (matching NEON), adjust after benchmarking.
 
-Reduction: `_mm256_extractf128_ps` + `_mm_add_ps` + two `_mm_shuffle_ps` (no `hadd`).
+#### `maxsim_flat_avx2_fma` / `maxsim_flat_avx512`
 
-#### `maxsim_flat_avx2_fma`
+Mirror `maxsim_flat_neon`:
+- General path: call per-doc-token dot on each doc chunk.
+- dim=128 specialization: const-length variant allowing full unrolling.
 
-Mirrors `maxsim_flat_neon`:
-- General path: calls `dot_avx2_fma` per doc token
-- dim=128 specialization: unrolled const-length version `dot_avx2_fma_128`
-
-Dispatched from `maxsim_flat` when `Avx2Fma | Avx2` (AVX2 only uses 2 accumulators × 8 = 16f/iter variant).
-
-#### `maxsim_flat_avx512`
-
-8 accumulators × 16 f32 = 128 floats/iteration. dim=128 specialization fully unrolled.
-
-Dispatched from `maxsim_flat` when `Avx512Vnni | Avx512F`.
+Dispatch: call `cpu_level()` once before the query-token outer loop; pass a function pointer into the inner loop.
 
 ---
 
 ## Correctness
 
-All new kernels added to the existing tolerance-check loops:
+### Problem with dispatch-path testing
 
-- `core.rs::simd_kernels_match_scalar_within_tolerance` — extended to call AVX-512 variants when `cpu_level()` reports them; tolerance ≤ 1e-3 (matches existing threshold).
-- `fde.rs::maxsim_flat_scalar_and_dispatch_agree_on_dim{128,384}` — dispatch now routes to AVX2/AVX-512 on x86; no test changes needed, coverage is automatic.
-- New: `screen_dot_all_paths_agree` — calls scalar, AVX2, AVX-512 VNNI on the same input; asserts exact equality (integer kernel, no FP error).
+Testing `dot_product(...)` on Ice Lake with `RUSTFLAGS=-C target-cpu=native` exercises the AVX-512 path. It does not test AVX2, AVX2+FMA, or scalar. The same is true for `screen_dot` and `maxsim_flat`.
+
+### Required: direct per-backend tests
+
+Each kernel function (`dot_avx2`, `dot_avx2_fma`, `dot_avx512`, `l2_avx2`, `l2_avx2_fma`, `l2_avx512`, `screen_dot_avx2`, `screen_dot_avx512_vnni`, `maxsim_flat_avx2_fma`, `maxsim_flat_avx512`) needs its own test calling the function directly, gated by `#[cfg(target_arch = "x86_64")]` and a runtime feature check.
+
+**For screen_dot (integer kernels) — required cases:**
+- Empty input (len = 0)
+- Lengths below SIMD width: 1, 4, 15, 16, 31, 32
+- Lengths at SIMD boundaries: 32, 64, 128, 256
+- Integer extremes: `query_i8 = [127; N]`, `stored_u8 = [255; N]` and `[0; N]`
+- Adversarial adjacent pairs designed to expose saturation bugs in any future `maddubs` attempt: `q=[127,127,...]`, `s=[255,255,...]`
+- Correctness: assert exact integer equality with `screen_dot_scalar` for all cases
+
+**For f32 kernels — required cases:**
+- Lengths below SIMD width: 1, 4, 7, 8, 15, 16, 31, 32
+- Lengths at SIMD boundaries: 16, 32, 64, 128, 256, 512
+- Floating-point cancellation: alternating +1.0 and -1.0
+- Tolerance: ≤ 1e-3 absolute difference vs scalar, with dimension-appropriate scaling
+
+### Benchmark access for `screen_dot`
+
+`screen_dot` is currently `pub(crate)` in `annex-core`. To benchmark it in the Criterion bench (which lives in `annex-multivector`), add a thin `pub` re-export in `annex-core` behind a `#[cfg(any(test, feature = "bench-internals"))]` gate. The `bench-internals` Cargo feature is activated only in the benchmark binary. Do not expose it in the public library API.
 
 ---
 
@@ -164,27 +177,37 @@ All new kernels added to the existing tolerance-check loops:
 ### Criterion (`benches/kernels.rs`)
 
 New group `bench_screen_dot`:
-- dim=128, dim=256 (NYT-256 production shape), dim=768
-- Calls the public `screen_dot` dispatch, so all paths are exercised automatically depending on build machine
+- Call `screen_dot` dispatch (via `bench-internals` feature) for dim=128, dim=256, dim=768
+- This gives the first Criterion coverage of the SQ8 screening kernel
 
-`bench_maxsim_flat` group gains dim=512 and dim=768.
+`bench_maxsim_flat` gains dim=512 and dim=768.
 
-### RAG comparison (end-to-end, on EC2)
+**Expected outputs:** absolute timing with Criterion confidence intervals. Claim no speedup until numbers are in hand.
 
-After kernel optimization is complete, run a cross-system comparison on the EC2 instance using `scripts/evaluate_ann_benchmark.py` extended to cover competing stacks:
+---
 
-**Competitors:** Qdrant (Docker, HNSW), Weaviate (Docker, HNSW), pgvector (PostgreSQL, ivfflat + hnsw).
+## Stages 2 and 3
 
-**Dataset:** NYT-256-angular (same as the existing Mac benchmark — 290K vectors, 256 dims, cosine).
+### Stage 2 — EC2 end-to-end validation
 
-**Metrics:**
-- Recall@10 vs median query latency (Pareto curve)
-- Build time
-- Index size on disk
+Run after stage 1 kernels pass all backend tests.
 
-**Deliverable:** A table comparable to the existing Mac benchmark wording in `project_strategy.md`, reportable as: "On NYT-256-Angular, x86-64 (Intel Ice Lake), ANNex reaches [recall]% Recall@10 at [X] ms using M=16 + SQ8 screening + RCM. Qdrant HNSW M=16: [Y] ms. pgvector HNSW: [Z] ms."
+**HNSW kernel validation:** ANNex baseline (current `master`) vs patched (this branch) on NYT-256-angular. Same M=16 + SQ8 screening + RCM config. Metric: recall@10 vs median query latency at matched recall. Expected: no regression in recall; latency improvement measurable at ≥2× criterion sample count for statistical significance.
 
-The `scripts/bench_competitors.py` script already has scaffolding for Qdrant and pgvector — extend it for Weaviate and wire it to the EC2 benchmark runner.
+**MaxSim kernel validation:** Use the existing `maxsim_bench` binary workload (10K docs × 200 tokens × 128 dims, 250 candidates). Compare scalar vs AVX2 vs AVX-512 paths directly. NYT-256 is single-vector retrieval and does **not** exercise `maxsim_flat`.
+
+### Stage 3 — Competitor comparison (separate project)
+
+Comparing ANNex against Qdrant, Weaviate, and pgvector requires:
+
+- Controlled dataset (NYT-256-angular, same version)
+- Each system configured at comparable `M` and `ef_construction`
+- Warmup rounds documented
+- Network/client overhead separated from pure index latency (test with local UNIX socket or loopback where possible)
+- Resource limits (RAM, CPU threads) equalized or reported
+- Published configurations (not default-tuned for one system)
+
+This is a non-trivial methodology effort. It belongs in a separate spec, not as a tail of the kernel work. When the kernel stages are complete and validated, open a new brainstorm for the competitor comparison.
 
 ---
 
@@ -192,18 +215,20 @@ The `scripts/bench_competitors.py` script already has scaffolding for Qdrant and
 
 | File | Change |
 |---|---|
-| `crates/annex-core/src/vector/simd.rs` | **New** — `CpuLevel` enum + `OnceLock` detection |
+| `crates/annex-core/src/vector/simd.rs` | **New** — `CpuLevel` enum + `cpu_level()` detection function |
 | `crates/annex-core/src/vector/mod.rs` | Re-export `simd::cpu_level` |
-| `crates/annex-core/src/vector/hnsw/core.rs` | Add AVX-512 kernels; rewrite `screen_dot_avx2`; replace runtime detection with `cpu_level()` |
-| `crates/annex-multivector/src/fde.rs` | Add `dot_avx2_fma`, `maxsim_flat_avx2_fma`, `maxsim_flat_avx512`; wire dispatch |
+| `crates/annex-core/src/vector/hnsw/core.rs` | Add `dot_avx512`, `l2_avx512`, `screen_dot_avx512_vnni`; hoist dispatch outside candidate loop; per-backend correctness tests |
+| `crates/annex-core/Cargo.toml` | Add `bench-internals` feature flag |
+| `crates/annex-multivector/src/fde.rs` | Add `dot_avx2_fma`, `dot_avx512`, `maxsim_flat_avx2_fma`, `maxsim_flat_avx512`; hoist dispatch outside token loop |
 | `crates/annex-multivector/benches/kernels.rs` | Add `bench_screen_dot` group; extend `bench_maxsim_flat` dims |
-| `scripts/bench_competitors.py` | Add Weaviate; wire to EC2 runner |
 
 ---
 
 ## Out of Scope
 
-- Windows (separate effort)
-- ARM SVE / SVE2 (no current test hardware)
+- `screen_dot_avx2` rewrite with `maddubs` — deferred; requires proof of input bounds
+- Windows
+- ARM SVE / SVE2
 - BF16 / FP16 kernels
-- Cosine-specific kernel fusion (normalize-then-dot in one pass)
+- Cosine-specific normalize+dot fusion
+- Competitor comparison (Stage 3 is a separate project)

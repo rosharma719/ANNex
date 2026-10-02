@@ -73,5 +73,16 @@
       "queries.npy": "sha256:3af50ba2e59a6936d4c5f6a126b8ec22db5aa5a48cc1438d1d53b66ff3d61e82",
       "ground_truth.json": "sha256:9516651fa450e6fafe0c407dd8281611f5398a1ad72b9ae776fe2cc3d897f775"
     }
+  },
+  "gist-960-euclidean": {
+    "name": "GIST-1M",
+    "description": "GIST image descriptors, 960-D Euclidean, 1M base vectors",
+    "dims": 960,
+    "metric": "euclidean",
+    "n_base": 1000000,
+    "n_queries": 1000,
+    "n_gt": 100,
+    "source_url": "https://ann-benchmarks.com/gist-960-euclidean.hdf5",
+    "checksums": {}
   }
 }

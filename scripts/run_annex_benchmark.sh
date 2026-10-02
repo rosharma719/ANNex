@@ -8,6 +8,7 @@ METRIC="$3"
 TOP_K="${4:-10}"
 M_VALUES="${M_VALUES:-16}"
 EF_SEARCH_LIST="${EF_SEARCH_LIST:-32,64,128,256,512}"
+RCM_VALUES="${RCM_VALUES:-false true}"
 ROOT="$(git rev-parse --show-toplevel)"
 OUT="$ROOT/crates/annex-core/bench/$SUITE/results_annexdb.jsonl"
 cd "$ROOT"
@@ -26,7 +27,7 @@ done
 for M in $M_VALUES; do
     SNAP="$DATA_DIR/annexdb_m${M}_efc300.bin"
     for SQ8 in false true; do
-        for RCM in false true; do
+        for RCM in $RCM_VALUES; do
             LABEL="m${M}"
             [[ "$RCM" == true ]] && LABEL="${LABEL}+rcm"
             [[ "$SQ8" == true ]] && LABEL="${LABEL}+sq8"
@@ -40,7 +41,7 @@ for M in $M_VALUES; do
     done
 done
 
-M_VALS="$M_VALUES" EF_VALS="$EF_SEARCH_LIST" OUT_PATH="$OUT" python3 - <<'PY'
+M_VALS="$M_VALUES" EF_VALS="$EF_SEARCH_LIST" RCM_VALS="$RCM_VALUES" OUT_PATH="$OUT" python3 - <<'PY'
 import datetime, json, os, subprocess
 from pathlib import Path
 p = Path(os.environ["OUT_PATH"]).parent / "manifest.json"
@@ -51,6 +52,7 @@ m["annexdb"] = {
     "branch": subprocess.check_output(["git", "branch", "--show-current"], text=True).strip(),
     "rust": subprocess.check_output(["rustc", "--version"], text=True).strip(),
     "m_values": os.environ["M_VALS"], "ef_values": os.environ["EF_VALS"],
+    "rcm_values": os.environ["RCM_VALS"],
 }
 p.write_text(json.dumps(m, indent=2) + "\n")
 PY

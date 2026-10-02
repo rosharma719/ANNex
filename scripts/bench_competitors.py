@@ -204,6 +204,7 @@ def main():
             "lastfm-64-dot": "lastfm64",
             "mnist-784-euclidean": "mnist784",
             "nytimes-256-angular": "nyt256",
+            "gist-960-euclidean": "gist1m",
         }
         bench = mapping.get(args.data_dir.name, args.data_dir.name)
         out = Path(f"bench/{bench}/results_competitors.jsonl")

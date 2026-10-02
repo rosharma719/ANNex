@@ -4,9 +4,13 @@ version = "0.3.0"
 default-run = "annex-multivector"
 edition = "2024"
 rust-version.workspace = true
-description = "Late-interaction retrieval built on annex: MUVERA fixed-dimensional candidate generation, packed 2-bit residuals, ColBERT MaxSim rescoring."
+description = "Hybrid dense-sparse retrieval and multivector / ColBERT late-interaction reranking built on the ANNex HNSW engine."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/rosharma719/annex"
+repository = "https://github.com/rosharma719/ANNex"
+homepage = "https://annexsearch.com"
+documentation = "https://docs.rs/annex-multivector"
+keywords = ["colbert", "hybrid-search", "vector-search", "multivector", "hnsw"]
+categories = ["database-implementations", "algorithms"]
 
 [lib]
 name = "multivector"
@@ -33,6 +37,7 @@ rayon = "1.11"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 fs2 = "=0.4.3"
+subtle = "2"
 tower = { version = "0.5", features = ["util"] }
 rust-stemmers = "1.2.0"
 unicode-normalization = "0.1.25"

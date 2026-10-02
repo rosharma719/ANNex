@@ -747,6 +747,29 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn open_server_passes_write_route_on_real_router() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
+        let app = authed_app(None, None);
+        let body = serde_json::to_vec(&serde_json::json!({"documents":[{"id":"x","vectors":[[1.0,0.0]],"metadata":{}}]})).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/vectors/upsert")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let s = response.status().as_u16();
+        assert_ne!(s, 401, "open server must not reject unauthenticated request");
+        assert_ne!(s, 403, "open server must not forbid any request");
+    }
+
     fn authed_app(read_key: Option<&str>, write_key: Option<&str>) -> axum::Router {
         use crate::auth::AuthConfig;
         let (_dir, index) = fixture();

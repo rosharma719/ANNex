@@ -1,3 +1,5 @@
+mod auth;
+
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{

@@ -99,6 +99,8 @@ pub enum PlanReason {
     OperatorRequiresExact,
     /// Cost model estimated exact cheaper than HNSW for this corpus size.
     LowerEstimatedCost,
+    /// Runtime calibration estimated lower p90 latency for this hardware.
+    LowerCalibratedLatency,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -223,8 +225,11 @@ pub struct PlannedChannel {
     pub limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ef_search: Option<usize>,
-    /// Raw cost units for this operator (not calibrated to ms yet).
+    /// Hardware-independent work estimate.
     pub estimated_cost_units: f64,
+    /// Calibrated p90 estimate after enough observations in this workload bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_latency_ms: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -270,6 +275,12 @@ pub enum PlanStage {
 pub struct PlanEstimate {
     pub critical_path_cost: f64,
     pub total_cost: f64,
+    /// Calibrated p90 for the parallel candidate stage, excluding later stages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibrated_parallel_p90_ms: Option<f64>,
+    /// Sum of calibrated channel p90 values; useful as a CPU-work proxy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibrated_channel_total_p90_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -441,6 +452,7 @@ impl MultiVectorIndex {
                 .as_ref()
                 .map(|_| (eligible_documents, filter_strategy)),
         );
+        let calibration = self.calibration_snapshot();
 
         let logical_channels = request
             .prefetch
@@ -562,6 +574,20 @@ impl MultiVectorIndex {
                     let cost_exact = f * dim * 2.0 * 13.0;
                     let cost_hnsw = ef * n.log2().ceil().max(1.0) * dim * 3.0;
                     let _ = filtered; // crossover via calibrated cost_exact
+                    let exact_ms = calibrated_latency(
+                        &calibration,
+                        PhysicalOperator::ExactDense,
+                        channel,
+                        &stats,
+                        cost_exact,
+                    );
+                    let hnsw_ms = calibrated_latency(
+                        &calibration,
+                        PhysicalOperator::HnswDense,
+                        channel,
+                        &stats,
+                        cost_hnsw,
+                    );
                     let (operator, reason) = choose_ann_with_cost(
                         backend,
                         ann_ready,
@@ -570,6 +596,8 @@ impl MultiVectorIndex {
                         PhysicalOperator::HnswDense,
                         cost_exact,
                         cost_hnsw,
+                        exact_ms,
+                        hnsw_ms,
                     );
                     let cost = if operator == PhysicalOperator::HnswDense {
                         cost_hnsw
@@ -646,6 +674,20 @@ impl MultiVectorIndex {
                     let cost_exact = f * fde_dim * 2.0 * 13.0;
                     let cost_hnsw = ef * n.log2().ceil().max(1.0) * fde_dim * 3.0;
                     let _ = filtered;
+                    let exact_ms = calibrated_latency(
+                        &calibration,
+                        PhysicalOperator::ExactFde,
+                        channel,
+                        &stats,
+                        cost_exact,
+                    );
+                    let hnsw_ms = calibrated_latency(
+                        &calibration,
+                        PhysicalOperator::HnswFde,
+                        channel,
+                        &stats,
+                        cost_hnsw,
+                    );
                     let (operator, reason) = choose_ann_with_cost(
                         backend,
                         ann_ready,
@@ -654,6 +696,8 @@ impl MultiVectorIndex {
                         PhysicalOperator::HnswFde,
                         cost_exact,
                         cost_hnsw,
+                        exact_ms,
+                        hnsw_ms,
                     );
                     let cost = if operator == PhysicalOperator::HnswFde {
                         cost_hnsw
@@ -666,6 +710,8 @@ impl MultiVectorIndex {
             if limit == 0 || limit > 100_000 {
                 return Err(invalid("channel limit must be in 1..=100000"));
             }
+            let estimated_latency_ms =
+                calibrated_latency(&calibration, operator, channel, &stats, cost);
             planned_channels.push(PlannedChannel {
                 index,
                 operator,
@@ -673,6 +719,7 @@ impl MultiVectorIndex {
                 limit,
                 ef_search,
                 estimated_cost_units: cost,
+                estimated_latency_ms,
             });
         }
 
@@ -770,6 +817,16 @@ impl MultiVectorIndex {
             .fold(0.0_f64, f64::max)
             .max(1.0);
         let parallel_total = channel_costs.iter().sum::<f64>().max(1.0);
+        let calibrated_channel_times = planned_channels
+            .iter()
+            .map(|channel| channel.estimated_latency_ms)
+            .collect::<Option<Vec<_>>>();
+        let calibrated_parallel_p90_ms = calibrated_channel_times
+            .as_ref()
+            .map(|times| times.iter().copied().fold(0.0_f64, f64::max));
+        let calibrated_channel_total_p90_ms = calibrated_channel_times
+            .as_ref()
+            .map(|times| times.iter().sum());
         let fusion_cost = planned_channels.len() as f64 * 5.0;
         let rerank_cost = rerank_plan.as_ref().map_or(0.0, |r| {
             let candidates = r.candidate_limit as f64;
@@ -800,6 +857,8 @@ impl MultiVectorIndex {
                     + rerank_cost
                     + context_cost,
                 total_cost: parallel_total + fusion_cost + rerank_cost + context_cost,
+                calibrated_parallel_p90_ms,
+                calibrated_channel_total_p90_ms,
             },
             policy: None, // populated by plan()/retrieve() for non-Manual modes
         })
@@ -876,6 +935,8 @@ fn choose_ann_with_cost(
     ann: PhysicalOperator,
     cost_exact: f64,
     cost_hnsw: f64,
+    exact_ms: Option<f64>,
+    hnsw_ms: Option<f64>,
 ) -> (PhysicalOperator, PlanReason) {
     if backend == "exact" {
         return (exact, PlanReason::RequestedExact);
@@ -889,12 +950,53 @@ fn choose_ann_with_cost(
     if backend == "hnsw" {
         return (ann, PlanReason::AnnReady);
     }
+    if let (Some(exact_ms), Some(hnsw_ms)) = (exact_ms, hnsw_ms) {
+        return if exact_ms <= hnsw_ms {
+            (exact, PlanReason::LowerCalibratedLatency)
+        } else {
+            (ann, PlanReason::LowerCalibratedLatency)
+        };
+    }
     // ANN is available — choose by cost model.
     if cost_exact <= cost_hnsw {
         (exact, PlanReason::LowerEstimatedCost)
     } else {
         (ann, PlanReason::LowerEstimatedCost)
     }
+}
+
+pub(super) fn calibrated_latency(
+    calibration: &CalibrationSnapshot,
+    operator: PhysicalOperator,
+    channel: &Channel,
+    stats: &PlannerStats,
+    cost_units: f64,
+) -> Option<f64> {
+    calibration.estimate_ms(calibration_key(operator, channel, stats), cost_units)
+}
+
+pub(super) fn calibration_key(
+    operator: PhysicalOperator,
+    channel: &Channel,
+    stats: &PlannerStats,
+) -> CalibrationKey {
+    let dimension = match operator {
+        PhysicalOperator::ExactDense | PhysicalOperator::HnswDense => channel_dim(channel, stats),
+        PhysicalOperator::ExactFde | PhysicalOperator::HnswFde => stats.fde_dimension,
+        PhysicalOperator::ExactMaxsim => match channel {
+            Channel::Multivector { vectors, .. } => {
+                vectors.first().map_or(stats.fde_dimension, Vec::len)
+            }
+            _ => stats.fde_dimension,
+        },
+        PhysicalOperator::Bm25 | PhysicalOperator::SparseDot => 0,
+    };
+    calibration::key(
+        operator,
+        dimension,
+        stats.documents,
+        stats.filter_stats.as_ref().map(|filter| filter.selectivity),
+    )
 }
 
 fn estimate_channel_cost(

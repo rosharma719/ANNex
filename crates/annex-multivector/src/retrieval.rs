@@ -1110,7 +1110,7 @@ impl MultiVectorIndex {
         // work-stealing is safe but may create contention under high concurrency.
         // A per-query parallelism budget is tracked in a later phase.
         let parallel_stage_start = Instant::now();
-        type ChannelResult = Result<(Vec<(String, f32)>, Value), IndexError>;
+        type ChannelResult = Result<(Vec<(String, f32)>, Value, f64), IndexError>;
         let channel_results: Vec<ChannelResult> = request
             .prefetch
             .par_iter()
@@ -1266,20 +1266,34 @@ impl MultiVectorIndex {
                         }
                     }
                 };
+                let elapsed_ms = at.elapsed().as_secs_f64() * 1000.;
                 let backend = planned.operator.as_str();
                 let entry = serde_json::json!({
                     "backend": backend,
                     "candidates": scores.len(),
-                    "elapsed_ms": at.elapsed().as_secs_f64() * 1000.
+                    "elapsed_ms": elapsed_ms
                 });
-                Ok((scores, entry))
+                Ok((scores, entry, elapsed_ms))
             })
             .collect();
-        let (mut lists, channels): (Vec<_>, Vec<_>) = channel_results
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .unzip();
+        let channel_results = channel_results.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let mut lists = Vec::with_capacity(channel_results.len());
+        let mut channels = Vec::with_capacity(channel_results.len());
+        {
+            let mut calibration = self.calibration.lock().unwrap();
+            for ((scores, trace, elapsed_ms), (channel, planned)) in channel_results
+                .into_iter()
+                .zip(request.prefetch.iter().zip(plan.parallel_channels()))
+            {
+                calibration.observe(
+                    planner::calibration_key(planned.operator, channel, &plan.stats),
+                    planned.estimated_cost_units,
+                    elapsed_ms,
+                );
+                lists.push(scores);
+                channels.push(trace);
+            }
+        }
         per_stage_actual_ms.push(parallel_stage_start.elapsed().as_secs_f64() * 1000.);
 
         let fusion_stage_start = Instant::now();
@@ -1846,6 +1860,44 @@ mod tests {
             PlanReason::LowerEstimatedCost
         );
         assert_eq!(filtered.eligible_documents, 2);
+    }
+
+    #[test]
+    fn runtime_calibration_replaces_static_operator_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        index.build_dense_ann("semantic", 4, 16).unwrap();
+        let mut query = request();
+        query.filter = None;
+        query
+            .prefetch
+            .retain(|channel| matches!(channel, Channel::Dense { .. }));
+
+        for backend in ["exact", "hnsw"] {
+            let Channel::Dense {
+                backend: selected, ..
+            } = &mut query.prefetch[0]
+            else {
+                unreachable!()
+            };
+            *selected = backend.into();
+            for _ in 0..5 {
+                index.retrieve(&query).unwrap();
+            }
+        }
+
+        let Channel::Dense { backend, .. } = &mut query.prefetch[0] else {
+            unreachable!()
+        };
+        *backend = "auto".into();
+        let plan = index.plan(&query).unwrap();
+        assert_eq!(
+            plan.parallel_channels()[0].reason,
+            PlanReason::LowerCalibratedLatency
+        );
+        assert!(plan.parallel_channels()[0].estimated_latency_ms.is_some());
+        assert!(plan.estimate.calibrated_parallel_p90_ms.is_some());
+        assert_eq!(index.calibration_snapshot().entries.len(), 2);
     }
 
     #[test]

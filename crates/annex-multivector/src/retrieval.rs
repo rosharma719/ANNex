@@ -3417,4 +3417,125 @@ mod tests {
             assert!(snap.entries.iter().all(|e| e.observations >= 5));
         }
     }
+
+    #[test]
+    fn ann_graph_persists_and_auto_loads_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let top_ids_first: Vec<String>;
+
+        // Force HNSW via backend override — the 3-doc corpus is too small
+        // for the cost model to choose HNSW automatically. The goal of this
+        // test is persistence, not planner selection.
+        let make_hnsw_req = || -> RetrieveRequest {
+            serde_json::from_value(json!({
+                "prefetch": [{"kind": "dense", "field": "semantic",
+                              "vector": [1., 0.], "limit": 3, "backend": "hnsw"}],
+                "filter": {"op": "eq", "field": "tenant", "value": "a"},
+                "limit": 3
+            }))
+            .unwrap()
+        };
+        {
+            let index = index(dir.path());
+            index.build_dense_ann("semantic", 4, 16).unwrap();
+
+            // Verify the graph file exists on disk.
+            assert!(
+                dir.path().join("ann/semantic.ann").exists(),
+                "ann file should be written after build"
+            );
+
+            top_ids_first = index
+                .retrieve(&make_hnsw_req())
+                .unwrap()
+                .matches
+                .into_iter()
+                .map(|h| h.id)
+                .collect();
+            assert!(!top_ids_first.is_empty());
+        }
+        // Reopen — no explicit build_dense_ann call.
+        {
+            let index = MultiVectorIndex::open_existing(dir.path(), Durability::Buffered)
+                .expect("reopen index");
+
+            // Graph must be available: forced-HNSW request must succeed.
+            let top_ids_second: Vec<String> = index
+                .retrieve(&make_hnsw_req())
+                .expect("HNSW should be available after reopen without rebuild")
+                .matches
+                .into_iter()
+                .map(|h| h.id)
+                .collect();
+            assert_eq!(
+                top_ids_first, top_ids_second,
+                "results should be identical after reopen"
+            );
+
+            // Verify the planner sees the graph as available (even if it
+            // chooses exact on this tiny corpus by cost).
+            let plan = index.plan(&make_hnsw_req()).expect("plan after reopen");
+            assert_eq!(
+                plan.parallel_channels()[0].operator,
+                PhysicalOperator::HnswDense,
+                "forced-hnsw backend should use HnswDense"
+            );
+        }
+    }
+
+    #[test]
+    fn ann_graph_not_loaded_when_generation_mismatch() {
+        // When documents are written after a graph build, the persisted
+        // generation no longer matches the current generation. The graph is
+        // NOT auto-loaded (we can't safely reconstruct delta for updated docs
+        // without per-document modification timestamps). Exact fallback works,
+        // and a rebuild restores the graph. This is the correct conservative
+        // behavior until bounded delta folding is implemented.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let index = index(dir.path());
+            index.build_dense_ann("semantic", 4, 16).unwrap();
+            index
+                .upsert_records(vec![document(
+                    "new",
+                    "new document",
+                    vec![0.9, 0.1],
+                    "a",
+                    0,
+                )])
+                .unwrap();
+        }
+        {
+            let index = MultiVectorIndex::open_existing(dir.path(), Durability::Buffered)
+                .expect("reopen after mutation");
+            let mut q: RetrieveRequest = serde_json::from_value(json!({
+                "prefetch": [{"kind": "dense", "field": "semantic",
+                              "vector": [1., 0.], "limit": 3, "backend": "auto"}],
+                "limit": 3
+            }))
+            .unwrap();
+            // Graph not loaded (generation mismatch) → auto falls back to exact.
+            let plan = index.plan(&q).unwrap();
+            assert_eq!(
+                plan.parallel_channels()[0].operator,
+                PhysicalOperator::ExactDense,
+                "graph should not load after generation mismatch"
+            );
+            // Exact fallback returns all documents including the new one.
+            let response = index.retrieve(&q).unwrap();
+            assert!(
+                response.matches.iter().any(|h| h.id == "new"),
+                "exact fallback should return post-build insert"
+            );
+            // After an explicit rebuild the graph is available again.
+            index.build_dense_ann("semantic", 4, 16).unwrap();
+            q.prefetch[0] = serde_json::from_value(json!({
+                "kind": "dense", "field": "semantic",
+                "vector": [1., 0.], "limit": 3, "backend": "hnsw"
+            }))
+            .unwrap();
+            let response2 = index.retrieve(&q).unwrap();
+            assert!(response2.matches.iter().any(|h| h.id == "new"));
+        }
+    }
 }

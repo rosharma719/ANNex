@@ -76,4 +76,5 @@ pub use crate::vector::hnsw::arena::{
     ChunkedArray, ChunkedArrayView, VectorArena, VectorArenaView,
 };
 pub use crate::vector::hnsw::{ScoredPoint, SearchRuntimeOptions};
+pub use crate::vector::index::VectorIndex;
 pub use crate::vector::sparse::{SparseIndex, SparseVector};

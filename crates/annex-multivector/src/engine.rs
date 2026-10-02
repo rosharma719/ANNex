@@ -257,6 +257,16 @@ pub enum IndexError {
     )]
     CommitUncertain(io::Error),
 }
+/// On-disk representation of a built HNSW graph. Payloads, delta, and
+/// tombstones are reconstructed from the live document set on load.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PersistedAnn {
+    generation: u64,
+    /// Ordered list of external document IDs corresponding to HNSW node 0..n.
+    ids: Vec<String>,
+    hnsw: annex::vector::hnsw::HnswSnapshot,
+}
+
 /// Immutable graph and dense external-ID mapping, shared by staged generations.
 struct FdeAnnBase {
     index: HNSWIndex,
@@ -832,6 +842,13 @@ impl MultiVectorIndex {
             config,
         };
         index.load_calibration();
+        // Load persisted graphs into the initial state. Stale or missing files
+        // are silently skipped; the planner falls back to exact scan.
+        {
+            let mut s = (*index.snapshot()).clone();
+            index.load_all_ann(&mut s);
+            *index.state.write().unwrap() = Arc::new(s);
+        }
         Ok(index)
     }
     fn snapshot(&self) -> Arc<State> {
@@ -872,6 +889,110 @@ impl MultiVectorIndex {
     /// also safe to call explicitly after a workload that should persist.
     pub fn flush_calibration(&self) {
         self.save_calibration();
+    }
+
+    fn ann_dir(&self) -> PathBuf {
+        self.root.join("ann")
+    }
+
+    fn ann_path(&self, field: Option<&str>) -> PathBuf {
+        self.ann_dir()
+            .join(format!("{}.ann", field.unwrap_or("fde")))
+    }
+
+    fn save_ann(&self, field: Option<&str>, generation: u64, ids: &[String], hnsw: &HNSWIndex) {
+        let dir = self.ann_dir();
+        let _ = fs::create_dir_all(&dir);
+        let path = self.ann_path(field);
+        let tmp = path.with_extension("ann.tmp");
+        let persisted = PersistedAnn {
+            generation,
+            ids: ids.to_vec(),
+            hnsw: hnsw.to_snapshot(),
+        };
+        if let Ok(bytes) = bincode::serialize(&persisted) {
+            if fs::write(&tmp, &bytes).is_ok() {
+                let _ = fs::rename(&tmp, path);
+            }
+        }
+    }
+
+    fn delete_ann(&self, field: Option<&str>) {
+        let _ = fs::remove_file(self.ann_path(field));
+    }
+
+    /// Attempt to load all persisted ANN graphs into the given state.
+    /// Missing or stale files are silently skipped; the planner falls back
+    /// to exact scan and the caller can trigger a rebuild.
+    fn load_all_ann(&self, s: &mut State) {
+        let dir = self.ann_dir();
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("ann") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_owned();
+            let field: Option<&str> = if stem == "fde" { None } else { Some(&stem) };
+            let Ok(bytes) = fs::read(&path) else { continue };
+            let Ok(persisted) = bincode::deserialize::<PersistedAnn>(&bytes) else {
+                continue;
+            };
+            // Only load graphs that exactly match the current generation.
+            // We cannot safely reconstruct delta/tombstones for UPDATED
+            // documents (only for inserts and pure deletes) without a
+            // per-document modification timestamp. Exact-generation load
+            // covers the primary use case (ingest → build → restart).
+            // Generation-mismatched files are left on disk for inspection
+            // and will be overwritten the next time the graph is rebuilt.
+            if persisted.generation != s.generation {
+                continue;
+            }
+            // Rebuild by_id, payloads, and payload_index from the current
+            // document set. At exact-generation match, delta and tombstones
+            // are both empty (the graph is fully current).
+            let by_id: HashMap<String, u64> = persisted
+                .ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (id.clone(), i as u64))
+                .collect();
+            let mut payloads = HashMap::with_capacity(persisted.ids.len());
+            let mut payload_index = PayloadIndex::new();
+            for (point, id) in persisted.ids.iter().enumerate() {
+                if let Some(doc) = s.documents.get(id) {
+                    let payload = retrieval::metadata_ann_payload(&doc.metadata);
+                    payload_index.insert(point as u64, &payload);
+                    payloads.insert(point as u64, payload);
+                }
+            }
+            let ann = FdeAnn {
+                base: Arc::new(FdeAnnBase {
+                    index: HNSWIndex::from_snapshot(persisted.hnsw),
+                    ids: persisted.ids,
+                    by_id,
+                    field: field.map(str::to_owned),
+                    payloads,
+                    payload_index,
+                }),
+                delta: HashSet::new(),
+                tombstones: HashSet::new(),
+                // commit() maintains ann.generation == s.generation.
+                // Restore that invariant here so ann_scores_filtered passes.
+                generation: s.generation,
+            };
+            if let Some(f) = field {
+                s.named_ann.insert(f.to_owned(), ann);
+            } else {
+                s.fde_ann = Some(ann);
+            }
+        }
     }
 
     fn validate(&self, v: &[Vector]) -> Result<(), IndexError> {
@@ -1024,6 +1145,7 @@ impl MultiVectorIndex {
         next.postings = vec![HashSet::new(); next.codebook.len()];
         // Retraining an empty collection resets its derived graph/overlay.
         Self::invalidate_fde_ann(&mut next);
+        self.delete_ann(None); // persisted graph is stale after codebook retrain
         self.commit(&s, next)
     }
     pub fn upsert(
@@ -1440,6 +1562,55 @@ impl MultiVectorIndex {
     pub fn build_fde_ann(&self, m: usize, ef_construct: usize) -> Result<usize, IndexError> {
         self.build_ann(None, m, ef_construct)
     }
+
+    /// Rebuild the FDE ANN graph if the delta overlay has grown past
+    /// `threshold_fraction` of the current base size.
+    ///
+    /// Returns `Some(n)` if a rebuild was triggered (n = new base node count),
+    /// `None` if the overlay is within bounds and no rebuild was needed.
+    ///
+    /// Typical threshold: `0.20` (rebuild when delta > 20% of base).
+    /// Call from a background thread or after a batch of writes.
+    pub fn auto_compact_fde_ann(
+        &self,
+        m: usize,
+        ef_construct: usize,
+        threshold_fraction: f64,
+    ) -> Result<Option<usize>, IndexError> {
+        let s = self.snapshot();
+        let should_compact = s.fde_ann.as_ref().is_some_and(|ann| {
+            let base = ann.base.ids.len().saturating_sub(ann.tombstones.len()) as f64;
+            let delta = ann.delta.len() as f64;
+            base > 0.0 && delta / base > threshold_fraction
+        });
+        if should_compact {
+            Ok(Some(self.build_fde_ann(m, ef_construct)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Rebuild the named dense ANN graph for `field` if its delta overlay has
+    /// grown past `threshold_fraction` of the base size.
+    pub fn auto_compact_dense_ann(
+        &self,
+        field: &str,
+        m: usize,
+        ef_construct: usize,
+        threshold_fraction: f64,
+    ) -> Result<Option<usize>, IndexError> {
+        let s = self.snapshot();
+        let should_compact = s.named_ann.get(field).is_some_and(|ann| {
+            let base = ann.base.ids.len().saturating_sub(ann.tombstones.len()) as f64;
+            let delta = ann.delta.len() as f64;
+            base > 0.0 && delta / base > threshold_fraction
+        });
+        if should_compact {
+            Ok(Some(self.build_dense_ann(field, m, ef_construct)?))
+        } else {
+            Ok(None)
+        }
+    }
     pub fn build_dense_ann(
         &self,
         field: &str,
@@ -1520,6 +1691,9 @@ impl MultiVectorIndex {
             )));
         }
         let count = ids.len();
+        // Persist before publishing so the file is on disk if we crash after
+        // the state swap. The file is overwritten atomically.
+        self.save_ann(field, built_generation, &ids, &hnsw);
         let by_id = ids
             .iter()
             .enumerate()

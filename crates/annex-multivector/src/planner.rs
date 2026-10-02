@@ -367,11 +367,12 @@ impl MultiVectorIndex {
         &self,
         state: &State,
         request: &'a RetrieveRequest,
+        eligible_documents: Option<(usize, FilterStrategy)>,
     ) -> (std::borrow::Cow<'a, RetrieveRequest>, Option<PolicyPlan>) {
         if request.planning_mode == PlanningMode::Manual {
             return (std::borrow::Cow::Borrowed(request), None);
         }
-        let stats = planner_stats(state, self.fde.output_dimension(), None);
+        let stats = planner_stats(state, self.fde.output_dimension(), eligible_documents);
         let mut policy = policy::generate_policy_prefetch(
             request.query.as_ref().expect("auto query validated"),
             &stats,
@@ -391,8 +392,6 @@ impl MultiVectorIndex {
     pub fn plan(&self, request: &RetrieveRequest) -> Result<RetrievalPlan, IndexError> {
         validate_request(request)?;
         let state = self.snapshot();
-        let (effective_request, policy_plan) = self.prepare_request(&state, request);
-        let request = effective_request.as_ref();
         let (eligible, filter_strategy) = request.filter.as_ref().map_or(
             (state.documents.len(), FilterStrategy::None),
             |filter| {
@@ -411,6 +410,10 @@ impl MultiVectorIndex {
                 )
             },
         );
+        let planner_filter = request.filter.as_ref().map(|_| (eligible, filter_strategy));
+        let (effective_request, policy_plan) =
+            self.prepare_request(&state, request, planner_filter);
+        let request = effective_request.as_ref();
         let mut plan = self.compile_plan(&state, request, eligible, filter_strategy)?;
         plan.policy = policy_plan;
         Ok(plan)
@@ -424,6 +427,11 @@ impl MultiVectorIndex {
         filter_strategy: FilterStrategy,
     ) -> Result<RetrievalPlan, IndexError> {
         validate_request(request)?;
+        if request.prefetch.is_empty() {
+            return Err(invalid(
+                "auto planning found no usable query representation",
+            ));
+        }
 
         let stats = planner_stats(
             state,

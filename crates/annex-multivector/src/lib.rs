@@ -14,8 +14,8 @@ pub use engine::{
     ContextPlan, Durability, FieldStats, FilterStats, FilterStrategy, Fusion, FusionOperator, Hit,
     IndexConfig, IndexError, IndexStats, LogicalChannel, LogicalChannelKind, LogicalFusion,
     LogicalPlan, MultiVectorIndex, PhysicalOperator, PlanEstimate, PlanReason, PlanStage,
-    PlannedChannel, PlannerStats, Predicate, QualityPreference, RankingSignals, Representation,
-    RepresentationKind, Rerank, RerankPlan, RetrievalDocument, RetrievalObjective, RetrievalPlan,
-    RetrievalResponse, RetrievalTrace, RetrieveRequest, UpsertDocument,
+    PlannedChannel, PlannerStats, Predicate, QualityPreference, QueryIntent, RankingSignals,
+    Representation, RepresentationKind, Rerank, RerankPlan, RetrievalDocument, RetrievalObjective,
+    RetrievalPlan, RetrievalResponse, RetrievalTrace, RetrieveRequest, UpsertDocument,
 };
 pub use fde::{MaxSimQuery, maxsim, maxsim_flat};

@@ -1325,6 +1325,7 @@ impl MultiVectorIndex {
         per_stage_actual_ms.push(parallel_stage_start.elapsed().as_secs_f64() * 1000.);
 
         let fusion_stage_start = Instant::now();
+        let fusion_candidates = lists.iter().map(Vec::len).sum();
         let agreement = if lists.len() > 1 {
             let head: HashSet<_> = lists[0]
                 .iter()
@@ -1380,7 +1381,20 @@ impl MultiVectorIndex {
             )
         };
         let fused_candidates = ranked.len();
-        per_stage_actual_ms.push(fusion_stage_start.elapsed().as_secs_f64() * 1000.);
+        let fusion_elapsed_ms = fusion_stage_start.elapsed().as_secs_f64() * 1000.;
+        self.calibration.lock().unwrap().observe(
+            planner::stage_calibration_key(
+                CalibrationTarget::Fusion(
+                    plan.fusion_operator()
+                        .expect("compiled plan has fusion stage"),
+                ),
+                0,
+                &plan.stats,
+            ),
+            planner::fusion_cost_units(fusion_candidates),
+            fusion_elapsed_ms,
+        );
+        per_stage_actual_ms.push(fusion_elapsed_ms);
 
         let mut reranked = 0;
         if let Some(rerank) = &request.rerank {
@@ -1422,13 +1436,47 @@ impl MultiVectorIndex {
                     .map(|h| (h.id, h.score))
                     .collect();
             }
-            per_stage_actual_ms.push(rerank_stage_start.elapsed().as_secs_f64() * 1000.);
+            let rerank_elapsed_ms = rerank_stage_start.elapsed().as_secs_f64() * 1000.;
+            self.calibration.lock().unwrap().observe(
+                planner::stage_calibration_key(
+                    CalibrationTarget::RerankMaxsim,
+                    self.config.dimension,
+                    &plan.stats,
+                ),
+                planner::rerank_cost_units(reranked, &plan.stats, self.config.dimension),
+                rerank_elapsed_ms,
+            );
+            per_stage_actual_ms.push(rerank_elapsed_ms);
         }
 
         let context_stage_start = Instant::now();
+        let context_candidates = ranked.len();
+        let context_operator = plan
+            .context_plan()
+            .expect("compiled plan has context stage")
+            .operator;
         let (matches, signals) =
             self.context(&s, ranked, &fused, eligible.as_ref(), request, agreement)?;
-        per_stage_actual_ms.push(context_stage_start.elapsed().as_secs_f64() * 1000.);
+        let context_elapsed_ms = context_stage_start.elapsed().as_secs_f64() * 1000.;
+        self.calibration.lock().unwrap().observe(
+            planner::stage_calibration_key(
+                CalibrationTarget::Context(context_operator),
+                if context_operator == ContextOperator::Mmr {
+                    self.config.dimension
+                } else {
+                    0
+                },
+                &plan.stats,
+            ),
+            planner::context_cost_units(
+                context_operator,
+                context_candidates,
+                request.limit,
+                self.config.dimension,
+            ),
+            context_elapsed_ms,
+        );
+        per_stage_actual_ms.push(context_elapsed_ms);
 
         Ok(RetrievalResponse {
             matches,
@@ -1925,7 +1973,15 @@ mod tests {
         );
         assert!(plan.parallel_channels()[0].estimated_latency_ms.is_some());
         assert!(plan.estimate.calibrated_parallel_p90_ms.is_some());
-        assert_eq!(index.calibration_snapshot().entries.len(), 2);
+        assert_eq!(
+            index
+                .calibration_snapshot()
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.key.target, CalibrationTarget::Channel(_)))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -2713,7 +2769,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_requests_are_rejected() {
+    fn invalid_and_uncalibrated_requests_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let index = index(dir.path());
         let query: RetrieveRequest = serde_json::from_value(json!({
@@ -2729,7 +2785,49 @@ mod tests {
         let mut query = request();
         query.objective.latency_budget_ms = Some(10.0);
         let error = index.plan(&query).unwrap_err();
-        assert!(error.to_string().contains("requires calibrated planning"));
+        assert!(error.to_string().contains("five observations"));
+
+        query.objective.latency_budget_ms = Some(0.0);
+        assert!(
+            index
+                .plan(&query)
+                .unwrap_err()
+                .to_string()
+                .contains("finite and positive")
+        );
+    }
+
+    #[test]
+    fn latency_budget_uses_calibrated_channel_and_post_retrieval_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut query = request();
+        query.rerank = Some(Rerank {
+            field: Some("tokens".into()),
+            vectors: vec![vec![1., 0.]],
+            limit: 3,
+            adaptive: None,
+        });
+
+        for _ in 0..5 {
+            index.retrieve(&query).unwrap();
+        }
+        query.objective.latency_budget_ms = Some(10_000.0);
+        let plan = index.plan(&query).unwrap();
+        assert!(plan.estimate.calibrated_parallel_p90_ms.is_some());
+        assert!(plan.estimate.calibrated_fusion_p90_ms.is_some());
+        assert!(plan.estimate.calibrated_rerank_p90_ms.is_some());
+        assert!(plan.estimate.calibrated_context_p90_ms.is_some());
+        assert!(plan.estimate.calibrated_total_p90_ms.is_some());
+
+        query.objective.latency_budget_ms = Some(f64::MIN_POSITIVE);
+        assert!(
+            index
+                .plan(&query)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds latency budget")
+        );
     }
 
     #[test]
@@ -3214,5 +3312,55 @@ mod tests {
         let gen0 = results[0].as_ref().unwrap().trace.plan.stats.generation;
         let gen2 = results[2].as_ref().unwrap().trace.plan.stats.generation;
         assert_eq!(gen0, gen2, "batch queries saw different generations");
+    }
+
+    #[test]
+    fn latency_budget_cold_start_error_and_warm_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+
+        // Build a single-channel query without reranking so the required
+        // stages are: channel + fusion (bypassed for 1 channel) + context.
+        let mut q: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [{"kind": "dense", "field": "semantic",
+                          "vector": [1., 0.], "limit": 3}],
+            "limit": 3,
+            "objective": {"latency_budget_ms": 1000.0}
+        }))
+        .unwrap();
+
+        // Cold start: no calibration data yet → error.
+        let err = index.plan(&q).unwrap_err();
+        assert!(
+            err.to_string().contains("five observations"),
+            "expected cold-start error, got: {err}"
+        );
+
+        // Warm all required stages: 5 retrieves record channel, fusion, and
+        // context observations. Reranking is absent, so its slot is zero.
+        q.objective.latency_budget_ms = None;
+        for _ in 0..5 {
+            index.retrieve(&q).unwrap();
+        }
+        q.objective.latency_budget_ms = Some(1000.0);
+
+        // A generous budget accepts the warmed plan.
+        let plan = index
+            .plan(&q)
+            .expect("warm plan should succeed with generous budget");
+        let total = plan.estimate.calibrated_total_p90_ms;
+        assert!(
+            total.is_some(),
+            "warmed plan should have total p90 estimate"
+        );
+        assert!(total.unwrap() < 1000.0);
+
+        // An impossibly tight budget is rejected.
+        q.objective.latency_budget_ms = Some(0.000_001);
+        let err = index.plan(&q).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds latency budget"),
+            "expected budget-exceeded error, got: {err}"
+        );
     }
 }

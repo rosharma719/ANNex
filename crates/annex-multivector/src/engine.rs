@@ -21,7 +21,7 @@ use annex::{
     utils::types::DistanceMetric,
     vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
 };
-pub use calibration::{CalibrationEntry, CalibrationKey, CalibrationSnapshot};
+pub use calibration::{CalibrationEntry, CalibrationKey, CalibrationSnapshot, CalibrationTarget};
 pub use planner::{
     ContextOperator, ContextPlan, FieldStats, FilterStats, FilterStrategy, FusionOperator,
     LogicalChannel, LogicalChannelKind, LogicalFusion, LogicalPlan, PhysicalOperator, PlanEstimate,

@@ -235,7 +235,7 @@ pub struct PlannedChannel {
     pub estimated_latency_ms: Option<f64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FusionOperator {
     NativeScore,
@@ -250,7 +250,7 @@ pub struct RerankPlan {
     pub adaptive: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextOperator {
     Ranked,
@@ -284,6 +284,16 @@ pub struct PlanEstimate {
     /// Sum of calibrated channel p90 values; useful as a CPU-work proxy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calibrated_channel_total_p90_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibrated_fusion_p90_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibrated_rerank_p90_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibrated_context_p90_ms: Option<f64>,
+    /// End-to-end estimate for the stages in this plan. This is available only
+    /// after every selected stage has enough observations in its workload bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibrated_total_p90_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -362,10 +372,12 @@ pub(super) fn validate_request(request: &RetrieveRequest) -> Result<(), IndexErr
     {
         return Err(invalid("invalid retrieval or context budgets"));
     }
-    if request.objective.latency_budget_ms.is_some() {
-        return Err(invalid(
-            "latency_budget_ms requires calibrated planning and is not supported",
-        ));
+    if request
+        .objective
+        .latency_budget_ms
+        .is_some_and(|budget| !budget.is_finite() || budget <= 0.0)
+    {
+        return Err(invalid("latency_budget_ms must be finite and positive"));
     }
     if request.objective.context_budget_tokens == Some(0) {
         return Err(invalid("invalid retrieval objective"));
@@ -528,7 +540,7 @@ impl MultiVectorIndex {
                     {
                         return Err(invalid("invalid BM25 query or parameters"));
                     }
-                    let cost = stats.token_documents as f64 * 10.0;
+                    let cost = stats.text_documents.max(1) as f64 * 10.0;
                     (
                         PhysicalOperator::Bm25,
                         PlanReason::LexicalIndex,
@@ -548,7 +560,12 @@ impl MultiVectorIndex {
                     vector
                         .canonicalized()
                         .map_err(|error| invalid(error.to_string()))?;
-                    let cost = stats.token_documents as f64 * 5.0;
+                    let cost = stats
+                        .fields
+                        .get(field)
+                        .map_or(1, |field| field.documents.max(1))
+                        as f64
+                        * 5.0;
                     (
                         PhysicalOperator::SparseDot,
                         PlanReason::SparseIndex,
@@ -851,20 +868,78 @@ impl MultiVectorIndex {
         let calibrated_channel_total_p90_ms = calibrated_channel_times
             .as_ref()
             .map(|times| times.iter().sum());
-        let fusion_cost = planned_channels.len() as f64 * 5.0;
+        let fusion_cost =
+            fusion_cost_units(planned_channels.iter().map(|channel| channel.limit).sum());
         let rerank_cost = rerank_plan.as_ref().map_or(0.0, |r| {
-            let candidates = r.candidate_limit as f64;
-            let avg_tokens =
-                (stats.token_vectors as f64 / stats.token_documents.max(1) as f64).max(1.0);
-            let dim = self.config.dimension as f64;
-            candidates * avg_tokens * dim * 2.0
+            rerank_cost_units(r.candidate_limit, &stats, self.config.dimension)
         });
-        let context_cost = request.limit as f64 * 2.0;
+        let context_pool = rerank_plan.as_ref().map_or_else(
+            || planned_channels.iter().map(|channel| channel.limit).sum(),
+            |rerank| rerank.candidate_limit,
+        );
+        let context_cost = context_cost_units(
+            context_plan.operator,
+            context_pool,
+            request.limit,
+            self.config.dimension,
+        );
+        let selectivity = stats.filter_stats.as_ref().map(|filter| filter.selectivity);
+        let fusion_key = calibration::key(
+            CalibrationTarget::Fusion(fusion_op),
+            0,
+            stats.documents,
+            selectivity,
+        );
+        let rerank_key = rerank_plan.as_ref().map(|_| {
+            calibration::key(
+                CalibrationTarget::RerankMaxsim,
+                self.config.dimension,
+                stats.documents,
+                selectivity,
+            )
+        });
+        let context_key = calibration::key(
+            CalibrationTarget::Context(context_plan.operator),
+            if context_plan.operator == ContextOperator::Mmr {
+                self.config.dimension
+            } else {
+                0
+            },
+            stats.documents,
+            selectivity,
+        );
+        let calibrated_fusion_p90_ms = calibration.estimate_ms(fusion_key, fusion_cost);
+        let calibrated_rerank_p90_ms =
+            rerank_key.and_then(|key| calibration.estimate_ms(key, rerank_cost));
+        let calibrated_rerank_stage_p90_ms = if rerank_plan.is_some() {
+            calibrated_rerank_p90_ms
+        } else {
+            Some(0.0)
+        };
+        let calibrated_context_p90_ms = calibration.estimate_ms(context_key, context_cost);
+        let calibrated_total_p90_ms = calibrated_parallel_p90_ms
+            .zip(calibrated_fusion_p90_ms)
+            .zip(calibrated_rerank_stage_p90_ms)
+            .zip(calibrated_context_p90_ms)
+            .map(|(((parallel, fusion), rerank), context)| parallel + fusion + rerank + context);
+
+        if let Some(budget) = request.objective.latency_budget_ms {
+            let estimate = calibrated_total_p90_ms.ok_or_else(|| {
+                invalid(
+                    "latency_budget_ms requires at least five observations for every selected stage",
+                )
+            })?;
+            if estimate > budget {
+                return Err(invalid(format!(
+                    "estimated p90 latency {estimate:.3} ms exceeds latency budget {budget:.3} ms"
+                )));
+            }
+        }
 
         let mut stages = Vec::with_capacity(4);
         stages.push(PlanStage::Parallel(planned_channels));
         stages.push(PlanStage::Fusion(fusion_op));
-        if let Some(rp) = rerank_plan {
+        if let Some(rp) = rerank_plan.clone() {
             stages.push(PlanStage::Rerank(rp));
         }
         stages.push(PlanStage::Context(context_plan));
@@ -883,6 +958,10 @@ impl MultiVectorIndex {
                 total_cost: parallel_total + fusion_cost + rerank_cost + context_cost,
                 calibrated_parallel_p90_ms,
                 calibrated_channel_total_p90_ms,
+                calibrated_fusion_p90_ms,
+                calibrated_rerank_p90_ms,
+                calibrated_context_p90_ms,
+                calibrated_total_p90_ms,
             },
             policy: None, // populated by plan()/retrieve() for non-Manual modes
         })
@@ -1019,7 +1098,43 @@ pub(super) fn calibration_key(
         PhysicalOperator::Bm25 | PhysicalOperator::SparseDot => 0,
     };
     calibration::key(
-        operator,
+        CalibrationTarget::Channel(operator),
+        dimension,
+        stats.documents,
+        stats.filter_stats.as_ref().map(|filter| filter.selectivity),
+    )
+}
+
+pub(super) fn fusion_cost_units(candidates: usize) -> f64 {
+    candidates.max(1) as f64
+}
+
+pub(super) fn rerank_cost_units(candidates: usize, stats: &PlannerStats, dimension: usize) -> f64 {
+    let avg_tokens = (stats.token_vectors as f64 / stats.token_documents.max(1) as f64).max(1.0);
+    candidates.max(1) as f64 * avg_tokens * dimension.max(1) as f64 * 2.0
+}
+
+pub(super) fn context_cost_units(
+    operator: ContextOperator,
+    candidates: usize,
+    result_limit: usize,
+    dimension: usize,
+) -> f64 {
+    match operator {
+        ContextOperator::Ranked => candidates.max(1) as f64,
+        ContextOperator::Mmr => {
+            candidates.max(1) as f64 * result_limit.max(1) as f64 * dimension.max(1) as f64
+        }
+    }
+}
+
+pub(super) fn stage_calibration_key(
+    target: CalibrationTarget,
+    dimension: usize,
+    stats: &PlannerStats,
+) -> CalibrationKey {
+    calibration::key(
+        target,
         dimension,
         stats.documents,
         stats.filter_stats.as_ref().map(|filter| filter.selectivity),
@@ -1040,8 +1155,17 @@ fn estimate_channel_cost(
     let log2_n = n.log2().ceil().max(1.0);
 
     match operator {
-        PhysicalOperator::Bm25 => stats.token_documents as f64 * 10.0,
-        PhysicalOperator::SparseDot => stats.token_documents as f64 * 5.0,
+        PhysicalOperator::Bm25 => stats.text_documents.max(1) as f64 * 10.0,
+        PhysicalOperator::SparseDot => match channel {
+            Channel::Sparse { field, .. } => {
+                stats
+                    .fields
+                    .get(field)
+                    .map_or(1, |field| field.documents.max(1)) as f64
+                    * 5.0
+            }
+            _ => unreachable!("sparse operator requires sparse channel"),
+        },
         PhysicalOperator::ExactDense => {
             let dim = channel_dim(channel, stats).max(1) as f64;
             f * dim * 2.0 * 13.0

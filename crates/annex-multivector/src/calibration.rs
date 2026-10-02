@@ -4,8 +4,28 @@ const MIN_OBSERVATIONS: u64 = 5;
 const ALPHA: f64 = 0.2;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "operator", rename_all = "snake_case")]
+pub enum CalibrationTarget {
+    Channel(PhysicalOperator),
+    Fusion(FusionOperator),
+    RerankMaxsim,
+    Context(ContextOperator),
+}
+
+impl CalibrationTarget {
+    fn sort_key(self) -> String {
+        match self {
+            Self::Channel(operator) => format!("channel/{}", operator.as_str()),
+            Self::Fusion(operator) => format!("fusion/{operator:?}"),
+            Self::RerankMaxsim => "rerank/maxsim".into(),
+            Self::Context(operator) => format!("context/{operator:?}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct CalibrationKey {
-    pub operator: PhysicalOperator,
+    pub target: CalibrationTarget,
     pub dimension_bucket: usize,
     pub corpus_bucket: usize,
     pub selectivity_bucket: u8,
@@ -70,7 +90,7 @@ impl CalibrationStats {
             .collect::<Vec<_>>();
         entries.sort_by_key(|entry| {
             (
-                entry.key.operator.as_str(),
+                entry.key.target.sort_key(),
                 entry.key.dimension_bucket,
                 entry.key.corpus_bucket,
                 entry.key.selectivity_bucket,
@@ -91,13 +111,13 @@ impl CalibrationSnapshot {
 }
 
 pub(super) fn key(
-    operator: PhysicalOperator,
+    target: CalibrationTarget,
     dimension: usize,
     documents: usize,
     selectivity: Option<f32>,
 ) -> CalibrationKey {
     CalibrationKey {
-        operator,
+        target,
         dimension_bucket: bucket(dimension, &[128, 256, 512, 1_024, 2_048]),
         corpus_bucket: bucket(documents, &[1_000, 10_000, 100_000, 1_000_000]),
         selectivity_bucket: match selectivity.unwrap_or(1.0) {
@@ -124,8 +144,18 @@ mod tests {
 
     #[test]
     fn calibration_is_gated_and_stratified() {
-        let dense = key(PhysicalOperator::ExactDense, 128, 10_000, Some(0.1));
-        let filtered = key(PhysicalOperator::ExactDense, 128, 10_000, Some(0.01));
+        let dense = key(
+            CalibrationTarget::Channel(PhysicalOperator::ExactDense),
+            128,
+            10_000,
+            Some(0.1),
+        );
+        let filtered = key(
+            CalibrationTarget::Channel(PhysicalOperator::ExactDense),
+            128,
+            10_000,
+            Some(0.01),
+        );
         let mut stats = CalibrationStats::default();
         for _ in 0..4 {
             stats.observe(dense, 100.0, 2.0);
@@ -139,7 +169,12 @@ mod tests {
 
     #[test]
     fn p90_penalizes_variable_operators() {
-        let key = key(PhysicalOperator::HnswDense, 768, 1_000_000, None);
+        let key = key(
+            CalibrationTarget::Channel(PhysicalOperator::HnswDense),
+            768,
+            1_000_000,
+            None,
+        );
         let mut stats = CalibrationStats::default();
         for elapsed in [1.0, 1.0, 1.0, 1.0, 5.0] {
             stats.observe(key, 1.0, elapsed);

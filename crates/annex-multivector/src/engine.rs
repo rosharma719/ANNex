@@ -34,7 +34,7 @@ pub use retrieval::{
     AdaptiveRerank, Channel, Chunk, ContextHit, ContextOptions, Fusion, Predicate, RankingSignals,
     Representation, Rerank, RetrievalDocument, RetrievalResponse, RetrievalTrace, RetrieveRequest,
 };
-use retrieval::{FieldSchema, Fields, RetrievalState};
+use retrieval::{DocSet, FieldSchema, Fields, RetrievalState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;

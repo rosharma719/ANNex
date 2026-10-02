@@ -207,6 +207,16 @@ fn channel_ef(base: usize, intent: QueryIntent) -> usize {
 
 const COVERAGE_THRESHOLD: f32 = 0.5;
 
+fn field_coverage(field: &FieldStats, stats: &PlannerStats, eligible: usize) -> f32 {
+    let documents = field.eligible_documents.unwrap_or(field.documents);
+    let denominator = if stats.filter_stats.is_some() {
+        eligible
+    } else {
+        stats.documents
+    };
+    documents as f32 / denominator.max(1) as f32
+}
+
 pub(super) fn generate_policy_prefetch(
     query: &QueryRepresentations,
     stats: &PlannerStats,
@@ -254,7 +264,7 @@ pub(super) fn generate_policy_prefetch(
 
     for (field, vec) in &query.dense {
         if let Some(field_stats) = stats.fields.get(field) {
-            let coverage = field_stats.documents as f32 / stats.documents.max(1) as f32;
+            let coverage = field_coverage(field_stats, stats, eligible);
             if coverage >= COVERAGE_THRESHOLD
                 && matches!(schema.get(field), Some(FieldSchema::Dense { .. }))
             {
@@ -299,7 +309,7 @@ pub(super) fn generate_policy_prefetch(
 
     for (field, vecs) in &query.multivector {
         if let Some(field_stats) = stats.fields.get(field) {
-            let coverage = field_stats.documents as f32 / stats.documents.max(1) as f32;
+            let coverage = field_coverage(field_stats, stats, eligible);
             if coverage >= COVERAGE_THRESHOLD
                 && matches!(schema.get(field), Some(FieldSchema::Multivector { .. }))
             {
@@ -397,6 +407,7 @@ mod tests {
                     kind: RepresentationKind::Dense,
                     dimension: Some(2),
                     documents: 1_000,
+                    eligible_documents: selectivity.map(|value| (1_000.0 * value) as usize),
                     graph_ready: true,
                 },
             )]),

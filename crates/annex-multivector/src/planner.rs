@@ -133,6 +133,9 @@ pub struct FieldStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dimension: Option<usize>,
     pub documents: usize,
+    /// Documents with this field inside the active filter, when filtered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eligible_documents: Option<usize>,
     pub graph_ready: bool,
 }
 
@@ -379,11 +382,17 @@ impl MultiVectorIndex {
         state: &State,
         request: &'a RetrieveRequest,
         eligible_documents: Option<(usize, FilterStrategy)>,
+        eligible_set: Option<&DocSet>,
     ) -> (std::borrow::Cow<'a, RetrieveRequest>, Option<PolicyPlan>) {
         if request.planning_mode == PlanningMode::Manual {
             return (std::borrow::Cow::Borrowed(request), None);
         }
-        let stats = planner_stats(state, self.fde.output_dimension(), eligible_documents);
+        let stats = planner_stats(
+            state,
+            self.fde.output_dimension(),
+            eligible_documents,
+            eligible_set,
+        );
         let mut policy = policy::generate_policy_prefetch(
             request.query.as_ref().expect("auto query validated"),
             &stats,
@@ -403,29 +412,42 @@ impl MultiVectorIndex {
     pub fn plan(&self, request: &RetrieveRequest) -> Result<RetrievalPlan, IndexError> {
         validate_request(request)?;
         let state = self.snapshot();
-        let (eligible, filter_strategy) = request.filter.as_ref().map_or(
-            (state.documents.len(), FilterStrategy::None),
-            |filter| {
-                state.retrieval.indexed_filter_count(filter).map_or_else(
-                    || {
-                        (
-                            state
-                                .documents
-                                .values()
-                                .filter(|document| filter.matches(&document.metadata))
-                                .count(),
-                            FilterStrategy::MetadataScan,
-                        )
-                    },
-                    |count| (count, FilterStrategy::MetadataIndex),
-                )
-            },
-        );
+        let (eligible_set, filter_strategy) =
+            request
+                .filter
+                .as_ref()
+                .map_or((None, FilterStrategy::None), |filter| {
+                    state.retrieval.indexed_filter_set(filter).map_or_else(
+                        || {
+                            (
+                                Some(DocSet::from_numbers(
+                                    state.retrieval.next_id(),
+                                    state
+                                        .documents
+                                        .iter()
+                                        .filter(|(_, document)| filter.matches(&document.metadata))
+                                        .filter_map(|(id, _)| state.retrieval.number(id)),
+                                )),
+                                FilterStrategy::MetadataScan,
+                            )
+                        },
+                        |set| (Some(set), FilterStrategy::MetadataIndex),
+                    )
+                });
+        let eligible = eligible_set
+            .as_ref()
+            .map_or(state.documents.len(), DocSet::len);
         let planner_filter = request.filter.as_ref().map(|_| (eligible, filter_strategy));
         let (effective_request, policy_plan) =
-            self.prepare_request(&state, request, planner_filter);
+            self.prepare_request(&state, request, planner_filter, eligible_set.as_ref());
         let request = effective_request.as_ref();
-        let mut plan = self.compile_plan(&state, request, eligible, filter_strategy)?;
+        let mut plan = self.compile_plan(
+            &state,
+            request,
+            eligible,
+            filter_strategy,
+            eligible_set.as_ref(),
+        )?;
         plan.policy = policy_plan;
         Ok(plan)
     }
@@ -436,6 +458,7 @@ impl MultiVectorIndex {
         request: &RetrieveRequest,
         eligible_documents: usize,
         filter_strategy: FilterStrategy,
+        eligible_set: Option<&DocSet>,
     ) -> Result<RetrievalPlan, IndexError> {
         validate_request(request)?;
         if request.prefetch.is_empty() {
@@ -451,6 +474,7 @@ impl MultiVectorIndex {
                 .filter
                 .as_ref()
                 .map(|_| (eligible_documents, filter_strategy)),
+            eligible_set,
         );
         let calibration = self.calibration_snapshot();
 
@@ -869,6 +893,7 @@ pub(super) fn planner_stats(
     state: &State,
     fde_dimension: usize,
     eligible_documents: Option<(usize, FilterStrategy)>,
+    eligible_set: Option<&DocSet>,
 ) -> PlannerStats {
     let fields = state
         .retrieval
@@ -894,6 +919,8 @@ pub(super) fn planner_stats(
                     kind,
                     dimension,
                     documents,
+                    eligible_documents: eligible_set
+                        .map(|eligible| state.retrieval.field_count_in(name, eligible)),
                     graph_ready: state.named_ann.contains_key(name),
                 },
             )

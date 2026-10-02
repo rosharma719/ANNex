@@ -70,6 +70,7 @@ pub(super) struct RetrievalState {
     lexical: SparseIndex,
     sparse: HashMap<String, SparseIndex>,
     schema: BTreeMap<String, FieldSchema>,
+    field_presence: HashMap<String, HashSet<u64>>,
     document_chunks: HashMap<u64, Chunk>,
     chunks: HashMap<String, BTreeMap<u32, BTreeSet<String>>>,
     metadata_eq: HashMap<MetadataKey, HashSet<u64>>,
@@ -95,7 +96,7 @@ pub(super) enum DocSet {
 }
 
 impl DocSet {
-    fn from_numbers<I>(next_id: u64, numbers: I) -> Self
+    pub(super) fn from_numbers<I>(next_id: u64, numbers: I) -> Self
     where
         I: IntoIterator<Item = u64>,
     {
@@ -299,6 +300,10 @@ impl RetrievalState {
         &self.schema
     }
 
+    pub(super) fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
     pub(super) fn has_sparse_field(&self, field: &str) -> bool {
         self.sparse.contains_key(field)
     }
@@ -328,6 +333,9 @@ impl RetrievalState {
             self.lexical.delete(number);
             for index in self.sparse.values() {
                 index.delete(number);
+            }
+            for documents in self.field_presence.values_mut() {
+                documents.remove(&number);
             }
             if let Some((equality, membership)) = self.metadata_keys.remove(&number) {
                 for key in equality {
@@ -437,6 +445,10 @@ impl RetrievalState {
                 )));
             }
             self.schema.insert(name.clone(), shape);
+            self.field_presence
+                .entry(name.clone())
+                .or_default()
+                .insert(number);
         }
         Ok(())
     }
@@ -498,6 +510,23 @@ impl RetrievalState {
         self.indexed_filter_numbers(filter)
     }
 
+    pub(super) fn field_count_in(&self, field: &str, eligible: &DocSet) -> usize {
+        let Some(documents) = self.field_presence.get(field) else {
+            return 0;
+        };
+        if eligible.len() < documents.len() {
+            eligible
+                .iter()
+                .filter(|number| documents.contains(number))
+                .count()
+        } else {
+            documents
+                .iter()
+                .filter(|number| eligible.contains(**number))
+                .count()
+        }
+    }
+
     pub(super) fn number(&self, id: &str) -> Option<u64> {
         self.by_id.get(id).copied()
     }
@@ -508,14 +537,6 @@ impl RetrievalState {
 
     pub(super) fn contains_external(&self, set: &DocSet, id: &str) -> bool {
         self.number(id).is_some_and(|number| set.contains(number))
-    }
-
-    pub(super) fn indexed_filter_count(&self, filter: &Predicate) -> Option<usize> {
-        if let Predicate::Eq { field, value } = filter {
-            let key = scalar_key(&predicate_pointer(field), value)?;
-            return Some(self.metadata_eq.get(&key).map_or(0, HashSet::len));
-        }
-        self.indexed_filter_numbers(filter).map(|ids| ids.len())
     }
 
     #[cfg(test)]
@@ -1098,10 +1119,17 @@ impl MultiVectorIndex {
             .filter
             .as_ref()
             .map(|_| (eligible_documents, filter_strategy));
-        let (effective_request, policy_plan) = self.prepare_request(&s, request, planner_filter);
+        let (effective_request, policy_plan) =
+            self.prepare_request(&s, request, planner_filter, eligible.as_ref());
         let request = effective_request.as_ref();
         let ann_filter = request.filter.as_ref().and_then(Predicate::ann_filter);
-        let mut plan = self.compile_plan(&s, request, eligible_documents, filter_strategy)?;
+        let mut plan = self.compile_plan(
+            &s,
+            request,
+            eligible_documents,
+            filter_strategy,
+            eligible.as_ref(),
+        )?;
         plan.policy = policy_plan;
         let mut per_stage_actual_ms: Vec<f64> = Vec::with_capacity(plan.stages.len());
 
@@ -2635,6 +2663,53 @@ mod tests {
         assert_eq!(plan.eligible_documents, 2);
         assert_eq!(plan.parallel_channels()[0].limit, 2);
         assert_eq!(plan.policy.unwrap().intent, QueryIntent::Lexical);
+    }
+
+    #[test]
+    fn auto_mode_uses_field_coverage_within_the_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
+        let documents = (0..10)
+            .map(|i| RetrievalDocument {
+                id: format!("doc-{i}"),
+                metadata: json!({"tenant": if i < 4 { "a" } else { "b" }}),
+                representations: if i < 4 {
+                    BTreeMap::from([(
+                        "semantic".into(),
+                        Representation::Dense {
+                            vector: vec![1.0, 0.0],
+                        },
+                    )])
+                } else {
+                    BTreeMap::new()
+                },
+                ..RetrievalDocument::default()
+            })
+            .collect();
+        index.upsert_records(documents).unwrap();
+        let mut query: RetrieveRequest = serde_json::from_value(json!({
+            "planning_mode": "auto",
+            "query": {"dense": {"semantic": [1.0, 0.0]}},
+            "filter": {"op": "eq", "field": "tenant", "value": "a"},
+            "limit": 2
+        }))
+        .unwrap();
+
+        let plan = index.plan(&query).unwrap();
+        let field = &plan.stats.fields["semantic"];
+        assert_eq!(field.documents, 4);
+        assert_eq!(field.eligible_documents, Some(4));
+        assert_eq!(plan.eligible_documents, 4);
+        assert_eq!(plan.parallel_channels().len(), 1);
+
+        query.filter = None;
+        assert!(
+            index
+                .plan(&query)
+                .unwrap_err()
+                .to_string()
+                .contains("no usable query representation")
+        );
     }
 
     #[test]

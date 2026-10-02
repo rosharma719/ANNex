@@ -7,6 +7,7 @@ use axum::{
 };
 use serde_json::json;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 const WRITE_PATHS: &[&str] = &[
     "/v1/vectors/upsert",
@@ -36,6 +37,10 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+fn ct_eq(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 fn unauthorized() -> Response {
@@ -75,7 +80,7 @@ pub async fn auth_middleware(
     if write {
         match (&config.write_key, token) {
             (None, _) => return forbidden(),
-            (Some(wk), Some(t)) if t == wk => {}
+            (Some(wk), Some(t)) if ct_eq(t, wk) => {}
             (Some(_), Some(_)) => return forbidden(),
             (Some(_), None) => return unauthorized(),
         }
@@ -84,13 +89,13 @@ pub async fn auth_middleware(
             .read_key
             .as_deref()
             .zip(token)
-            .map(|(rk, t)| t == rk)
+            .map(|(rk, t)| ct_eq(t, rk))
             .unwrap_or(false);
         let valid_write = config
             .write_key
             .as_deref()
             .zip(token)
-            .map(|(wk, t)| t == wk)
+            .map(|(wk, t)| ct_eq(t, wk))
             .unwrap_or(false);
 
         if !valid_read && !valid_write {

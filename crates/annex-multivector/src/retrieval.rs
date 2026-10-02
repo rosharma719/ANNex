@@ -3327,7 +3327,7 @@ mod tests {
 
         // Build a single-channel query without reranking so the required
         // stages are: channel + fusion (bypassed for 1 channel) + context.
-        let q: RetrieveRequest = serde_json::from_value(json!({
+        let mut q: RetrieveRequest = serde_json::from_value(json!({
             "prefetch": [{"kind": "dense", "field": "semantic",
                           "vector": [1., 0.], "limit": 3}],
             "limit": 3,
@@ -3375,7 +3375,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let index = index(dir.path());
-            let q: RetrieveRequest = serde_json::from_value(json!({
+            let mut q: RetrieveRequest = serde_json::from_value(json!({
                 "prefetch": [{"kind": "dense", "field": "semantic",
                               "vector": [1., 0.], "limit": 3}],
                 "limit": 3

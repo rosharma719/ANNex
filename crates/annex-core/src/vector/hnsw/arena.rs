@@ -1,30 +1,8 @@
-//! Stable-address storage primitives for concurrent HNSW operation.
+//! Stable-address chunked storage for concurrent HNSW readers.
 //!
-//! # Memory model
-//!
-//! The fundamental problem with a plain `Vec<f32>` for vector storage is
-//! reallocation: when the Vec grows, it may move all existing data to a new
-//! allocation, invalidating any `&[f32]` slices held by concurrent readers.
-//!
-//! Both types here solve this with the same strategy:
-//! - Backing storage is split into fixed-size **chunks**.
-//! - Each chunk is a `Box<[T]>` / `Box<[f32]>` allocated once and **never resized**.
-//!   Addresses inside a chunk are permanently stable.
-//! - Growing the arena appends a new chunk rather than moving existing data.
-//! - Readers acquire a **snapshot view** (`VectorArenaView` / `ChunkedArrayView`)
-//!   that holds an `Arc<[Arc<Chunk>]>`. The outer slice is immutable; a new one
-//!   is published atomically when a chunk is added. Readers who already hold a
-//!   snapshot are unaffected.
-//!
-//! # Hot-path usage
-//!
-//! ```text
-//! // Once per search — one Arc clone, short read-lock acquisition:
-//! let view = index.vectors.view();
-//!
-//! // ~2825 times inside BFS — zero locks, zero refcount operations:
-//! let vec: &[f32] = view.get(idx);
-//! ```
+//! Chunks never resize, so published element addresses remain valid. Snapshot
+//! views hold an immutable `Arc` to the chunk list and need no per-element lock;
+//! growth publishes a new list without affecting existing views.
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;

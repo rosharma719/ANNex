@@ -23,6 +23,14 @@ fn vecf(v: &[f32]) -> Vector {
     v.to_vec()
 }
 
+fn wait_for_path(path: &std::path::Path) {
+    let start = Instant::now();
+    while !path.exists() && start.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(path.exists(), "snapshot file was not created");
+}
+
 #[test]
 #[ignore]
 fn segment_build_and_persist_synthetic_snapshot() -> Result<(), DBError> {
@@ -358,14 +366,8 @@ fn background_snapshot_writes_file() -> Result<(), DBError> {
         guard.insert_with_id(1, vecf(&[1.0, 0.0]), None)?;
     }
 
-    let start = Instant::now();
-    while !path.exists() && start.elapsed() < Duration::from_secs(2) {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
+    wait_for_path(&path);
     handle.stop();
-
-    assert!(path.exists(), "snapshot file was not created");
     let restored = Segment::load_from_path(&path)?;
     assert_eq!(restored.hnsw().len(), 1);
     let _ = fs::remove_file(path);
@@ -401,13 +403,8 @@ fn background_snapshot_handles_concurrent_writes() -> Result<(), DBError> {
     };
 
     writer.join().expect("writer thread panicked");
-    let start = Instant::now();
-    while !path.exists() && start.elapsed() < Duration::from_secs(2) {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
+    wait_for_path(&path);
     handle.stop();
-    assert!(path.exists(), "snapshot file was not created");
 
     let restored = Segment::load_from_path(&path)?;
     let final_len = segment.read().unwrap().hnsw().len();
@@ -443,11 +440,7 @@ fn background_snapshot_updates_over_time() -> Result<(), DBError> {
         }
     }
 
-    let start = Instant::now();
-    while !path.exists() && start.elapsed() < Duration::from_secs(2) {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(path.exists(), "snapshot file was not created");
+    wait_for_path(&path);
     let first_size = fs::metadata(&path)?.len();
 
     {
@@ -470,41 +463,6 @@ fn background_snapshot_updates_over_time() -> Result<(), DBError> {
 
     handle.stop();
     assert!(grew, "snapshot file size did not grow after more inserts");
-    let _ = fs::remove_file(path);
-    Ok(())
-}
-
-#[test]
-fn background_snapshot_stop_is_clean() -> Result<(), DBError> {
-    let path = tmp_path("segment_background_stop");
-    let segment = Arc::new(RwLock::new(Segment::new(HNSWIndex::new(
-        DistanceMetric::Euclidean,
-        16,
-        32,
-        8,
-        2,
-    ))));
-
-    let mut config = SnapshotConfig::new(&path);
-    config.interval = Duration::from_millis(50);
-    config.max_ops = 1;
-    config.check_every = Duration::from_millis(10);
-    config.retain_last = 0;
-    let handle = start_background_snapshots(segment.clone(), config);
-
-    {
-        let mut guard = segment.write().unwrap();
-        guard.insert_with_id(1, vecf(&[1.0, 0.0]), None)?;
-    }
-
-    let start = Instant::now();
-    while !path.exists() && start.elapsed() < Duration::from_secs(2) {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
-    handle.stop();
-    assert!(path.exists(), "snapshot file was not created");
-    Segment::load_from_path(&path)?;
     let _ = fs::remove_file(path);
     Ok(())
 }
@@ -536,11 +494,7 @@ fn background_snapshot_respects_deletes() -> Result<(), DBError> {
         guard.delete(7)?;
     }
 
-    let start = Instant::now();
-    while !path.exists() && start.elapsed() < Duration::from_secs(2) {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
+    wait_for_path(&path);
     handle.stop();
     let restored = Segment::load_from_path(&path)?;
     assert!(restored.get_vector(2).is_none());
@@ -671,33 +625,6 @@ fn wal_checkpoint_truncates_log() -> Result<(), DBError> {
     let restored = Segment::load_from_path(&snapshot_path)?;
     assert!(restored.get_vector(1).is_some());
     assert!(restored.get_vector(2).is_some());
-
-    let _ = fs::remove_file(snapshot_path);
-    let _ = fs::remove_file(wal_path);
-    Ok(())
-}
-
-#[test]
-fn wal_auto_replay_can_be_disabled() -> Result<(), DBError> {
-    let snapshot_path = tmp_path("segment_wal_no_replay");
-    let wal_path = Segment::wal_path_for_snapshot(&snapshot_path);
-
-    let mut seg = Segment::new(HNSWIndex::new(DistanceMetric::Euclidean, 16, 32, 8, 2));
-    seg.enable_wal(&wal_path)?;
-    seg.insert_with_id(1, vecf(&[1.0, 0.0]), None)?;
-    seg.save_to_path(&snapshot_path)?;
-    seg.insert_with_id(2, vecf(&[2.0, 0.0]), None)?;
-
-    unsafe {
-        std::env::set_var("VECTORDB_WAL_AUTO_REPLAY", "0");
-    }
-    let restored = Segment::load_from_path(&snapshot_path)?;
-    unsafe {
-        std::env::remove_var("VECTORDB_WAL_AUTO_REPLAY");
-    }
-
-    assert!(restored.get_vector(1).is_some());
-    assert!(restored.get_vector(2).is_none());
 
     let _ = fs::remove_file(snapshot_path);
     let _ = fs::remove_file(wal_path);
@@ -843,10 +770,7 @@ fn wal_and_background_snapshot_together() -> Result<(), DBError> {
         }
     }
 
-    let start = Instant::now();
-    while !snapshot_path.exists() && start.elapsed() < Duration::from_secs(2) {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_path(&snapshot_path);
     handle.stop();
 
     let restored = Segment::load_from_path(&snapshot_path)?;

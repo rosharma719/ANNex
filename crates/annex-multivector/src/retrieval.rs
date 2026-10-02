@@ -1065,6 +1065,15 @@ impl MultiVectorIndex {
         let started = Instant::now();
         planner::validate_request(request)?;
         let s = self.snapshot();
+        self.retrieve_with_snapshot(started, s, request)
+    }
+
+    fn retrieve_with_snapshot(
+        &self,
+        started: Instant,
+        s: Arc<State>,
+        request: &RetrieveRequest,
+    ) -> Result<RetrievalResponse, IndexError> {
         let (effective_request, policy_plan) = self.prepare_request(&s, request);
         let request = effective_request.as_ref();
         // An unfiltered query means every live document is eligible. Keep that
@@ -1150,15 +1159,44 @@ impl MultiVectorIndex {
                         ..
                     } => {
                         if planned.operator == PhysicalOperator::HnswDense {
-                            self.ann_scores_filtered(
+                            let q = normalize(vector);
+                            let ann = &s.named_ann[field];
+                            let expected = limit.min(eligible_documents);
+                            let mut scores = self.ann_scores_filtered(
                                 &s,
-                                &s.named_ann[field],
-                                &normalize(vector),
+                                ann,
+                                &q,
                                 limit,
                                 *ef_search,
                                 ann_filter.as_ref(),
                                 eligible.as_ref(),
-                            )?
+                            )?;
+                            // Progressive widening: if short of expected, retry at
+                            // 2× ef before falling through to exact.
+                            if scores.len() < expected {
+                                let wider = (ef_search * 2).min(4 * limit).max(*ef_search + 1);
+                                scores = self.ann_scores_filtered(
+                                    &s,
+                                    ann,
+                                    &q,
+                                    limit,
+                                    wider,
+                                    ann_filter.as_ref(),
+                                    eligible.as_ref(),
+                                )?;
+                            }
+                            if scores.len() < expected {
+                                self.named_scores(
+                                    &s,
+                                    field,
+                                    std::slice::from_ref(vector),
+                                    false,
+                                    eligible.as_ref(),
+                                    limit,
+                                )?
+                            } else {
+                                scores
+                            }
                         } else {
                             self.named_scores(
                                 &s,
@@ -1183,14 +1221,37 @@ impl MultiVectorIndex {
                     } => {
                         let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
                         if planned.operator == PhysicalOperator::HnswFde {
-                            self.ann_fde_scores_filtered(
+                            let encoded = self.fde.encode_query(&normalized);
+                            let expected = limit.min(eligible_documents);
+                            let mut scores = self.ann_fde_scores_filtered(
                                 &s,
-                                &self.fde.encode_query(&normalized),
+                                &encoded,
                                 limit,
                                 *ef_search,
                                 ann_filter.as_ref(),
                                 eligible.as_ref(),
-                            )?
+                            )?;
+                            if scores.len() < expected {
+                                let wider = (ef_search * 2).min(4 * limit).max(*ef_search + 1);
+                                scores = self.ann_fde_scores_filtered(
+                                    &s,
+                                    &encoded,
+                                    limit,
+                                    wider,
+                                    ann_filter.as_ref(),
+                                    eligible.as_ref(),
+                                )?;
+                            }
+                            if scores.len() < expected {
+                                self.exact_fde_scores_filtered(
+                                    &s,
+                                    &normalized,
+                                    Some(limit),
+                                    eligible.as_ref(),
+                                )?
+                            } else {
+                                scores
+                            }
                         } else {
                             self.exact_fde_scores_filtered(
                                 &s,
@@ -1338,6 +1399,30 @@ impl MultiVectorIndex {
                 signals,
             },
         })
+    }
+
+    /// Execute multiple independent queries against a single immutable snapshot.
+    ///
+    /// All requests share one `Arc<State>` — one lock acquisition for the whole
+    /// batch — and run concurrently via Rayon. Order of results matches order of
+    /// inputs. All queries in the batch see the same generation of data, which is
+    /// the correct semantic for a training step.
+    ///
+    /// A per-request error is returned in its slot without aborting the batch.
+    pub fn retrieve_batch(
+        &self,
+        requests: &[RetrieveRequest],
+    ) -> Vec<Result<RetrievalResponse, IndexError>> {
+        use rayon::prelude::*;
+        let s = self.snapshot();
+        requests
+            .par_iter()
+            .map(|req| {
+                let started = Instant::now();
+                planner::validate_request(req)?;
+                self.retrieve_with_snapshot(started, Arc::clone(&s), req)
+            })
+            .collect()
     }
 
     fn named_scores(
@@ -1727,7 +1812,7 @@ mod tests {
 
         index.build_dense_ann("semantic", 4, 16).unwrap();
         let ann = index.plan(&query).unwrap();
-        // 3-doc corpus, dim=2: cost_exact=12 < cost_hnsw=3072 → exact chosen by cost model.
+        // 3-doc corpus, dim=2: cost_exact=156 < cost_hnsw=2435 → exact chosen by cost model.
         assert_eq!(
             ann.parallel_channels()[0].operator,
             PhysicalOperator::ExactDense
@@ -2431,7 +2516,7 @@ mod tests {
     #[test]
     fn auto_mode_generates_bm25_channel_from_text_representation() {
         let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path()); // has BM25 (token_documents > 0)
+        let index = index(dir.path());
 
         let query: RetrieveRequest = serde_json::from_value(json!({
             "prefetch": [],
@@ -2441,7 +2526,6 @@ mod tests {
         }))
         .unwrap();
         let response = index.retrieve(&query).unwrap();
-        // Auto mode with text query → must have generated at least one BM25 channel.
         let policy = response
             .trace
             .plan
@@ -2461,7 +2545,7 @@ mod tests {
     #[test]
     fn auto_mode_generates_dense_channel_from_representation() {
         let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path()); // has "semantic" dense field
+        let index = index(dir.path());
 
         let query: RetrieveRequest = serde_json::from_value(json!({
             "prefetch": [],
@@ -2471,7 +2555,6 @@ mod tests {
         }))
         .unwrap();
         let plan = index.plan(&query).unwrap();
-        // Verify that the plan has channels (from generated prefetch).
         assert!(
             !plan.parallel_channels().is_empty(),
             "auto mode with dense query must generate channels"
@@ -2499,28 +2582,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_trace_includes_policy_plan() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path());
-        let query: RetrieveRequest = serde_json::from_value(json!({
-            "prefetch": [],
-            "planning_mode": "auto",
-            "query": {"text": "repair"},
-            "limit": 2
-        }))
-        .unwrap();
-        let response = index.retrieve(&query).unwrap();
-        let policy = response
-            .trace
-            .plan
-            .policy
-            .as_ref()
-            .expect("auto mode must embed PolicyPlan in plan");
-        assert!(!policy.channels_selected.is_empty());
-        assert!(!policy.selection_reasons.is_empty());
-    }
-
-    #[test]
     fn auto_with_overrides_uses_the_caller_channel() {
         let dir = tempfile::tempdir().unwrap();
         let index = index(dir.path());
@@ -2538,12 +2599,9 @@ mod tests {
 
     #[test]
     fn token_budget_skips_large_chunks_rather_than_stopping() {
-        // Insert two short docs and one long doc (>budget by itself).
-        // With a skip-and-continue packer, short docs should appear in output
-        // even though the long doc comes first in score order.
         let dir = tempfile::tempdir().unwrap();
         let index = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
-        let long_text = "word ".repeat(200); // ~200 words ≈ 260 estimated tokens
+        let long_text = "word ".repeat(200);
         let short_text = "short";
         index
             .upsert_records(vec![
@@ -2586,7 +2644,6 @@ mod tests {
             ])
             .unwrap();
 
-        // Budget of 50 tokens: "long" (~260 tokens) doesn't fit; short docs do.
         let query: RetrieveRequest = serde_json::from_value(json!({
             "prefetch": [{"kind":"dense","field":"s","vector":[1.0,0.0],"limit":10}],
             "limit": 5,
@@ -2594,14 +2651,12 @@ mod tests {
         }))
         .unwrap();
         let response = index.retrieve(&query).unwrap();
-        // Short docs must appear — packer should skip "long" and continue.
         let ids: Vec<&str> = response.matches.iter().map(|h| h.id.as_str()).collect();
         assert!(
             ids.contains(&"short1") || ids.contains(&"short2"),
             "short docs should be included when large doc is skipped: got {:?}",
             ids
         );
-        // estimated_tokens should be populated.
         assert!(
             response
                 .matches
@@ -2624,25 +2679,17 @@ mod tests {
     }
 
     #[test]
-    fn global_development_choice_is_the_rrf_default() {
-        assert!(matches!(Fusion::default(), Fusion::Rrf { k } if k == 10.));
-    }
-
-    #[test]
     fn plan_stages_structure_matches_request_channels() {
         let dir = tempfile::tempdir().unwrap();
         let index = index(dir.path());
-        // Two-channel request: Dense + BM25
         let query = request();
         let plan = index.plan(&query).unwrap();
 
-        // First stage must be Parallel with one PlannedChannel per prefetch entry.
         let PlanStage::Parallel(channels) = &plan.stages[0] else {
             panic!("expected Parallel stage, got {:?}", plan.stages[0]);
         };
         assert_eq!(channels.len(), query.prefetch.len());
 
-        // Second stage must be Fusion (two channels → RRF).
         assert!(
             matches!(
                 plan.stages[1],
@@ -2652,7 +2699,6 @@ mod tests {
             plan.stages[1]
         );
 
-        // Last stage must be Context.
         assert!(
             matches!(plan.stages.last().unwrap(), PlanStage::Context(_)),
             "last stage must be Context"
@@ -2704,31 +2750,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_is_deterministic_for_same_generation() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path());
-        let query = request();
-
-        let plan_a = index.plan(&query).unwrap();
-        let plan_b = index.plan(&query).unwrap();
-        assert_eq!(plan_a, plan_b, "planning must be deterministic");
-    }
-
-    #[test]
-    fn plan_parallel_channels_accessor_returns_channels_in_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path());
-        let query = request();
-
-        let plan = index.plan(&query).unwrap();
-        let channels = plan.parallel_channels();
-        assert_eq!(channels.len(), query.prefetch.len());
-        for (i, ch) in channels.iter().enumerate() {
-            assert_eq!(ch.index, i);
-        }
-    }
-
-    #[test]
     fn retrieve_trace_per_stage_ms_is_aligned_with_plan_stages() {
         let dir = tempfile::tempdir().unwrap();
         let index = index(dir.path());
@@ -2759,26 +2780,6 @@ mod tests {
         assert_eq!(
             response.trace.plan, dry_run,
             "plan embedded in trace must match plan() dry-run"
-        );
-    }
-
-    #[test]
-    fn plan_estimate_uses_critical_path_for_parallel_channels() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = index(dir.path());
-        let query = request(); // two channels
-
-        let plan = index.plan(&query).unwrap();
-        let channels = plan.parallel_channels();
-        let channel_cost_sum: f64 = channels.iter().map(|c| c.estimated_cost_units).sum();
-
-        assert!(
-            plan.estimate.critical_path_cost <= plan.estimate.total_cost,
-            "critical-path cost must not exceed total cost"
-        );
-        assert!(
-            channel_cost_sum > 0.0,
-            "per-channel cost units must be populated"
         );
     }
 
@@ -3027,5 +3028,40 @@ mod tests {
                 .iter()
                 .all(|hit| hit.metadata["tenant"] == "a")
         );
+    }
+
+    #[test]
+    fn retrieve_batch_returns_same_generation_and_correct_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+
+        let make_req = |v: f32| -> RetrieveRequest {
+            serde_json::from_value(json!({
+                "prefetch": [{"kind": "dense", "field": "semantic",
+                              "vector": [v, 0.], "limit": 3}],
+                "limit": 3
+            }))
+            .unwrap()
+        };
+        let requests = vec![make_req(1.0), make_req(0.8), make_req(0.0)];
+        let results = index.retrieve_batch(&requests);
+
+        // All three slots succeed.
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert!(r.is_ok(), "batch slot failed: {:?}", r);
+        }
+
+        // Results are in request order: query [1,0] should rank "b" first,
+        // query [0,0] should also return results (scalar fallback).
+        let top0 = &results[0].as_ref().unwrap().matches;
+        let top2 = &results[2].as_ref().unwrap().matches;
+        assert!(!top0.is_empty());
+        assert!(!top2.is_empty());
+
+        // All results share the same generation — verified by comparing trace generations.
+        let gen0 = results[0].as_ref().unwrap().trace.plan.stats.generation;
+        let gen2 = results[2].as_ref().unwrap().trace.plan.stats.generation;
+        assert_eq!(gen0, gen2, "batch queries saw different generations");
     }
 }

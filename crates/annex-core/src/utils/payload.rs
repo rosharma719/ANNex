@@ -16,17 +16,14 @@ pub enum PayloadValue {
     ListBool(Vec<bool>),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Payload(pub HashMap<String, PayloadValue>);
 
-//Wrapper around a HashMap<String, PayloadValue>
 impl Payload {
-    //Setter for key and value
     pub fn set(&mut self, key: &str, value: PayloadValue) {
         self.0.insert(key.to_string(), value);
     }
 
-    //Getter for value given key
     pub fn get(&self, key: &str) -> Option<&PayloadValue> {
         self.0.get(key)
     }
@@ -37,60 +34,37 @@ impl Payload {
         op: ScalarComparisonOp,
         other: &PayloadValue,
     ) -> Result<bool, DBError> {
-        match self.get(field) {
-            Some(value) => {
-                match (value, other) {
-                    // Handle ListStr comparison
-                    (PayloadValue::ListStr(l), PayloadValue::ListStr(o)) => {
-                        match op {
-                            ScalarComparisonOp::Eq => {
-                                let result = l == o;
-                                log::debug!(target: "payload", "Result of Eq comparison: {}", result);
-                                Ok(result)
-                            }
-                            ScalarComparisonOp::Neq => {
-                                let result = l != o;
-                                Ok(result)
-                            }
-                            _ => {
-                                log::warn!(target: "payload", "Invalid operation for ListStr.");
-                                Err(DBError::InvalidPayload("Invalid operation for ListStr".into()))
-                            }
-                        }
-                    },(PayloadValue::ListStr(l), PayloadValue::Str(s)) => {
-                        match op {
-                            ScalarComparisonOp::Eq => {
-                                let result = l.contains(s);
-                                Ok(result)
-                            },
-                            ScalarComparisonOp::Neq => {
-                                let result = !l.contains(s);
-                                Ok(result)
-                            },
-                            _ => {
-                                Err(DBError::InvalidPayload("Invalid operation for ListStr and Str".into()))
-                            }
-                        }
-                    }
-                    ,
-                    // Handle other types like Int, Float, etc.
-                    _ => {
-                        let result = value.compare_scalar(op, other);
-                        match result {
-                            Some(res) => {
-                                Ok(res)
-                            },
-                            None => {
-                                Err(DBError::InvalidPayload(format!("Type mismatch for field: {field}")))
-                            }
-                        }
-                    }
-                }
-            }
-            None => {
-                log::debug!(target: "payload", "Field '{}' is missing from the payload.", field);
-                Ok(false)
-            }
+        let Some(value) = self.get(field) else {
+            log::debug!(target: "payload", "Field '{}' is missing from the payload.", field);
+            return Ok(false);
+        };
+        match (value, other, op) {
+            (
+                PayloadValue::ListStr(values),
+                PayloadValue::ListStr(expected),
+                ScalarComparisonOp::Eq,
+            ) => Ok(values == expected),
+            (
+                PayloadValue::ListStr(values),
+                PayloadValue::ListStr(expected),
+                ScalarComparisonOp::Neq,
+            ) => Ok(values != expected),
+            (
+                PayloadValue::ListStr(values),
+                PayloadValue::Str(expected),
+                ScalarComparisonOp::Eq,
+            ) => Ok(values.contains(expected)),
+            (
+                PayloadValue::ListStr(values),
+                PayloadValue::Str(expected),
+                ScalarComparisonOp::Neq,
+            ) => Ok(!values.contains(expected)),
+            (PayloadValue::ListStr(_), _, _) => Err(DBError::InvalidPayload(
+                "Invalid operation for ListStr".into(),
+            )),
+            _ => value.compare_scalar(op, other).ok_or_else(|| {
+                DBError::InvalidPayload(format!("Type mismatch for field: {field}"))
+            }),
         }
     }
 
@@ -233,11 +207,5 @@ impl PayloadValue {
             ScalarComparisonOp::Gt => a > b,
             ScalarComparisonOp::Gte => a >= b,
         }
-    }
-}
-
-impl Default for Payload {
-    fn default() -> Self {
-        Payload(HashMap::new())
     }
 }

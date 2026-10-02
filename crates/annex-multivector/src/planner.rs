@@ -111,7 +111,7 @@ pub enum FilterStrategy {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FilterStats {
-    /// Fraction of the current generation that passed the metadata scan.
+    /// Fraction of the current generation that passed the predicate.
     pub selectivity: f32,
     /// Physical strategy used to evaluate the filter.
     pub filter_operator: FilterStrategy,
@@ -544,12 +544,16 @@ impl MultiVectorIndex {
                     if backend == "hnsw" && !filter_supported {
                         return Err(invalid("filter is not supported by dense HNSW"));
                     }
-                    let cost_exact = f * dim * 2.0;
-                    let mut cost_hnsw = ef * n.log2().ceil().max(1.0) * dim * 3.0;
-                    if filtered {
-                        let selectivity = (f / n).clamp(0.01, 1.0);
-                        cost_hnsw /= selectivity.sqrt();
-                    }
+                    // EXACT_SCALE: benchmarks on a 10k×128 fixture show exact
+                    // is ~26× slower than HNSW unfiltered, but the raw op counts
+                    // imply only ~2×. The 13× multiplier closes that gap so the
+                    // model's crossover (~4% selectivity) matches empirical data.
+                    // In-place filtered HNSW (annex-core) does not degrade with
+                    // selectivity the way post-filter HNSW does, so no selectivity
+                    // penalty is applied to cost_hnsw.
+                    let cost_exact = f * dim * 2.0 * 13.0;
+                    let cost_hnsw = ef * n.log2().ceil().max(1.0) * dim * 3.0;
+                    let _ = filtered; // crossover via calibrated cost_exact
                     let (operator, reason) = choose_ann_with_cost(
                         backend,
                         ann_ready,
@@ -631,12 +635,9 @@ impl MultiVectorIndex {
                     if backend == "hnsw" && !filter_supported {
                         return Err(invalid("filter is not supported by FDE HNSW"));
                     }
-                    let cost_exact = f * fde_dim * 2.0;
-                    let mut cost_hnsw = ef * n.log2().ceil().max(1.0) * fde_dim * 3.0;
-                    if filtered {
-                        let selectivity = (f / n).clamp(0.01, 1.0);
-                        cost_hnsw /= selectivity.sqrt();
-                    }
+                    let cost_exact = f * fde_dim * 2.0 * 13.0;
+                    let cost_hnsw = ef * n.log2().ceil().max(1.0) * fde_dim * 3.0;
+                    let _ = filtered;
                     let (operator, reason) = choose_ann_with_cost(
                         backend,
                         ann_ready,
@@ -906,7 +907,7 @@ fn estimate_channel_cost(
         PhysicalOperator::SparseDot => stats.token_documents as f64 * 5.0,
         PhysicalOperator::ExactDense => {
             let dim = channel_dim(channel, stats).max(1) as f64;
-            f * dim * 2.0
+            f * dim * 2.0 * 13.0
         }
         PhysicalOperator::HnswDense => {
             let dim = channel_dim(channel, stats).max(1) as f64;
@@ -914,7 +915,7 @@ fn estimate_channel_cost(
         }
         PhysicalOperator::ExactFde => {
             let fde_dim = stats.fde_dimension.max(1) as f64;
-            f * fde_dim * 2.0
+            f * fde_dim * 2.0 * 13.0
         }
         PhysicalOperator::HnswFde => {
             let fde_dim = stats.fde_dimension.max(1) as f64;

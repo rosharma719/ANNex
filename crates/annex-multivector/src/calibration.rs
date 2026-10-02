@@ -3,7 +3,7 @@ use super::*;
 const MIN_OBSERVATIONS: u64 = 5;
 const ALPHA: f64 = 0.2;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "operator", rename_all = "snake_case")]
 pub enum CalibrationTarget {
     Channel(PhysicalOperator),
@@ -23,7 +23,7 @@ impl CalibrationTarget {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct CalibrationKey {
     pub target: CalibrationTarget,
     pub dimension_bucket: usize,
@@ -31,15 +31,16 @@ pub struct CalibrationKey {
     pub selectivity_bucket: u8,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationEntry {
     pub key: CalibrationKey,
     pub observations: u64,
     pub mean_ms_per_cost_unit: f64,
+    pub variance_ms_per_cost_unit: f64,
     pub p90_ms_per_cost_unit: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationSnapshot {
     pub entries: Vec<CalibrationEntry>,
 }
@@ -51,9 +52,16 @@ struct RunningCalibration {
     variance: f64,
 }
 
+/// Number of observations between automatic calibration flushes to disk.
+/// Low enough to avoid losing a full warm-up on crashes; high enough not
+/// to dominate retrieve() latency with file I/O.
+pub(super) const AUTOSAVE_INTERVAL: u64 = 50;
+
 #[derive(Debug, Default)]
 pub(super) struct CalibrationStats {
     entries: HashMap<CalibrationKey, RunningCalibration>,
+    /// Total observations since the last save, used to trigger autosave.
+    pub(super) since_save: u64,
 }
 
 impl CalibrationStats {
@@ -68,6 +76,7 @@ impl CalibrationStats {
         let sample = elapsed_ms / cost_units;
         let entry = self.entries.entry(key).or_default();
         entry.observations += 1;
+        self.since_save += 1;
         if entry.observations == 1 {
             entry.mean = sample;
             return;
@@ -85,6 +94,7 @@ impl CalibrationStats {
                 key,
                 observations: value.observations,
                 mean_ms_per_cost_unit: value.mean,
+                variance_ms_per_cost_unit: value.variance,
                 p90_ms_per_cost_unit: value.mean + 1.282 * value.variance.sqrt(),
             })
             .collect::<Vec<_>>();
@@ -97,6 +107,21 @@ impl CalibrationStats {
             )
         });
         CalibrationSnapshot { entries }
+    }
+
+    pub(super) fn restore(&mut self, snapshot: &CalibrationSnapshot) {
+        self.entries.clear();
+        for entry in &snapshot.entries {
+            self.entries.insert(
+                entry.key,
+                RunningCalibration {
+                    observations: entry.observations,
+                    mean: entry.mean_ms_per_cost_unit,
+                    variance: entry.variance_ms_per_cost_unit,
+                },
+            );
+        }
+        self.since_save = 0;
     }
 }
 

@@ -1478,6 +1478,12 @@ impl MultiVectorIndex {
         );
         per_stage_actual_ms.push(context_elapsed_ms);
 
+        // Autosave calibration every AUTOSAVE_INTERVAL observations so data
+        // survives process exit even without explicit flush_calibration().
+        if self.calibration.lock().unwrap().since_save >= calibration::AUTOSAVE_INTERVAL {
+            self.save_calibration();
+        }
+
         Ok(RetrievalResponse {
             matches,
             trace: RetrievalTrace {
@@ -3362,5 +3368,53 @@ mod tests {
             err.to_string().contains("exceeds latency budget"),
             "expected budget-exceeded error, got: {err}"
         );
+    }
+
+    #[test]
+    fn calibration_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let index = index(dir.path());
+            let mut q: RetrieveRequest = serde_json::from_value(json!({
+                "prefetch": [{"kind": "dense", "field": "semantic",
+                              "vector": [1., 0.], "limit": 3}],
+                "limit": 3
+            }))
+            .unwrap();
+            // Warm calibration for all required stages.
+            for _ in 0..5 {
+                index.retrieve(&q).unwrap();
+            }
+            // Explicit flush ensures the data is on disk before drop.
+            index.flush_calibration();
+
+            // Verify calibration is warm before closing.
+            q.objective.latency_budget_ms = Some(1000.0);
+            index.plan(&q).expect("warm index should accept budget");
+        }
+        // Reopen the index — calibration must be restored from disk.
+        {
+            let index = MultiVectorIndex::open_existing(dir.path(), Durability::Buffered)
+                .expect("reopen index");
+            let q: RetrieveRequest = serde_json::from_value(json!({
+                "prefetch": [{"kind": "dense", "field": "semantic",
+                              "vector": [1., 0.], "limit": 3}],
+                "limit": 3,
+                "objective": {"latency_budget_ms": 1000.0}
+            }))
+            .unwrap();
+            // No additional retrieves — calibration should already be warm.
+            index
+                .plan(&q)
+                .expect("reopened index should have persisted calibration");
+
+            // Snapshot should contain loaded entries.
+            let snap = index.calibration_snapshot();
+            assert!(
+                !snap.entries.is_empty(),
+                "calibration should survive reopen"
+            );
+            assert!(snap.entries.iter().all(|e| e.observations >= 5));
+        }
     }
 }

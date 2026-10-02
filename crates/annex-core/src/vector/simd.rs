@@ -15,10 +15,11 @@ pub enum CpuLevel {
 pub fn cpu_level() -> CpuLevel {
     #[cfg(target_arch = "aarch64")]
     {
-        if std::arch::is_aarch64_feature_detected!("dotprod") {
-            return CpuLevel::NeonDotprod;
-        }
-        return CpuLevel::Neon;
+        return if std::arch::is_aarch64_feature_detected!("dotprod") {
+            CpuLevel::NeonDotprod
+        } else {
+            CpuLevel::Neon
+        };
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -42,8 +43,12 @@ pub fn cpu_level() -> CpuLevel {
         if std::arch::is_x86_feature_detected!("avx2") {
             return CpuLevel::Avx2;
         }
+        CpuLevel::Scalar
     }
-    CpuLevel::Scalar
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        CpuLevel::Scalar
+    }
 }
 
 #[cfg(test)]

@@ -111,7 +111,7 @@ pub enum FilterStrategy {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FilterStats {
-    /// Fraction of the current generation that passed the metadata scan.
+    /// Fraction of the current generation that passed the predicate.
     pub selectivity: f32,
     /// Physical strategy used to evaluate the filter.
     pub filter_operator: FilterStrategy,

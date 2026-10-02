@@ -21,6 +21,7 @@ experiments/
 **/benchmark/cache/
 **/benchmark/results/
 **/benchmark/reports/
+/crates/annex-kernel-bench/results/
 /crates/annex-core/bench/nyt256/results*
 .venv/
 .claude/

@@ -1074,8 +1074,6 @@ impl MultiVectorIndex {
         s: Arc<State>,
         request: &RetrieveRequest,
     ) -> Result<RetrievalResponse, IndexError> {
-        let (effective_request, policy_plan) = self.prepare_request(&s, request);
-        let request = effective_request.as_ref();
         // An unfiltered query means every live document is eligible. Keep that
         // state implicit: materializing a HashSet of every ID makes an HNSW
         // query O(collection size) before graph traversal even begins.
@@ -1096,6 +1094,12 @@ impl MultiVectorIndex {
             }
         });
         let eligible_documents = eligible.as_ref().map_or(s.documents.len(), DocSet::len);
+        let planner_filter = request
+            .filter
+            .as_ref()
+            .map(|_| (eligible_documents, filter_strategy));
+        let (effective_request, policy_plan) = self.prepare_request(&s, request, planner_filter);
+        let request = effective_request.as_ref();
         let ann_filter = request.filter.as_ref().and_then(Predicate::ann_filter);
         let mut plan = self.compile_plan(&s, request, eligible_documents, filter_strategy)?;
         plan.policy = policy_plan;
@@ -2559,6 +2563,26 @@ mod tests {
             !plan.parallel_channels().is_empty(),
             "auto mode with dense query must generate channels"
         );
+    }
+
+    #[test]
+    fn auto_mode_uses_filter_cardinality_for_candidate_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [],
+            "planning_mode": "auto",
+            "query": {"text": "E123"},
+            "objective": {"quality": "high"},
+            "filter": {"op": "eq", "field": "tenant", "value": "a"},
+            "limit": 1
+        }))
+        .unwrap();
+
+        let plan = index.plan(&query).unwrap();
+        assert_eq!(plan.eligible_documents, 2);
+        assert_eq!(plan.parallel_channels()[0].limit, 2);
+        assert_eq!(plan.policy.unwrap().intent, QueryIntent::Lexical);
     }
 
     #[test]

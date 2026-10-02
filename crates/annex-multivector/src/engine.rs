@@ -25,7 +25,7 @@ pub use planner::{
     PlanReason, PlanStage, PlannedChannel, PlannerStats, QualityPreference, RepresentationKind,
     RerankPlan, RetrievalObjective, RetrievalPlan,
 };
-pub use policy::{PlanningMode, PolicyPlan, QueryRepresentations};
+pub use policy::{PlanningMode, PolicyPlan, QueryIntent, QueryRepresentations};
 use rayon::prelude::*;
 pub use retrieval::{
     AdaptiveRerank, Channel, Chunk, ContextHit, ContextOptions, Fusion, Predicate, RankingSignals,

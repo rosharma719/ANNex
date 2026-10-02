@@ -1,3 +1,5 @@
+#[path = "calibration.rs"]
+mod calibration;
 #[path = "planner.rs"]
 mod planner;
 #[path = "policy.rs"]
@@ -19,19 +21,20 @@ use annex::{
     utils::types::DistanceMetric,
     vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
 };
+pub use calibration::{CalibrationEntry, CalibrationKey, CalibrationSnapshot, CalibrationTarget};
 pub use planner::{
     ContextOperator, ContextPlan, FieldStats, FilterStats, FilterStrategy, FusionOperator,
     LogicalChannel, LogicalChannelKind, LogicalFusion, LogicalPlan, PhysicalOperator, PlanEstimate,
     PlanReason, PlanStage, PlannedChannel, PlannerStats, QualityPreference, RepresentationKind,
     RerankPlan, RetrievalObjective, RetrievalPlan,
 };
-pub use policy::{PlanningMode, PolicyPlan, QueryRepresentations};
+pub use policy::{PlanningMode, PolicyPlan, QueryIntent, QueryRepresentations};
 use rayon::prelude::*;
 pub use retrieval::{
     AdaptiveRerank, Channel, Chunk, ContextHit, ContextOptions, Fusion, Predicate, RankingSignals,
     Representation, Rerank, RetrievalDocument, RetrievalResponse, RetrievalTrace, RetrieveRequest,
 };
-use retrieval::{FieldSchema, Fields, RetrievalState};
+use retrieval::{DocSet, FieldSchema, Fields, RetrievalState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -402,6 +405,7 @@ pub struct MultiVectorIndex {
     fde: FdeEncoder,
     state: RwLock<Arc<State>>,
     writer: Mutex<()>,
+    calibration: Mutex<calibration::CalibrationStats>,
     durability: Durability,
     // One process/handle owns append offsets and manifest publication at a time.
     _directory_lock: DirectoryLock,
@@ -792,6 +796,7 @@ impl MultiVectorIndex {
                 )
             },
             writer: Mutex::new(()),
+            calibration: Mutex::new(calibration::CalibrationStats::default()),
             durability,
             _directory_lock: directory_lock,
             state: RwLock::new(Arc::new(State {
@@ -829,6 +834,10 @@ impl MultiVectorIndex {
     }
     fn snapshot(&self) -> Arc<State> {
         Arc::clone(&self.state.read().unwrap())
+    }
+
+    pub fn calibration_snapshot(&self) -> CalibrationSnapshot {
+        self.calibration.lock().unwrap().snapshot()
     }
 
     fn validate(&self, v: &[Vector]) -> Result<(), IndexError> {

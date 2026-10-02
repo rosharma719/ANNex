@@ -70,6 +70,7 @@ pub(super) struct RetrievalState {
     lexical: SparseIndex,
     sparse: HashMap<String, SparseIndex>,
     schema: BTreeMap<String, FieldSchema>,
+    field_presence: HashMap<String, HashSet<u64>>,
     document_chunks: HashMap<u64, Chunk>,
     chunks: HashMap<String, BTreeMap<u32, BTreeSet<String>>>,
     metadata_eq: HashMap<MetadataKey, HashSet<u64>>,
@@ -95,7 +96,7 @@ pub(super) enum DocSet {
 }
 
 impl DocSet {
-    fn from_numbers<I>(next_id: u64, numbers: I) -> Self
+    pub(super) fn from_numbers<I>(next_id: u64, numbers: I) -> Self
     where
         I: IntoIterator<Item = u64>,
     {
@@ -299,6 +300,10 @@ impl RetrievalState {
         &self.schema
     }
 
+    pub(super) fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
     pub(super) fn has_sparse_field(&self, field: &str) -> bool {
         self.sparse.contains_key(field)
     }
@@ -328,6 +333,9 @@ impl RetrievalState {
             self.lexical.delete(number);
             for index in self.sparse.values() {
                 index.delete(number);
+            }
+            for documents in self.field_presence.values_mut() {
+                documents.remove(&number);
             }
             if let Some((equality, membership)) = self.metadata_keys.remove(&number) {
                 for key in equality {
@@ -437,6 +445,10 @@ impl RetrievalState {
                 )));
             }
             self.schema.insert(name.clone(), shape);
+            self.field_presence
+                .entry(name.clone())
+                .or_default()
+                .insert(number);
         }
         Ok(())
     }
@@ -498,6 +510,23 @@ impl RetrievalState {
         self.indexed_filter_numbers(filter)
     }
 
+    pub(super) fn field_count_in(&self, field: &str, eligible: &DocSet) -> usize {
+        let Some(documents) = self.field_presence.get(field) else {
+            return 0;
+        };
+        if eligible.len() < documents.len() {
+            eligible
+                .iter()
+                .filter(|number| documents.contains(number))
+                .count()
+        } else {
+            documents
+                .iter()
+                .filter(|number| eligible.contains(**number))
+                .count()
+        }
+    }
+
     pub(super) fn number(&self, id: &str) -> Option<u64> {
         self.by_id.get(id).copied()
     }
@@ -508,14 +537,6 @@ impl RetrievalState {
 
     pub(super) fn contains_external(&self, set: &DocSet, id: &str) -> bool {
         self.number(id).is_some_and(|number| set.contains(number))
-    }
-
-    pub(super) fn indexed_filter_count(&self, filter: &Predicate) -> Option<usize> {
-        if let Predicate::Eq { field, value } = filter {
-            let key = scalar_key(&predicate_pointer(field), value)?;
-            return Some(self.metadata_eq.get(&key).map_or(0, HashSet::len));
-        }
-        self.indexed_filter_numbers(filter).map(|ids| ids.len())
     }
 
     #[cfg(test)]
@@ -1074,8 +1095,6 @@ impl MultiVectorIndex {
         s: Arc<State>,
         request: &RetrieveRequest,
     ) -> Result<RetrievalResponse, IndexError> {
-        let (effective_request, policy_plan) = self.prepare_request(&s, request);
-        let request = effective_request.as_ref();
         // An unfiltered query means every live document is eligible. Keep that
         // state implicit: materializing a HashSet of every ID makes an HNSW
         // query O(collection size) before graph traversal even begins.
@@ -1096,8 +1115,21 @@ impl MultiVectorIndex {
             }
         });
         let eligible_documents = eligible.as_ref().map_or(s.documents.len(), DocSet::len);
+        let planner_filter = request
+            .filter
+            .as_ref()
+            .map(|_| (eligible_documents, filter_strategy));
+        let (effective_request, policy_plan) =
+            self.prepare_request(&s, request, planner_filter, eligible.as_ref());
+        let request = effective_request.as_ref();
         let ann_filter = request.filter.as_ref().and_then(Predicate::ann_filter);
-        let mut plan = self.compile_plan(&s, request, eligible_documents, filter_strategy)?;
+        let mut plan = self.compile_plan(
+            &s,
+            request,
+            eligible_documents,
+            filter_strategy,
+            eligible.as_ref(),
+        )?;
         plan.policy = policy_plan;
         let mut per_stage_actual_ms: Vec<f64> = Vec::with_capacity(plan.stages.len());
 
@@ -1106,7 +1138,7 @@ impl MultiVectorIndex {
         // work-stealing is safe but may create contention under high concurrency.
         // A per-query parallelism budget is tracked in a later phase.
         let parallel_stage_start = Instant::now();
-        type ChannelResult = Result<(Vec<(String, f32)>, Value), IndexError>;
+        type ChannelResult = Result<(Vec<(String, f32)>, Value, f64), IndexError>;
         let channel_results: Vec<ChannelResult> = request
             .prefetch
             .par_iter()
@@ -1262,23 +1294,38 @@ impl MultiVectorIndex {
                         }
                     }
                 };
+                let elapsed_ms = at.elapsed().as_secs_f64() * 1000.;
                 let backend = planned.operator.as_str();
                 let entry = serde_json::json!({
                     "backend": backend,
                     "candidates": scores.len(),
-                    "elapsed_ms": at.elapsed().as_secs_f64() * 1000.
+                    "elapsed_ms": elapsed_ms
                 });
-                Ok((scores, entry))
+                Ok((scores, entry, elapsed_ms))
             })
             .collect();
-        let (mut lists, channels): (Vec<_>, Vec<_>) = channel_results
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .unzip();
+        let channel_results = channel_results.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let mut lists = Vec::with_capacity(channel_results.len());
+        let mut channels = Vec::with_capacity(channel_results.len());
+        {
+            let mut calibration = self.calibration.lock().unwrap();
+            for ((scores, trace, elapsed_ms), (channel, planned)) in channel_results
+                .into_iter()
+                .zip(request.prefetch.iter().zip(plan.parallel_channels()))
+            {
+                calibration.observe(
+                    planner::calibration_key(planned.operator, channel, &plan.stats),
+                    planned.estimated_cost_units,
+                    elapsed_ms,
+                );
+                lists.push(scores);
+                channels.push(trace);
+            }
+        }
         per_stage_actual_ms.push(parallel_stage_start.elapsed().as_secs_f64() * 1000.);
 
         let fusion_stage_start = Instant::now();
+        let fusion_candidates = lists.iter().map(Vec::len).sum();
         let agreement = if lists.len() > 1 {
             let head: HashSet<_> = lists[0]
                 .iter()
@@ -1334,7 +1381,20 @@ impl MultiVectorIndex {
             )
         };
         let fused_candidates = ranked.len();
-        per_stage_actual_ms.push(fusion_stage_start.elapsed().as_secs_f64() * 1000.);
+        let fusion_elapsed_ms = fusion_stage_start.elapsed().as_secs_f64() * 1000.;
+        self.calibration.lock().unwrap().observe(
+            planner::stage_calibration_key(
+                CalibrationTarget::Fusion(
+                    plan.fusion_operator()
+                        .expect("compiled plan has fusion stage"),
+                ),
+                0,
+                &plan.stats,
+            ),
+            planner::fusion_cost_units(fusion_candidates),
+            fusion_elapsed_ms,
+        );
+        per_stage_actual_ms.push(fusion_elapsed_ms);
 
         let mut reranked = 0;
         if let Some(rerank) = &request.rerank {
@@ -1376,13 +1436,47 @@ impl MultiVectorIndex {
                     .map(|h| (h.id, h.score))
                     .collect();
             }
-            per_stage_actual_ms.push(rerank_stage_start.elapsed().as_secs_f64() * 1000.);
+            let rerank_elapsed_ms = rerank_stage_start.elapsed().as_secs_f64() * 1000.;
+            self.calibration.lock().unwrap().observe(
+                planner::stage_calibration_key(
+                    CalibrationTarget::RerankMaxsim,
+                    self.config.dimension,
+                    &plan.stats,
+                ),
+                planner::rerank_cost_units(reranked, &plan.stats, self.config.dimension),
+                rerank_elapsed_ms,
+            );
+            per_stage_actual_ms.push(rerank_elapsed_ms);
         }
 
         let context_stage_start = Instant::now();
+        let context_candidates = ranked.len();
+        let context_operator = plan
+            .context_plan()
+            .expect("compiled plan has context stage")
+            .operator;
         let (matches, signals) =
             self.context(&s, ranked, &fused, eligible.as_ref(), request, agreement)?;
-        per_stage_actual_ms.push(context_stage_start.elapsed().as_secs_f64() * 1000.);
+        let context_elapsed_ms = context_stage_start.elapsed().as_secs_f64() * 1000.;
+        self.calibration.lock().unwrap().observe(
+            planner::stage_calibration_key(
+                CalibrationTarget::Context(context_operator),
+                if context_operator == ContextOperator::Mmr {
+                    self.config.dimension
+                } else {
+                    0
+                },
+                &plan.stats,
+            ),
+            planner::context_cost_units(
+                context_operator,
+                context_candidates,
+                request.limit,
+                self.config.dimension,
+            ),
+            context_elapsed_ms,
+        );
+        per_stage_actual_ms.push(context_elapsed_ms);
 
         Ok(RetrievalResponse {
             matches,
@@ -1842,6 +1936,52 @@ mod tests {
             PlanReason::LowerEstimatedCost
         );
         assert_eq!(filtered.eligible_documents, 2);
+    }
+
+    #[test]
+    fn runtime_calibration_replaces_static_operator_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        index.build_dense_ann("semantic", 4, 16).unwrap();
+        let mut query = request();
+        query.filter = None;
+        query
+            .prefetch
+            .retain(|channel| matches!(channel, Channel::Dense { .. }));
+
+        for backend in ["exact", "hnsw"] {
+            let Channel::Dense {
+                backend: selected, ..
+            } = &mut query.prefetch[0]
+            else {
+                unreachable!()
+            };
+            *selected = backend.into();
+            for _ in 0..5 {
+                index.retrieve(&query).unwrap();
+            }
+        }
+
+        let Channel::Dense { backend, .. } = &mut query.prefetch[0] else {
+            unreachable!()
+        };
+        *backend = "auto".into();
+        let plan = index.plan(&query).unwrap();
+        assert_eq!(
+            plan.parallel_channels()[0].reason,
+            PlanReason::LowerCalibratedLatency
+        );
+        assert!(plan.parallel_channels()[0].estimated_latency_ms.is_some());
+        assert!(plan.estimate.calibrated_parallel_p90_ms.is_some());
+        assert_eq!(
+            index
+                .calibration_snapshot()
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.key.target, CalibrationTarget::Channel(_)))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -2562,7 +2702,74 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_requests_are_rejected() {
+    fn auto_mode_uses_filter_cardinality_for_candidate_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let query: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [],
+            "planning_mode": "auto",
+            "query": {"text": "E123"},
+            "objective": {"quality": "high"},
+            "filter": {"op": "eq", "field": "tenant", "value": "a"},
+            "limit": 1
+        }))
+        .unwrap();
+
+        let plan = index.plan(&query).unwrap();
+        assert_eq!(plan.eligible_documents, 2);
+        assert_eq!(plan.parallel_channels()[0].limit, 2);
+        assert_eq!(plan.policy.unwrap().intent, QueryIntent::Lexical);
+    }
+
+    #[test]
+    fn auto_mode_uses_field_coverage_within_the_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = MultiVectorIndex::open(dir.path(), IndexConfig::new(2)).unwrap();
+        let documents = (0..10)
+            .map(|i| RetrievalDocument {
+                id: format!("doc-{i}"),
+                metadata: json!({"tenant": if i < 4 { "a" } else { "b" }}),
+                representations: if i < 4 {
+                    BTreeMap::from([(
+                        "semantic".into(),
+                        Representation::Dense {
+                            vector: vec![1.0, 0.0],
+                        },
+                    )])
+                } else {
+                    BTreeMap::new()
+                },
+                ..RetrievalDocument::default()
+            })
+            .collect();
+        index.upsert_records(documents).unwrap();
+        let mut query: RetrieveRequest = serde_json::from_value(json!({
+            "planning_mode": "auto",
+            "query": {"dense": {"semantic": [1.0, 0.0]}},
+            "filter": {"op": "eq", "field": "tenant", "value": "a"},
+            "limit": 2
+        }))
+        .unwrap();
+
+        let plan = index.plan(&query).unwrap();
+        let field = &plan.stats.fields["semantic"];
+        assert_eq!(field.documents, 4);
+        assert_eq!(field.eligible_documents, Some(4));
+        assert_eq!(plan.eligible_documents, 4);
+        assert_eq!(plan.parallel_channels().len(), 1);
+
+        query.filter = None;
+        assert!(
+            index
+                .plan(&query)
+                .unwrap_err()
+                .to_string()
+                .contains("no usable query representation")
+        );
+    }
+
+    #[test]
+    fn invalid_and_uncalibrated_requests_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let index = index(dir.path());
         let query: RetrieveRequest = serde_json::from_value(json!({
@@ -2578,7 +2785,49 @@ mod tests {
         let mut query = request();
         query.objective.latency_budget_ms = Some(10.0);
         let error = index.plan(&query).unwrap_err();
-        assert!(error.to_string().contains("requires calibrated planning"));
+        assert!(error.to_string().contains("five observations"));
+
+        query.objective.latency_budget_ms = Some(0.0);
+        assert!(
+            index
+                .plan(&query)
+                .unwrap_err()
+                .to_string()
+                .contains("finite and positive")
+        );
+    }
+
+    #[test]
+    fn latency_budget_uses_calibrated_channel_and_post_retrieval_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+        let mut query = request();
+        query.rerank = Some(Rerank {
+            field: Some("tokens".into()),
+            vectors: vec![vec![1., 0.]],
+            limit: 3,
+            adaptive: None,
+        });
+
+        for _ in 0..5 {
+            index.retrieve(&query).unwrap();
+        }
+        query.objective.latency_budget_ms = Some(10_000.0);
+        let plan = index.plan(&query).unwrap();
+        assert!(plan.estimate.calibrated_parallel_p90_ms.is_some());
+        assert!(plan.estimate.calibrated_fusion_p90_ms.is_some());
+        assert!(plan.estimate.calibrated_rerank_p90_ms.is_some());
+        assert!(plan.estimate.calibrated_context_p90_ms.is_some());
+        assert!(plan.estimate.calibrated_total_p90_ms.is_some());
+
+        query.objective.latency_budget_ms = Some(f64::MIN_POSITIVE);
+        assert!(
+            index
+                .plan(&query)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds latency budget")
+        );
     }
 
     #[test]
@@ -3063,5 +3312,55 @@ mod tests {
         let gen0 = results[0].as_ref().unwrap().trace.plan.stats.generation;
         let gen2 = results[2].as_ref().unwrap().trace.plan.stats.generation;
         assert_eq!(gen0, gen2, "batch queries saw different generations");
+    }
+
+    #[test]
+    fn latency_budget_cold_start_error_and_warm_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+
+        // Build a single-channel query without reranking so the required
+        // stages are: channel + fusion (bypassed for 1 channel) + context.
+        let mut q: RetrieveRequest = serde_json::from_value(json!({
+            "prefetch": [{"kind": "dense", "field": "semantic",
+                          "vector": [1., 0.], "limit": 3}],
+            "limit": 3,
+            "objective": {"latency_budget_ms": 1000.0}
+        }))
+        .unwrap();
+
+        // Cold start: no calibration data yet → error.
+        let err = index.plan(&q).unwrap_err();
+        assert!(
+            err.to_string().contains("five observations"),
+            "expected cold-start error, got: {err}"
+        );
+
+        // Warm all required stages: 5 retrieves record channel, fusion, and
+        // context observations. Reranking is absent, so its slot is zero.
+        q.objective.latency_budget_ms = None;
+        for _ in 0..5 {
+            index.retrieve(&q).unwrap();
+        }
+        q.objective.latency_budget_ms = Some(1000.0);
+
+        // A generous budget accepts the warmed plan.
+        let plan = index
+            .plan(&q)
+            .expect("warm plan should succeed with generous budget");
+        let total = plan.estimate.calibrated_total_p90_ms;
+        assert!(
+            total.is_some(),
+            "warmed plan should have total p90 estimate"
+        );
+        assert!(total.unwrap() < 1000.0);
+
+        // An impossibly tight budget is rejected.
+        q.objective.latency_budget_ms = Some(0.000_001);
+        let err = index.plan(&q).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds latency budget"),
+            "expected budget-exceeded error, got: {err}"
+        );
     }
 }

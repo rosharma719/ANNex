@@ -776,7 +776,7 @@ impl MultiVectorIndex {
         }
         let planner_stats =
             planner::CachedPlannerStats::from_documents(&documents, retrieval.schema());
-        Ok(Self {
+        let index = Self {
             fde: if fde_encoding_version == 2 {
                 FdeEncoder::new(
                     config.dimension,
@@ -797,7 +797,7 @@ impl MultiVectorIndex {
             },
             writer: Mutex::new(()),
             calibration: Mutex::new(calibration::CalibrationStats::default()),
-            durability,
+            durability: durability.clone(),
             _directory_lock: directory_lock,
             state: RwLock::new(Arc::new(State {
                 generation,
@@ -830,7 +830,9 @@ impl MultiVectorIndex {
             })),
             root,
             config,
-        })
+        };
+        index.load_calibration();
+        Ok(index)
     }
     fn snapshot(&self) -> Arc<State> {
         Arc::clone(&self.state.read().unwrap())
@@ -838,6 +840,38 @@ impl MultiVectorIndex {
 
     pub fn calibration_snapshot(&self) -> CalibrationSnapshot {
         self.calibration.lock().unwrap().snapshot()
+    }
+
+    fn calibration_path(&self) -> PathBuf {
+        self.root.join("calibration.json")
+    }
+
+    fn load_calibration(&self) {
+        let path = self.calibration_path();
+        let Ok(bytes) = fs::read(&path) else { return };
+        let Ok(snapshot) = serde_json::from_slice::<CalibrationSnapshot>(&bytes) else {
+            return;
+        };
+        self.calibration.lock().unwrap().restore(&snapshot);
+    }
+
+    fn save_calibration(&self) {
+        let snapshot = self.calibration.lock().unwrap().snapshot();
+        if let Ok(bytes) = serde_json::to_vec(&snapshot) {
+            let tmp = self.calibration_path().with_extension("json.tmp");
+            if fs::write(&tmp, &bytes).is_ok() {
+                let _ = fs::rename(&tmp, self.calibration_path());
+                self.calibration.lock().unwrap().since_save = 0;
+            }
+        }
+    }
+
+    /// Flush accumulated calibration observations to disk.
+    ///
+    /// Called automatically after every [`AUTOSAVE_INTERVAL`] observations;
+    /// also safe to call explicitly after a workload that should persist.
+    pub fn flush_calibration(&self) {
+        self.save_calibration();
     }
 
     fn validate(&self, v: &[Vector]) -> Result<(), IndexError> {
@@ -897,7 +931,10 @@ impl MultiVectorIndex {
             } else {
                 IndexError::Io(e.source)
             }
-        })
+        })?;
+        // Best-effort: calibration is not part of the durability guarantee.
+        self.save_calibration();
+        Ok(())
     }
 
     fn commit(&self, current: &State, mut next: State) -> Result<(), IndexError> {

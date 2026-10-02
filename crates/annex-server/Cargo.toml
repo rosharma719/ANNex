@@ -1,6 +1,6 @@
 [package]
 name = "annex-server"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version.workspace = true
 description = "Reference HTTP servers on top of annex (dense single-vector) and annex-multivector (late-interaction)."
@@ -12,7 +12,7 @@ name = "annex-server"
 path = "src/bin/annex_server.rs"
 
 [dependencies]
-annex = { path = "../annex-core", version = "0.2.0" }
+annex = { path = "../annex-core", version = "0.3.0" }
 axum = "0.8"
 bytemuck = "1.24"
 clap = { version = "4.5", features = ["derive"] }

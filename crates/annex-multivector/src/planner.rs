@@ -54,7 +54,7 @@ pub struct LogicalPlan {
     pub context_selection: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PhysicalOperator {
     Bm25,
@@ -235,7 +235,7 @@ pub struct PlannedChannel {
     pub estimated_latency_ms: Option<f64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FusionOperator {
     NativeScore,
@@ -250,7 +250,7 @@ pub struct RerankPlan {
     pub adaptive: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextOperator {
     Ranked,

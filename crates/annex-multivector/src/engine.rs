@@ -944,12 +944,19 @@ impl MultiVectorIndex {
             let Ok(persisted) = bincode::deserialize::<PersistedAnn>(&bytes) else {
                 continue;
             };
-            if persisted.generation > s.generation {
-                continue; // built against a future generation — corrupt or wrong index
+            // Only load graphs that exactly match the current generation.
+            // We cannot safely reconstruct delta/tombstones for UPDATED
+            // documents (only for inserts and pure deletes) without a
+            // per-document modification timestamp. Exact-generation load
+            // covers the primary use case (ingest → build → restart).
+            // Generation-mismatched files are left on disk for inspection
+            // and will be overwritten the next time the graph is rebuilt.
+            if persisted.generation != s.generation {
+                continue;
             }
-            // Validate all IDs still exist (stale if any are missing entirely).
-            let id_set: HashSet<&str> = persisted.ids.iter().map(String::as_str).collect();
-            // Reconstruct by_id, payloads, payload_index from current documents.
+            // Rebuild by_id, payloads, and payload_index from the current
+            // document set. At exact-generation match, delta and tombstones
+            // are both empty (the graph is fully current).
             let by_id: HashMap<String, u64> = persisted
                 .ids
                 .iter()
@@ -965,24 +972,6 @@ impl MultiVectorIndex {
                     payloads.insert(point as u64, payload);
                 }
             }
-            // Tombstones: base IDs no longer in documents.
-            let tombstones: HashSet<u64> = persisted
-                .ids
-                .iter()
-                .enumerate()
-                .filter(|(_, id)| !s.documents.contains_key(*id))
-                .map(|(i, _)| i as u64)
-                .collect();
-            // Delta: documents that should be in this graph but aren't in the base.
-            let delta: HashSet<String> = s
-                .documents
-                .iter()
-                .filter(|(id, doc)| {
-                    !id_set.contains(id.as_str())
-                        && field.map_or(doc.tokens > 0, |f| doc.fields.has_dense(f))
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
             let ann = FdeAnn {
                 base: Arc::new(FdeAnnBase {
                     index: HNSWIndex::from_snapshot(persisted.hnsw),
@@ -992,12 +981,10 @@ impl MultiVectorIndex {
                     payloads,
                     payload_index,
                 }),
-                delta,
-                tombstones,
-                // Use the current state generation, not the persisted one.
-                // commit() keeps ann.generation == s.generation; we restore
-                // that invariant here so the consistency check in
-                // ann_scores_filtered passes.
+                delta: HashSet::new(),
+                tombstones: HashSet::new(),
+                // commit() maintains ann.generation == s.generation.
+                // Restore that invariant here so ann_scores_filtered passes.
                 generation: s.generation,
             };
             if let Some(f) = field {
@@ -1574,6 +1561,55 @@ impl MultiVectorIndex {
     /// Build an HNSW index over persisted FDEs. Exact FDE scan remains available as an oracle.
     pub fn build_fde_ann(&self, m: usize, ef_construct: usize) -> Result<usize, IndexError> {
         self.build_ann(None, m, ef_construct)
+    }
+
+    /// Rebuild the FDE ANN graph if the delta overlay has grown past
+    /// `threshold_fraction` of the current base size.
+    ///
+    /// Returns `Some(n)` if a rebuild was triggered (n = new base node count),
+    /// `None` if the overlay is within bounds and no rebuild was needed.
+    ///
+    /// Typical threshold: `0.20` (rebuild when delta > 20% of base).
+    /// Call from a background thread or after a batch of writes.
+    pub fn auto_compact_fde_ann(
+        &self,
+        m: usize,
+        ef_construct: usize,
+        threshold_fraction: f64,
+    ) -> Result<Option<usize>, IndexError> {
+        let s = self.snapshot();
+        let should_compact = s.fde_ann.as_ref().is_some_and(|ann| {
+            let base = ann.base.ids.len().saturating_sub(ann.tombstones.len()) as f64;
+            let delta = ann.delta.len() as f64;
+            base > 0.0 && delta / base > threshold_fraction
+        });
+        if should_compact {
+            Ok(Some(self.build_fde_ann(m, ef_construct)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Rebuild the named dense ANN graph for `field` if its delta overlay has
+    /// grown past `threshold_fraction` of the base size.
+    pub fn auto_compact_dense_ann(
+        &self,
+        field: &str,
+        m: usize,
+        ef_construct: usize,
+        threshold_fraction: f64,
+    ) -> Result<Option<usize>, IndexError> {
+        let s = self.snapshot();
+        let should_compact = s.named_ann.get(field).is_some_and(|ann| {
+            let base = ann.base.ids.len().saturating_sub(ann.tombstones.len()) as f64;
+            let delta = ann.delta.len() as f64;
+            base > 0.0 && delta / base > threshold_fraction
+        });
+        if should_compact {
+            Ok(Some(self.build_dense_ann(field, m, ef_construct)?))
+        } else {
+            Ok(None)
+        }
     }
     pub fn build_dense_ann(
         &self,

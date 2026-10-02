@@ -3484,12 +3484,17 @@ mod tests {
     }
 
     #[test]
-    fn ann_graph_delta_reconstructed_on_reopen() {
+    fn ann_graph_not_loaded_when_generation_mismatch() {
+        // When documents are written after a graph build, the persisted
+        // generation no longer matches the current generation. The graph is
+        // NOT auto-loaded (we can't safely reconstruct delta for updated docs
+        // without per-document modification timestamps). Exact fallback works,
+        // and a rebuild restores the graph. This is the correct conservative
+        // behavior until bounded delta folding is implemented.
         let dir = tempfile::tempdir().unwrap();
         {
             let index = index(dir.path());
             index.build_dense_ann("semantic", 4, 16).unwrap();
-            // Insert a document after the graph is built — it goes into delta.
             index
                 .upsert_records(vec![document(
                     "new",
@@ -3502,25 +3507,35 @@ mod tests {
         }
         {
             let index = MultiVectorIndex::open_existing(dir.path(), Durability::Buffered)
-                .expect("reopen with delta");
-            let q: RetrieveRequest = serde_json::from_value(json!({
+                .expect("reopen after mutation");
+            let mut q: RetrieveRequest = serde_json::from_value(json!({
                 "prefetch": [{"kind": "dense", "field": "semantic",
-                              "vector": [1., 0.], "limit": 3, "backend": "hnsw"}],
+                              "vector": [1., 0.], "limit": 3, "backend": "auto"}],
                 "limit": 3
             }))
             .unwrap();
+            // Graph not loaded (generation mismatch) → auto falls back to exact.
             let plan = index.plan(&q).unwrap();
             assert_eq!(
                 plan.parallel_channels()[0].operator,
-                PhysicalOperator::HnswDense,
-                "HNSW should still be available with delta"
+                PhysicalOperator::ExactDense,
+                "graph should not load after generation mismatch"
             );
-            // New document should appear in results (exact delta scan).
+            // Exact fallback returns all documents including the new one.
             let response = index.retrieve(&q).unwrap();
             assert!(
                 response.matches.iter().any(|h| h.id == "new"),
-                "post-build insert should appear in results after reopen"
+                "exact fallback should return post-build insert"
             );
+            // After an explicit rebuild the graph is available again.
+            index.build_dense_ann("semantic", 4, 16).unwrap();
+            q.prefetch[0] = serde_json::from_value(json!({
+                "kind": "dense", "field": "semantic",
+                "vector": [1., 0.], "limit": 3, "backend": "hnsw"
+            }))
+            .unwrap();
+            let response2 = index.retrieve(&q).unwrap();
+            assert!(response2.matches.iter().any(|h| h.id == "new"));
         }
     }
 }

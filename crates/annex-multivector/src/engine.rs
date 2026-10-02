@@ -257,6 +257,16 @@ pub enum IndexError {
     )]
     CommitUncertain(io::Error),
 }
+/// On-disk representation of a built HNSW graph. Payloads, delta, and
+/// tombstones are reconstructed from the live document set on load.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PersistedAnn {
+    generation: u64,
+    /// Ordered list of external document IDs corresponding to HNSW node 0..n.
+    ids: Vec<String>,
+    hnsw: annex::vector::hnsw::HnswSnapshot,
+}
+
 /// Immutable graph and dense external-ID mapping, shared by staged generations.
 struct FdeAnnBase {
     index: HNSWIndex,
@@ -832,6 +842,13 @@ impl MultiVectorIndex {
             config,
         };
         index.load_calibration();
+        // Load persisted graphs into the initial state. Stale or missing files
+        // are silently skipped; the planner falls back to exact scan.
+        {
+            let mut s = (*index.snapshot()).clone();
+            index.load_all_ann(&mut s);
+            *index.state.write().unwrap() = Arc::new(s);
+        }
         Ok(index)
     }
     fn snapshot(&self) -> Arc<State> {
@@ -872,6 +889,123 @@ impl MultiVectorIndex {
     /// also safe to call explicitly after a workload that should persist.
     pub fn flush_calibration(&self) {
         self.save_calibration();
+    }
+
+    fn ann_dir(&self) -> PathBuf {
+        self.root.join("ann")
+    }
+
+    fn ann_path(&self, field: Option<&str>) -> PathBuf {
+        self.ann_dir()
+            .join(format!("{}.ann", field.unwrap_or("fde")))
+    }
+
+    fn save_ann(&self, field: Option<&str>, generation: u64, ids: &[String], hnsw: &HNSWIndex) {
+        let dir = self.ann_dir();
+        let _ = fs::create_dir_all(&dir);
+        let path = self.ann_path(field);
+        let tmp = path.with_extension("ann.tmp");
+        let persisted = PersistedAnn {
+            generation,
+            ids: ids.to_vec(),
+            hnsw: hnsw.to_snapshot(),
+        };
+        if let Ok(bytes) = bincode::serialize(&persisted) {
+            if fs::write(&tmp, &bytes).is_ok() {
+                let _ = fs::rename(&tmp, path);
+            }
+        }
+    }
+
+    fn delete_ann(&self, field: Option<&str>) {
+        let _ = fs::remove_file(self.ann_path(field));
+    }
+
+    /// Attempt to load all persisted ANN graphs into the given state.
+    /// Missing or stale files are silently skipped; the planner falls back
+    /// to exact scan and the caller can trigger a rebuild.
+    fn load_all_ann(&self, s: &mut State) {
+        let dir = self.ann_dir();
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("ann") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_owned();
+            let field: Option<&str> = if stem == "fde" { None } else { Some(&stem) };
+            let Ok(bytes) = fs::read(&path) else { continue };
+            let Ok(persisted) = bincode::deserialize::<PersistedAnn>(&bytes) else {
+                continue;
+            };
+            if persisted.generation > s.generation {
+                continue; // built against a future generation — corrupt or wrong index
+            }
+            // Validate all IDs still exist (stale if any are missing entirely).
+            let id_set: HashSet<&str> = persisted.ids.iter().map(String::as_str).collect();
+            // Reconstruct by_id, payloads, payload_index from current documents.
+            let by_id: HashMap<String, u64> = persisted
+                .ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (id.clone(), i as u64))
+                .collect();
+            let mut payloads = HashMap::with_capacity(persisted.ids.len());
+            let mut payload_index = PayloadIndex::new();
+            for (point, id) in persisted.ids.iter().enumerate() {
+                if let Some(doc) = s.documents.get(id) {
+                    let payload = retrieval::metadata_ann_payload(&doc.metadata);
+                    payload_index.insert(point as u64, &payload);
+                    payloads.insert(point as u64, payload);
+                }
+            }
+            // Tombstones: base IDs no longer in documents.
+            let tombstones: HashSet<u64> = persisted
+                .ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| !s.documents.contains_key(*id))
+                .map(|(i, _)| i as u64)
+                .collect();
+            // Delta: documents that should be in this graph but aren't in the base.
+            let delta: HashSet<String> = s
+                .documents
+                .iter()
+                .filter(|(id, doc)| {
+                    !id_set.contains(id.as_str())
+                        && field.map_or(doc.tokens > 0, |f| doc.fields.has_dense(f))
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            let ann = FdeAnn {
+                base: Arc::new(FdeAnnBase {
+                    index: HNSWIndex::from_snapshot(persisted.hnsw),
+                    ids: persisted.ids,
+                    by_id,
+                    field: field.map(str::to_owned),
+                    payloads,
+                    payload_index,
+                }),
+                delta,
+                tombstones,
+                // Use the current state generation, not the persisted one.
+                // commit() keeps ann.generation == s.generation; we restore
+                // that invariant here so the consistency check in
+                // ann_scores_filtered passes.
+                generation: s.generation,
+            };
+            if let Some(f) = field {
+                s.named_ann.insert(f.to_owned(), ann);
+            } else {
+                s.fde_ann = Some(ann);
+            }
+        }
     }
 
     fn validate(&self, v: &[Vector]) -> Result<(), IndexError> {
@@ -1024,6 +1158,7 @@ impl MultiVectorIndex {
         next.postings = vec![HashSet::new(); next.codebook.len()];
         // Retraining an empty collection resets its derived graph/overlay.
         Self::invalidate_fde_ann(&mut next);
+        self.delete_ann(None); // persisted graph is stale after codebook retrain
         self.commit(&s, next)
     }
     pub fn upsert(
@@ -1520,6 +1655,9 @@ impl MultiVectorIndex {
             )));
         }
         let count = ids.len();
+        // Persist before publishing so the file is on disk if we crash after
+        // the state swap. The file is overwritten atomically.
+        self.save_ann(field, built_generation, &ids, &hnsw);
         let by_id = ids
             .iter()
             .enumerate()

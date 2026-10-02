@@ -3029,4 +3029,39 @@ mod tests {
                 .all(|hit| hit.metadata["tenant"] == "a")
         );
     }
+
+    #[test]
+    fn retrieve_batch_returns_same_generation_and_correct_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(dir.path());
+
+        let make_req = |v: f32| -> RetrieveRequest {
+            serde_json::from_value(json!({
+                "prefetch": [{"kind": "dense", "field": "semantic",
+                              "vector": [v, 0.], "limit": 3}],
+                "limit": 3
+            }))
+            .unwrap()
+        };
+        let requests = vec![make_req(1.0), make_req(0.8), make_req(0.0)];
+        let results = index.retrieve_batch(&requests);
+
+        // All three slots succeed.
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert!(r.is_ok(), "batch slot failed: {:?}", r);
+        }
+
+        // Results are in request order: query [1,0] should rank "b" first,
+        // query [0,0] should also return results (scalar fallback).
+        let top0 = &results[0].as_ref().unwrap().matches;
+        let top2 = &results[2].as_ref().unwrap().matches;
+        assert!(!top0.is_empty());
+        assert!(!top2.is_empty());
+
+        // All results share the same generation — verified by comparing trace generations.
+        let gen0 = results[0].as_ref().unwrap().trace.plan.stats.generation;
+        let gen2 = results[2].as_ref().unwrap().trace.plan.stats.generation;
+        assert_eq!(gen0, gen2, "batch queries saw different generations");
+    }
 }

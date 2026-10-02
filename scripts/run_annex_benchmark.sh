@@ -12,6 +12,7 @@ RCM_VALUES="${RCM_VALUES:-false true}"
 ROOT="$(git rev-parse --show-toplevel)"
 OUT="$ROOT/crates/annex-core/bench/$SUITE/results_annexdb.jsonl"
 cd "$ROOT"
+DATA_DIR="$(cd "$DATA_DIR" && pwd)"
 
 cargo build --release -p annex --tests
 for M in $M_VALUES; do
@@ -36,7 +37,7 @@ for M in $M_VALUES; do
             ANNEX_BENCH_M="$M" ANNEX_BENCH_RCM="$RCM" ANNEX_BENCH_SQ8="$SQ8" \
             ANNEX_BENCH_LABEL="$LABEL" ANNEX_BENCH_TOPK="$TOP_K" ANNEX_BENCH_ROUNDS="3" \
             cargo test --release -p annex --test ann_bench ann_pareto_sweep \
-                -- --ignored --nocapture 2>/dev/null | grep '^\{' >> "$OUT"
+                -- --ignored --nocapture 2>/dev/null | grep '^{' >> "$OUT"
         done
     done
 done

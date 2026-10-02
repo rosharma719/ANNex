@@ -83,6 +83,10 @@
     "n_queries": 1000,
     "n_gt": 100,
     "source_url": "https://ann-benchmarks.com/gist-960-euclidean.hdf5",
-    "checksums": {}
+    "checksums": {
+      "base.npy": "sha256:f03ba13c0f879f9efd654c225aac3e68990c54ae478d69c145ba32382dfcda50",
+      "queries.npy": "sha256:df868d4df62b7665c0d03f9251d48c52f5d7eef197c780943bbbc70e373056c8",
+      "ground_truth.json": "sha256:2b15d17533cb632d088df5a8865b25517b7aa1277e5493eddf42c981c948adea"
+    }
   }
 }

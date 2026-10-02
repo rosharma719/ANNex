@@ -1,0 +1,15 @@
+{
+  "annexdb": {
+    "timestamp": "2026-10-02T18:28:59",
+    "commit": "90ba488",
+    "branch": "codex/gist-benchmark-matrix",
+    "rust": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "m_values": "16 32",
+    "ef_values": "32,64,128,256,512",
+    "rcm_values": "false"
+  },
+  "combined": {
+    "timestamp": "2026-10-02T18:28:59",
+    "rows": 20
+  }
+}

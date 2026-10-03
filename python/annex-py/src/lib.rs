@@ -1,4 +1,5 @@
 use annex::segment::Segment;
+use annex::utils::types::{DistanceMetric, Vector};
 use annex::vector::hnsw::{HNSWIndex, SearchRuntimeOptions};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
@@ -6,6 +7,7 @@ use numpy::{
 };
 use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyType;
 
 type PySearchResult<'py> = PyResult<(Bound<'py, PyArray1<u64>>, Bound<'py, PyArray1<f32>>)>;
 type PyBatchSearchResult<'py> = PyResult<(Bound<'py, PyArray2<u64>>, Bound<'py, PyArray2<f32>>)>;
@@ -117,6 +119,71 @@ struct Index {
 
 #[pymethods]
 impl Index {
+    /// Build an index from a float32 numpy array of shape ``[n, dim]``.
+    ///
+    /// ``metric`` accepts ``"cosine"``/``"angular"``, ``"euclidean"``/``"l2"``,
+    /// or ``"dot"``/``"ip"``. For angular datasets, pass already-normalised
+    /// vectors (ann-benchmarks guarantees this). The GIL is released during
+    /// construction.
+    #[classmethod]
+    #[pyo3(signature = (data, metric = "cosine", m = 16, ef_construct = 300, quantize = false))]
+    fn build(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        data: PyReadonlyArray2<'_, f32>,
+        metric: &str,
+        m: usize,
+        ef_construct: usize,
+        quantize: bool,
+    ) -> PyResult<Self> {
+        let shape = data.shape();
+        let (n, dim) = (shape[0], shape[1]);
+        if dim == 0 {
+            return Err(value_error("data has zero dimensions"));
+        }
+        if !data.is_c_contiguous() {
+            return Err(value_error("data must be C-contiguous (row-major)"));
+        }
+        let flat = data.as_slice()?;
+        validate_values(flat, "data")?;
+
+        let dist = match metric {
+            "cosine" | "angular" => DistanceMetric::Cosine,
+            "euclidean" | "l2" => DistanceMetric::Euclidean,
+            "dot" | "ip" | "inner_product" => DistanceMetric::Dot,
+            other => return Err(value_error(format!("unknown metric: {other}"))),
+        };
+
+        let flat = flat.to_vec();
+
+        let inner = py
+            .detach(|| -> Result<HNSWIndex, String> {
+                let mut segment = Segment::new(HNSWIndex::new(dist, m, 64, 16, dim));
+                segment.hnsw_mut().set_m0(m * 2);
+                segment.hnsw_mut().set_ef_construct(ef_construct);
+
+                let chunk = 50_000usize;
+                let mut pos = 0;
+                while pos < n {
+                    let end = (pos + chunk).min(n);
+                    let batch: Vec<(u64, Vector)> = (pos..end)
+                        .map(|i| (i as u64, flat[i * dim..(i + 1) * dim].to_vec()))
+                        .collect();
+                    segment.bulk_load(&batch).map_err(|e| e.to_string())?;
+                    pos = end;
+                }
+
+                let mut idx = HNSWIndex::from_snapshot(segment.hnsw().to_snapshot());
+                if quantize {
+                    idx.quantize_all();
+                }
+                Ok(idx)
+            })
+            .map_err(runtime_error)?;
+
+        Ok(Self { inner })
+    }
+
     /// Load a segment snapshot from `path`. When `quantize` is true, build the
     /// SQ8 codes required by the screening fast path.
     #[new]

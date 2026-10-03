@@ -1,4 +1,4 @@
-FROM ann-benchmarks
+FROM ann-benchmarks AS builder
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -23,6 +23,12 @@ RUN git init /annex \
     && git fetch --depth 1 origin "$ANNEX_REF" \
     && git checkout --detach FETCH_HEAD
 
-WORKDIR /annex/python/annex-py
-RUN maturin build --release --features extension-module -o /tmp/annex-wheels
-RUN pip install /tmp/annex-wheels/*.whl
+RUN cd /annex/python/annex-py \
+    && maturin build --release --features extension-module -o /tmp/annex-wheels \
+    && find /annex/target -mindepth 1 -delete
+
+FROM ann-benchmarks
+
+COPY --from=builder /tmp/annex-wheels /tmp/annex-wheels
+RUN pip install /tmp/annex-wheels/*.whl \
+    && find /tmp/annex-wheels -mindepth 1 -delete

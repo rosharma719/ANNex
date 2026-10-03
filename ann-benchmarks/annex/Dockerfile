@@ -1,6 +1,12 @@
 FROM ann-benchmarks
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # Rust toolchain
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && apt-get clean \
+    && find /var/lib/apt/lists -mindepth 1 -delete
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --default-toolchain stable
 ENV PATH="/root/.cargo/bin:${PATH}"

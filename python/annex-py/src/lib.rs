@@ -1,13 +1,13 @@
 use annex::segment::Segment;
 use annex::utils::types::{DistanceMetric, Vector};
 use annex::vector::hnsw::{HNSWIndex, SearchRuntimeOptions};
-use pyo3::types::PyType;
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
     ndarray::Array2,
 };
 use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyType;
 
 type PySearchResult<'py> = PyResult<(Bound<'py, PyArray1<u64>>, Bound<'py, PyArray1<f32>>)>;
 type PyBatchSearchResult<'py> = PyResult<(Bound<'py, PyArray2<u64>>, Bound<'py, PyArray2<f32>>)>;
@@ -158,8 +158,7 @@ impl Index {
 
         let inner = py
             .detach(|| -> Result<HNSWIndex, String> {
-                let mut segment =
-                    Segment::new(HNSWIndex::new(dist, m, 64, 16, dim));
+                let mut segment = Segment::new(HNSWIndex::new(dist, m, 64, 16, dim));
                 segment.hnsw_mut().set_m0(m * 2);
                 segment.hnsw_mut().set_ef_construct(ef_construct);
 
@@ -174,8 +173,7 @@ impl Index {
                     pos = end;
                 }
 
-                let mut idx =
-                    HNSWIndex::from_snapshot(segment.hnsw().to_snapshot());
+                let mut idx = HNSWIndex::from_snapshot(segment.hnsw().to_snapshot());
                 if quantize {
                     idx.quantize_all();
                 }

@@ -568,12 +568,7 @@ impl HNSWIndex {
                                 .unwrap_or(Ordering::Equal)
                         });
                         let selected = self.select_diverse_neighbors_with_view(
-                            &cands,
-                            cap,
-                            use_norm,
-                            l,
-                            &vectors,
-                            &deleted,
+                            &cands, cap, use_norm, l, &vectors, &deleted,
                         );
                         self.layers[l].with(n, |lock| *lock.write() = selected.clone());
                         // Keep edge_dists_l0 in sync with the post-cap neighbor list.

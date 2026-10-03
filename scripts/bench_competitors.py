@@ -69,7 +69,7 @@ def hnswlib_space(metric: str) -> str:
     return {"cosine": "cosine", "euclidean": "l2", "dot": "ip"}[metric]
 
 
-def bench_hnswlib(base, queries, truth, records, metric, data_dir):
+def bench_hnswlib(base, queries, truth, records, metric, data_dir, cleanup_indexes=False):
     import hnswlib
     space = hnswlib_space(metric)
     # For IP (dot), vectors should not be normalized; for cosine, hnswlib normalizes internally
@@ -96,9 +96,12 @@ def bench_hnswlib(base, queries, truth, records, metric, data_dir):
             times = _time_rounds(lambda q: idx.knn_query(q, k=K, num_threads=1), q_use)
             emit(records, "hnswlib", f"M={M} efc=300", ef, rec, times)
         print(f"  hnswlib M={M} done")
+        if cleanup_indexes:
+            del idx
+            idx_path.unlink(missing_ok=True)
 
 
-def bench_usearch(base, queries, truth, records, metric, data_dir):
+def bench_usearch(base, queries, truth, records, metric, data_dir, cleanup_indexes=False):
     from usearch.index import Index, MetricKind
     mk = {"cosine": MetricKind.Cos, "euclidean": MetricKind.L2sq, "dot": MetricKind.IP}[metric]
     dims = base.shape[1]
@@ -122,9 +125,12 @@ def bench_usearch(base, queries, truth, records, metric, data_dir):
             times = _time_rounds(lambda q: idx.search(q, K), queries)
             emit(records, "usearch", f"M={M} efc=300", ef, rec, times)
         print(f"  usearch M={M} done")
+        if cleanup_indexes:
+            del idx
+            idx_path.unlink(missing_ok=True)
 
 
-def bench_faiss_hnsw(base, queries, truth, records, metric, data_dir):
+def bench_faiss_hnsw(base, queries, truth, records, metric, data_dir, cleanup_indexes=False):
     import faiss
     faiss.omp_set_num_threads(1)
     dims = base.shape[1]
@@ -158,6 +164,9 @@ def bench_faiss_hnsw(base, queries, truth, records, metric, data_dir):
             times = _time_rounds(lambda q: idx.search(q[None], K), queries_use)
             emit(records, "faiss-hnsw", f"M={M} efc=300", ef, rec, times)
         print(f"  faiss-hnsw M={M} done")
+        if cleanup_indexes:
+            del idx
+            idx_path.unlink(missing_ok=True)
 
 
 def _update_manifest(out_path: Path) -> None:
@@ -190,6 +199,8 @@ def main():
                     help="Output JSONL path (default: auto-derived from data-dir name)")
     ap.add_argument("--libs", default="hnswlib,usearch,faiss-hnsw",
                     help="comma-separated libs to run")
+    ap.add_argument("--cleanup-indexes", action="store_true",
+                    help="delete each cached competitor index after measuring it")
     args = ap.parse_args()
     global K
     K = args.k
@@ -216,13 +227,16 @@ def main():
     records = []
     if "hnswlib" in libs:
         print("Running hnswlib...")
-        bench_hnswlib(base, queries, truth, records, args.metric, args.data_dir)
+        bench_hnswlib(base, queries, truth, records, args.metric, args.data_dir,
+                      args.cleanup_indexes)
     if "usearch" in libs:
         print("Running usearch...")
-        bench_usearch(base, queries, truth, records, args.metric, args.data_dir)
+        bench_usearch(base, queries, truth, records, args.metric, args.data_dir,
+                      args.cleanup_indexes)
     if "faiss-hnsw" in libs:
         print("Running faiss-hnsw...")
-        bench_faiss_hnsw(base, queries, truth, records, args.metric, args.data_dir)
+        bench_faiss_hnsw(base, queries, truth, records, args.metric, args.data_dir,
+                         args.cleanup_indexes)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as f:

@@ -1,0 +1,39 @@
+float:
+  angular:
+    docker-tag: ann-benchmarks-annex
+    module: ann_benchmarks.algorithms.annex
+    constructor: Annex
+    base-args: ['@metric']
+    run-groups:
+      base:
+        args:
+          - {M: 16, efConstruction: 300}
+          - {M: 16, efConstruction: 300, sq8: true}
+          - {M: 32, efConstruction: 300}
+          - {M: 32, efConstruction: 300, sq8: true}
+      query:
+        args:
+          - [{ef: 32}]
+          - [{ef: 64}]
+          - [{ef: 128}]
+          - [{ef: 256}]
+          - [{ef: 512}]
+  euclidean:
+    docker-tag: ann-benchmarks-annex
+    module: ann_benchmarks.algorithms.annex
+    constructor: Annex
+    base-args: ['@metric']
+    run-groups:
+      base:
+        args:
+          - {M: 16, efConstruction: 300}
+          - {M: 16, efConstruction: 300, sq8: true}
+          - {M: 32, efConstruction: 300}
+          - {M: 32, efConstruction: 300, sq8: true}
+      query:
+        args:
+          - [{ef: 32}]
+          - [{ef: 64}]
+          - [{ef: 128}]
+          - [{ef: 256}]
+          - [{ef: 512}]

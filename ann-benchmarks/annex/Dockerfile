@@ -8,7 +8,7 @@ RUN apt-get update \
     && apt-get clean \
     && find /var/lib/apt/lists -mindepth 1 -delete
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --no-modify-path --default-toolchain stable
+    | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.98.1
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # maturin builds the PyO3 extension
@@ -25,7 +25,8 @@ RUN git init /annex \
 
 RUN cd /annex/python/annex-py \
     && maturin build --release --features extension-module -o /tmp/annex-wheels \
-    && find /annex/target -mindepth 1 -delete
+    && find /annex/target -mindepth 1 -delete \
+    && find /root/.cargo/registry -mindepth 1 -delete
 
 FROM ann-benchmarks
 

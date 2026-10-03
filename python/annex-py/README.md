@@ -1,5 +1,7 @@
 # Python snapshot search
 
+[ANNex website](https://annexsearch.vercel.app)
+
 `annexdb.Index` loads an ANNex core `Segment` snapshot and provides native
 single-query and batch HNSW search. Python 3.9+ and NumPy are required.
 The [multivector HTTP API](../../crates/annex-multivector/README.md) owns hybrid

@@ -19,10 +19,10 @@ license = { text = "MIT OR Apache-2.0" }
 dependencies = ["numpy>=1.23"]
 
 [project.urls]
-Homepage = "https://github.com/rosharma719/ANNex"
+Homepage = "https://annexsearch.vercel.app"
+Documentation = "https://annexsearch.vercel.app"
 Repository = "https://github.com/rosharma719/ANNex"
 Issues = "https://github.com/rosharma719/ANNex/issues"
 
 [tool.maturin]
 features = ["extension-module"]
-

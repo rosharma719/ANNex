@@ -1,5 +1,5 @@
 import numpy as np
-from ann_benchmarks.algorithms.base import BaseANN
+from ann_benchmarks.algorithms.base.module import BaseANN
 import annexdb
 
 
@@ -53,7 +53,7 @@ class Annex(BaseANN):
         )
         self._res = ids
 
-    def get_results(self):
+    def get_batch_results(self):
         return self._res
 
     def __str__(self):

@@ -9,9 +9,13 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 RUN pip install maturin
 
 ARG ANNEX_REPO=https://github.com/rosharma719/ANNex.git
-ARG ANNEX_REF=master
+ARG ANNEX_REF=df9da0ff6bc878c0f7c48ed8c33aed57ba8e2040
 
-RUN git clone --depth 1 --branch "$ANNEX_REF" "$ANNEX_REPO" /annex
+RUN git init /annex \
+    && cd /annex \
+    && git remote add origin "$ANNEX_REPO" \
+    && git fetch --depth 1 origin "$ANNEX_REF" \
+    && git checkout --detach FETCH_HEAD
 
 WORKDIR /annex/python/annex-py
 RUN maturin build --release --features extension-module -o /tmp/annex-wheels

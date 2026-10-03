@@ -1,4 +1,4 @@
-FROM ann-benchmarks-base
+FROM ann-benchmarks
 
 # Rust toolchain
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \

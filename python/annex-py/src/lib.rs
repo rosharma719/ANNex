@@ -173,9 +173,16 @@ impl Index {
                     segment.bulk_load(&batch).map_err(|e| e.to_string())?;
                     pos = end;
                 }
+                // Free the input copy before snapshot extraction so peak
+                // memory is segment + snapshot, not segment + snapshot + flat.
+                drop(flat);
 
-                let mut idx =
-                    HNSWIndex::from_snapshot(segment.hnsw().to_snapshot());
+                let snapshot = segment.hnsw().to_snapshot();
+                // Free the segment (and its VectorArena) before allocating
+                // the HNSWIndex so peak is snapshot + index, not both + segment.
+                drop(segment);
+
+                let mut idx = HNSWIndex::from_snapshot(snapshot);
                 if quantize {
                     idx.quantize_all();
                 }

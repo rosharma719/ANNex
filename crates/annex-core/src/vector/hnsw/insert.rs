@@ -457,6 +457,7 @@ impl HNSWIndex {
         // Keep one immutable arena snapshot for the whole operation instead of
         // taking the arena locks for every distance calculation below.
         let vectors = self.vectors.view();
+        let deleted = self.deleted.view();
         let query = vectors.get(idx);
         // Build-time: don't apply candidate-pool expansion; ef_construct already controls quality.
         let opts = SearchRuntimeOptions {
@@ -492,6 +493,7 @@ impl HNSWIndex {
                 use_norm,
                 l,
                 &vectors,
+                &deleted,
             );
 
             // Write new node's neighbor list, sorted with self-link at position 0.
@@ -571,6 +573,7 @@ impl HNSWIndex {
                             use_norm,
                             l,
                             &vectors,
+                            &deleted,
                         );
                         self.layers[l].with(n, |lock| *lock.write() = selected.clone());
                         // Keep edge_dists_l0 in sync with the post-cap neighbor list.
@@ -954,12 +957,14 @@ impl HNSWIndex {
         level: usize,
     ) -> Vec<usize> {
         let vectors = self.vectors.view();
+        let deleted = self.deleted.view();
         self.select_diverse_neighbors_with_view(
             candidates,
             m,
             normalize_scores,
             level,
             &vectors,
+            &deleted,
         )
     }
 
@@ -970,6 +975,7 @@ impl HNSWIndex {
         normalize_scores: bool,
         level: usize,
         vectors: &super::arena::VectorArenaView,
+        deleted: &super::arena::ChunkedArrayView<std::sync::atomic::AtomicBool>,
     ) -> Vec<usize> {
         let alpha = diversity_alpha_for_level(level);
         let prune_floor = diversity_prune_floor().min(m);
@@ -979,6 +985,12 @@ impl HNSWIndex {
                 break;
             }
             if result.contains(&cand.idx) {
+                continue;
+            }
+            if deleted
+                .get(cand.idx)
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
                 continue;
             }
             let cand_vec = vectors.get(cand.idx);
@@ -1041,6 +1053,7 @@ impl HNSWIndex {
         }
 
         let vectors = self.vectors.view();
+        let deleted = self.deleted.view();
         let neighbor_indices: Vec<usize> = layer.with(node_idx, |rw| rw.read().clone());
         let node_vec = vectors.get(node_idx);
 
@@ -1063,8 +1076,14 @@ impl HNSWIndex {
                 .unwrap_or(Ordering::Equal)
         });
 
-        let selected =
-            self.select_diverse_neighbors_with_view(&candidates, cap, true, level, &vectors);
+        let selected = self.select_diverse_neighbors_with_view(
+            &candidates,
+            cap,
+            true,
+            level,
+            &vectors,
+            &deleted,
+        );
         self.layers[level].with(node_idx, |lock| *lock.write() = selected.clone());
         // Keep edge_dists_l0 in sync with the post-cap neighbor list.
         if level == 0 && !self.edge_dists_l0.is_empty() {

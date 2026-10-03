@@ -453,6 +453,11 @@ impl HNSWIndex {
         }
         let mut current_entry = initial_entry;
         let use_norm = self.metric == DistanceMetric::Cosine || self.metric == DistanceMetric::Dot;
+        // Every vector in this insertion wave is allocated before linking begins.
+        // Keep one immutable arena snapshot for the whole operation instead of
+        // taking the arena locks for every distance calculation below.
+        let vectors = self.vectors.view();
+        let query = vectors.get(idx);
         // Build-time: don't apply candidate-pool expansion; ef_construct already controls quality.
         let opts = SearchRuntimeOptions {
             expansion_mult: Some(1),
@@ -461,13 +466,12 @@ impl HNSWIndex {
 
         // Greedy descent above the insertion level.
         for l in ((level + 1)..=self.current_max_level()).rev() {
-            current_entry =
-                self.greedy_search_layer_unfiltered(self.vector_slice(idx), current_entry, l);
+            current_entry = self.greedy_search_layer_unfiltered(query, current_entry, l);
         }
 
         for l in (0..=level).rev() {
             let (mut candidates, _) = self.search_layer_unfiltered(
-                self.vector_slice(idx),
+                query,
                 &[current_entry],
                 l,
                 self.ef_construct,
@@ -479,10 +483,16 @@ impl HNSWIndex {
             Self::pre_sort_candidates(&mut candidates);
 
             // Extend candidates: top-m only (matches sequential insert path).
-            self.extend_candidates(&mut candidates, idx, l, use_norm);
+            self.extend_candidates_with_view(&mut candidates, idx, l, use_norm, &vectors);
 
             let m_for_layer = if l == 0 { self.m0 } else { self.m };
-            let neighbors = self.select_diverse_neighbors(&candidates, m_for_layer, use_norm, l);
+            let neighbors = self.select_diverse_neighbors_with_view(
+                &candidates,
+                m_for_layer,
+                use_norm,
+                l,
+                &vectors,
+            );
 
             // Write new node's neighbor list, sorted with self-link at position 0.
             {
@@ -495,14 +505,13 @@ impl HNSWIndex {
                 }
                 self.layers[l].with(idx, |lock| *lock.write() = linked.clone());
                 if l == 0 {
-                    let src = self.vector_slice(idx).to_vec();
                     let dists: Vec<f32> = linked
                         .iter()
                         .map(|&n| {
                             if n == idx {
                                 return 0.0;
                             }
-                            self.fast_score(&src, self.vector_slice(n))
+                            self.fast_score(query, vectors.get(n))
                         })
                         .collect();
                     self.edge_dists_l0.with(idx, |lock| *lock.write() = dists);
@@ -511,19 +520,13 @@ impl HNSWIndex {
 
             // Write back-edges into neighbors, sorted by distance from each neighbor.
             for &n in &neighbors {
-                let Some(n_vec) = self.get_vector_by_idx(n) else {
-                    continue;
-                };
-                let n_vec = n_vec.to_vec();
-                let new_score =
-                    self.normalize_score(self.fast_score(&n_vec, self.vector_slice(idx)));
+                let n_vec = vectors.get(n);
+                let new_score = self.normalize_score(self.fast_score(n_vec, query));
                 self.layers[l].with(n, |lock| {
                     let mut nb_list = lock.write();
                     // idx is freshly allocated; it can't already be in nb_list.
                     let pos = nb_list.partition_point(|&nb| {
-                        self.get_vector_by_idx(nb)
-                            .map(|v| self.normalize_score(self.fast_score(&n_vec, v)) <= new_score)
-                            .unwrap_or(true)
+                        self.normalize_score(self.fast_score(n_vec, vectors.get(nb))) <= new_score
                     });
                     nb_list.insert(pos, idx);
                     if l == 0 {
@@ -533,7 +536,7 @@ impl HNSWIndex {
                                 if nb == n {
                                     return 0.0;
                                 }
-                                self.fast_score(&n_vec, self.vector_slice(nb))
+                                self.fast_score(n_vec, vectors.get(nb))
                             })
                             .collect();
                         self.edge_dists_l0.with(n, |ed| *ed.write() = n_dists);
@@ -549,7 +552,7 @@ impl HNSWIndex {
                         let mut cands: Vec<NodeCandidate> = nb_indices
                             .into_iter()
                             .map(|nb_idx| {
-                                let raw = self.fast_score(&n_vec, self.vector_slice(nb_idx));
+                                let raw = self.fast_score(n_vec, vectors.get(nb_idx));
                                 NodeCandidate {
                                     idx: nb_idx,
                                     raw_score: raw,
@@ -562,7 +565,13 @@ impl HNSWIndex {
                                 .partial_cmp(&b.sort_key)
                                 .unwrap_or(Ordering::Equal)
                         });
-                        let selected = self.select_diverse_neighbors(&cands, cap, use_norm, l);
+                        let selected = self.select_diverse_neighbors_with_view(
+                            &cands,
+                            cap,
+                            use_norm,
+                            l,
+                            &vectors,
+                        );
                         self.layers[l].with(n, |lock| *lock.write() = selected.clone());
                         // Keep edge_dists_l0 in sync with the post-cap neighbor list.
                         if l == 0 && !self.edge_dists_l0.is_empty() {
@@ -572,7 +581,7 @@ impl HNSWIndex {
                                     if nb == n {
                                         return 0.0;
                                     }
-                                    self.fast_score(&n_vec, self.vector_slice(nb))
+                                    self.fast_score(n_vec, vectors.get(nb))
                                 })
                                 .collect();
                             self.edge_dists_l0.with(n, |lock| *lock.write() = dists);
@@ -868,6 +877,18 @@ impl HNSWIndex {
         level: usize,
         use_norm: bool,
     ) {
+        let vectors = self.vectors.view();
+        self.extend_candidates_with_view(candidates, idx, level, use_norm, &vectors);
+    }
+
+    fn extend_candidates_with_view(
+        &self,
+        candidates: &mut Vec<NodeCandidate>,
+        idx: usize,
+        level: usize,
+        use_norm: bool,
+        vectors: &super::arena::VectorArenaView,
+    ) {
         let m_for_layer = if level == 0 { self.m0 } else { self.m };
         let nodes_len = self.levels.len();
         SEARCH_SCRATCH.with(|cell| {
@@ -905,7 +926,7 @@ impl HNSWIndex {
                     if !scratch.mark_extend_seen(nb) {
                         continue;
                     }
-                    let raw = self.fast_score(self.vector_slice(idx), self.vector_slice(nb));
+                    let raw = self.fast_score(vectors.get(idx), vectors.get(nb));
                     let sort_key = if use_norm {
                         self.normalize_score(raw)
                     } else {
@@ -932,6 +953,24 @@ impl HNSWIndex {
         normalize_scores: bool,
         level: usize,
     ) -> Vec<usize> {
+        let vectors = self.vectors.view();
+        self.select_diverse_neighbors_with_view(
+            candidates,
+            m,
+            normalize_scores,
+            level,
+            &vectors,
+        )
+    }
+
+    fn select_diverse_neighbors_with_view(
+        &self,
+        candidates: &[NodeCandidate],
+        m: usize,
+        normalize_scores: bool,
+        level: usize,
+        vectors: &super::arena::VectorArenaView,
+    ) -> Vec<usize> {
         let alpha = diversity_alpha_for_level(level);
         let prune_floor = diversity_prune_floor().min(m);
         let mut result = Vec::with_capacity(m);
@@ -942,9 +981,7 @@ impl HNSWIndex {
             if result.contains(&cand.idx) {
                 continue;
             }
-            let Some(cand_vec) = self.get_vector_by_idx(cand.idx) else {
-                continue;
-            };
+            let cand_vec = vectors.get(cand.idx);
             let d_qc = cand.sort_key;
             if result.len() < prune_floor {
                 result.push(cand.idx);
@@ -952,9 +989,7 @@ impl HNSWIndex {
             }
             let mut too_close = false;
             for &r_id in &result {
-                let Some(r_vec) = self.get_vector_by_idx(r_id) else {
-                    continue;
-                };
+                let r_vec = vectors.get(r_id);
                 let d_cr_raw = self.fast_score(cand_vec, r_vec);
                 let d_cr = if normalize_scores {
                     self.normalize_score(d_cr_raw)
@@ -1005,13 +1040,14 @@ impl HNSWIndex {
             return;
         }
 
+        let vectors = self.vectors.view();
         let neighbor_indices: Vec<usize> = layer.with(node_idx, |rw| rw.read().clone());
-        let node_vec: Vec<f32> = self.vector_slice(node_idx).to_vec();
+        let node_vec = vectors.get(node_idx);
 
         let mut candidates: Vec<NodeCandidate> = neighbor_indices
             .into_iter()
             .map(|nb_idx| {
-                let raw = self.fast_score(&node_vec, self.vector_slice(nb_idx));
+                let raw = self.fast_score(node_vec, vectors.get(nb_idx));
                 let sort_key = self.normalize_score(raw);
                 NodeCandidate {
                     idx: nb_idx,
@@ -1027,18 +1063,18 @@ impl HNSWIndex {
                 .unwrap_or(Ordering::Equal)
         });
 
-        let selected = self.select_diverse_neighbors(&candidates, cap, true, level);
+        let selected =
+            self.select_diverse_neighbors_with_view(&candidates, cap, true, level, &vectors);
         self.layers[level].with(node_idx, |lock| *lock.write() = selected.clone());
         // Keep edge_dists_l0 in sync with the post-cap neighbor list.
         if level == 0 && !self.edge_dists_l0.is_empty() {
-            let node_vec = self.vector_slice(node_idx).to_vec();
             let dists: Vec<f32> = selected
                 .iter()
                 .map(|&nb| {
                     if nb == node_idx {
                         return 0.0;
                     }
-                    self.fast_score(&node_vec, self.vector_slice(nb))
+                    self.fast_score(node_vec, vectors.get(nb))
                 })
                 .collect();
             self.edge_dists_l0

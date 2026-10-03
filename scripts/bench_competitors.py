@@ -23,8 +23,8 @@ K = 10
 
 
 def load_data(data_dir: Path, n_queries: int):
-    base    = np.load(data_dir / "base.npy").astype("float32")
-    queries = np.load(data_dir / "queries.npy")[:n_queries].astype("float32")
+    base    = np.load(data_dir / "base.npy").astype("float32", copy=False)
+    queries = np.load(data_dir / "queries.npy")[:n_queries].astype("float32", copy=False)
     truth   = json.loads((data_dir / "ground_truth.json").read_text())[:n_queries]
     truth   = [t[:K] for t in truth]
     return base, queries, truth

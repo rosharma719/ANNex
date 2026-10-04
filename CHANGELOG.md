@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Faster HNSW bulk construction** (`annex`). Insertion waves take one immutable arena view
+  instead of locking per access: a 20,000 x 64 cosine build drops from about 170 s to about 9 s
+  on 4 cores with identical recall@10. Adds the ann-benchmarks adapter under `ann-benchmarks/annex/`.
 - **Distance kernels**: AVX-512 (with VNNI for SQ8) and AVX2+FMA kernels for f32 dot, L2 and SQ8
   scoring, selected at runtime with a scalar fallback; NEON is unchanged. HNSW scoring and the
   multivector x86 dot path use them. MaxSim gets a register-tiled kernel over a packed query

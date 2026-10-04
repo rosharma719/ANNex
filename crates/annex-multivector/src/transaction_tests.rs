@@ -738,11 +738,18 @@ fn randomized_mutation_restart_state_machine_matches_scalar_oracle() {
             assert_eq!(actual.len(), model.len());
             let ids: HashSet<_> = actual.iter().map(|h| h.id.clone()).collect();
             assert_eq!(ids, model.keys().cloned().collect());
+            // With BF16 scoring opted in, rescoring runs through the BF16 kernels, which differ
+            // from this f32 reference by up to one BF16 dot error per query token.
+            let tolerance = if crate::fde::bf16_active() {
+                query.len() as f32 * crate::fde::BF16_UNIT_DOT_TOL
+            } else {
+                1e-5
+            };
             for hit in &actual {
                 let (vectors, metadata) = &model[&hit.id];
                 let expected = reference_score(&query, vectors);
                 assert!(
-                    (hit.score - expected).abs() < 1e-5,
+                    (hit.score - expected).abs() < tolerance,
                     "seed={seed} step={step} id={} score={} expected={expected}",
                     hit.id,
                     hit.score

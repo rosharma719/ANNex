@@ -6,7 +6,7 @@ pub type Vector = Vec<f32>;
 /// Whether [`dot`] and [`maxsim_flat`] are using the AVX-512 BF16 kernels. That needs a CPU
 /// with the instructions and an explicit opt-in (`VECTORDB_BF16=1`); see
 /// `annex::vector::simd::bf16_enabled` for why it is not automatic.
-fn bf16_active() -> bool {
+pub(crate) fn bf16_active() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         matches!(cpu_level(), CpuLevel::Avx512Bf16)
@@ -16,6 +16,21 @@ fn bf16_active() -> bool {
         false
     }
 }
+
+/// Worst-case error of a BF16 dot product of two unit vectors.
+///
+/// The BF16 kernels round each operand to bfloat16 (8 significant bits, so a relative error
+/// of at most 2^-8) and then multiply-accumulate in f32. Each product therefore has a
+/// relative error of at most 2 * 2^-8 (plus a second-order 2^-16), which gives
+/// `|bf16_dot - dot| <= (2^-7 + 2^-16) * sum|a_i * b_i|`. For unit vectors
+/// `sum|a_i * b_i| <= |a| * |b| = 1` (Cauchy-Schwarz), so the bound is about 7.8e-3 and does
+/// not grow with the dimension. The constant adds slack for f32 accumulation.
+///
+/// A tolerance of 1e-3 is not attainable in BF16: the self-dot of a normalised
+/// `1/(i+1)` vector is off by 3.9e-3 at dim 64 (see
+/// `bf16_operand_rounding_stays_within_the_documented_bound`).
+#[cfg(test)]
+pub(crate) const BF16_UNIT_DOT_TOL: f32 = 8.2e-3;
 
 pub fn normalize(vector: &[f32]) -> Vector {
     let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -668,20 +683,6 @@ mod x86 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Worst-case error of a BF16 dot product of two unit vectors.
-    ///
-    /// The BF16 kernels round each operand to bfloat16 (8 significant bits, so a relative error
-    /// of at most 2^-8) and then multiply-accumulate in f32. Each product therefore has a
-    /// relative error of at most 2 * 2^-8 (plus a second-order 2^-16), which gives
-    /// `|bf16_dot - dot| <= (2^-7 + 2^-16) * sum|a_i * b_i|`. For unit vectors
-    /// `sum|a_i * b_i| <= |a| * |b| = 1` (Cauchy-Schwarz), so the bound is about 7.8e-3 and does
-    /// not grow with the dimension. The constant adds slack for f32 accumulation.
-    ///
-    /// A tolerance of 1e-3 is not attainable in BF16: the self-dot of a normalised
-    /// `1/(i+1)` vector is off by 3.9e-3 at dim 64 (see
-    /// `bf16_operand_rounding_stays_within_the_documented_bound`).
-    const BF16_UNIT_DOT_TOL: f32 = 8.2e-3;
 
     /// Round an f32 to the nearest bfloat16 (ties to even) and back, as `vcvtneps2bf16` does to
     /// each operand before the fused multiply-accumulate.

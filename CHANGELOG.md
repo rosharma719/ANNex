@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- SQ8 `NeighborBlock` baseline for HNSW L0 traversal. Quantization now materializes immutable
+  32-neighbor expansion blocks with neighbor IDs and copied SQ8 codes, so compressed traversal
+  reads codes sequentially instead of gathering every neighbor from the global code array. The
+  first scorer is scalar and preserves the existing FP32 rerank behavior; block SIMD remains a
+  follow-up.
 - Experimental SQ4 codec and exact scalar `i8 × u4` scoring baseline in `annex`. The codec
   trains per-dimension ranges, packs two 4-bit codes per byte, prepares integer query weights,
   and exposes reconstruction error. It is not yet connected to HNSW traversal; neighbor-local

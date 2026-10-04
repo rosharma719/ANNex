@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use crate::utils::errors::DBError;
 use crate::utils::types::{DistanceMetric, PointId, Vector};
 use crate::vector::hnsw::arena::{ChunkedArray, VectorArena};
+use crate::vector::hnsw::neighbor_block::NeighborBlockStore;
 use crate::vector::kernels;
 
 use super::config::{
@@ -120,6 +121,9 @@ pub struct HNSWIndex {
     /// SQ8 quantized vectors: quantized[idx * dim + d] = u8 encoding of dimension d.
     /// Empty until `quantize_all()` is called.
     pub(crate) quantized: Vec<u8>,
+    /// Immutable L0 adjacency with neighbor-local SQ8 codes. Rebuilt with the
+    /// quantized representation and consumed by SQ8 graph traversal.
+    pub(crate) neighbor_blocks_sq8: NeighborBlockStore,
     /// Per-dimension minimum value used for SQ8 quantization.
     pub(crate) quant_min: Vec<f32>,
     /// Per-dimension scale: (max - min) / 255.0. Set to 1.0 for constant dimensions.
@@ -210,6 +214,7 @@ impl HNSWIndex {
                 node_count: 0,
             }),
             quantized: Vec::new(),
+            neighbor_blocks_sq8: NeighborBlockStore::default(),
             quant_min: Vec::new(),
             quant_scale: Vec::new(),
             exact_fallback_enabled: exact_fallback_enabled_override().unwrap_or(false),
@@ -871,6 +876,7 @@ impl HNSWIndex {
         // Quantized codes are indexed by node idx; they are invalidated by reordering.
         // Clear them so callers know to re-run quantize_all() after reorder.
         self.quantized.clear();
+        self.neighbor_blocks_sq8 = NeighborBlockStore::default();
         self.quant_min.clear();
         self.quant_scale.clear();
 
@@ -1092,6 +1098,11 @@ impl HNSWIndex {
             self.quant_scale = scale;
         }
         self.quantized = quantized;
+        let l0 = self.layers[0].view();
+        let adjacency = (0..l0.len())
+            .map(|idx| l0.get(idx).read().clone())
+            .collect::<Vec<_>>();
+        self.neighbor_blocks_sq8 = NeighborBlockStore::build(adjacency, &self.quantized, self.dim);
     }
 
     /// Quantize a query vector into signed i16 codes for `sq8_approx_dot`.

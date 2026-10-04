@@ -561,12 +561,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         read_key: args.read_key,
         write_key: args.write_key,
     };
-    let app = index_router(index)
-        .merge(collection_routes)
-        .layer(axum::middleware::from_fn_with_state(
-            std::sync::Arc::new(auth_config),
-            auth::auth_middleware,
-        ));
+    let app =
+        index_router(index)
+            .merge(collection_routes)
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(auth_config),
+                auth::auth_middleware,
+            ));
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     println!("multivector listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app)
@@ -753,7 +754,10 @@ mod tests {
         use axum::http::{Method, Request};
         use tower::ServiceExt;
         let app = authed_app(None, None);
-        let body = serde_json::to_vec(&serde_json::json!({"documents":[{"id":"x","vectors":[[1.0,0.0]],"metadata":{}}]})).unwrap();
+        let body = serde_json::to_vec(
+            &serde_json::json!({"documents":[{"id":"x","vectors":[[1.0,0.0]],"metadata":{}}]}),
+        )
+        .unwrap();
         let response = app
             .oneshot(
                 Request::builder()
@@ -766,7 +770,10 @@ mod tests {
             .await
             .unwrap();
         let s = response.status().as_u16();
-        assert_ne!(s, 401, "open server must not reject unauthenticated request");
+        assert_ne!(
+            s, 401,
+            "open server must not reject unauthenticated request"
+        );
         assert_ne!(s, 403, "open server must not forbid any request");
     }
 

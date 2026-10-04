@@ -1,3 +1,4 @@
+use annex::DistanceMetric;
 use annex::segment::Segment;
 use annex::vector::hnsw::{HNSWIndex, SearchRuntimeOptions};
 use numpy::{
@@ -6,6 +7,7 @@ use numpy::{
 };
 use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use std::collections::HashSet;
 
 type PySearchResult<'py> = PyResult<(Bound<'py, PyArray1<u64>>, Bound<'py, PyArray1<f32>>)>;
 type PyBatchSearchResult<'py> = PyResult<(Bound<'py, PyArray2<u64>>, Bound<'py, PyArray2<f32>>)>;
@@ -18,6 +20,25 @@ fn runtime_error<E: std::fmt::Display>(error: E) -> PyErr {
 
 fn value_error(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())
+}
+
+fn parse_metric(name: &str) -> PyResult<DistanceMetric> {
+    match name.to_ascii_lowercase().as_str() {
+        "cosine" => Ok(DistanceMetric::Cosine),
+        "dot" => Ok(DistanceMetric::Dot),
+        "euclidean" | "l2" => Ok(DistanceMetric::Euclidean),
+        other => Err(value_error(format!(
+            "unknown metric {other:?}; expected \"cosine\", \"dot\" or \"euclidean\""
+        ))),
+    }
+}
+
+fn metric_name(metric: DistanceMetric) -> &'static str {
+    match metric {
+        DistanceMetric::Cosine => "cosine",
+        DistanceMetric::Dot => "dot",
+        DistanceMetric::Euclidean => "euclidean",
+    }
 }
 
 #[inline]
@@ -106,13 +127,20 @@ fn with_query_buf<R>(query: &[f32], f: impl FnOnce(&Vec<f32>) -> R) -> R {
     })
 }
 
-/// In-memory ANN index loaded from an ANNex segment snapshot.
+/// In-memory ANN index, either built from NumPy arrays with `Index.build` or
+/// loaded from an ANNex segment snapshot.
 ///
 /// Search calls release the GIL. Query data is copied into Rust-owned memory
 /// before release so native search never aliases Python-owned mutable storage.
 #[pyclass]
 struct Index {
-    inner: HNSWIndex,
+    segment: Segment,
+}
+
+impl Index {
+    fn hnsw(&self) -> &HNSWIndex {
+        self.segment.hnsw()
+    }
 }
 
 #[pymethods]
@@ -122,23 +150,108 @@ impl Index {
     #[new]
     #[pyo3(signature = (path, quantize = false))]
     fn new(path: &str, quantize: bool) -> PyResult<Self> {
-        let segment = Segment::load_from_path(path).map_err(runtime_error)?;
-        let mut inner = HNSWIndex::from_snapshot(segment.hnsw().to_snapshot());
-        if inner.dim() == 0 {
+        let mut segment = Segment::load_from_path(path).map_err(runtime_error)?;
+        if segment.hnsw().dim() == 0 {
             return Err(value_error("the loaded index has zero dimensions"));
         }
         if quantize {
-            inner.quantize_all();
+            segment.hnsw_mut().quantize_all();
         }
-        Ok(Self { inner })
+        Ok(Self { segment })
+    }
+
+    /// Build an index from a C-contiguous float32 array of shape `[n, dim]`.
+    ///
+    /// `ids` is an optional uint64 array of `n` unique ids; by default row `i`
+    /// gets id `i`. `metric` is `"cosine"`, `"dot"` or `"euclidean"`. `m` and
+    /// `ef_construction` are the usual HNSW build parameters. Save the result
+    /// with `Index.save` and reload it with `Index(path)`.
+    #[staticmethod]
+    #[pyo3(signature = (vectors, ids = None, metric = "cosine", m = 16, ef_construction = 64, level_cap = 16))]
+    fn build<'py>(
+        py: Python<'py>,
+        vectors: PyReadonlyArray2<'py, f32>,
+        ids: Option<PyReadonlyArray1<'py, u64>>,
+        metric: &str,
+        m: usize,
+        ef_construction: usize,
+        level_cap: usize,
+    ) -> PyResult<Self> {
+        let shape = vectors.shape();
+        let (rows, dimensions) = (shape[0], shape[1]);
+        if rows == 0 {
+            return Err(value_error("vectors must contain at least one row"));
+        }
+        if dimensions == 0 {
+            return Err(value_error("vectors must have at least one dimension"));
+        }
+        if !vectors.is_c_contiguous() {
+            return Err(value_error("vectors must be C-contiguous (row-major)"));
+        }
+        let flat = vectors.as_slice()?;
+        validate_values(flat, "vectors")?;
+        if m < 2 {
+            return Err(value_error("m must be at least 2"));
+        }
+        if ef_construction == 0 {
+            return Err(value_error("ef_construction must be at least 1"));
+        }
+        let metric = parse_metric(metric)?;
+
+        let ids: Vec<u64> = match ids {
+            Some(ids) => {
+                let ids = ids.as_slice()?;
+                if ids.len() != rows {
+                    return Err(value_error(format!(
+                        "ids has {} entries but vectors has {rows} rows",
+                        ids.len()
+                    )));
+                }
+                ids.to_vec()
+            }
+            None => (0..rows as u64).collect(),
+        };
+        let mut seen = HashSet::with_capacity(ids.len());
+        if let Some(duplicate) = ids.iter().find(|id| !seen.insert(**id)) {
+            return Err(value_error(format!("duplicate id {duplicate}")));
+        }
+
+        // Own all Python-backed input before releasing the GIL.
+        let entries: Vec<(u64, Vec<f32>)> = ids
+            .iter()
+            .zip(flat.chunks_exact(dimensions))
+            .map(|(id, row)| (*id, row.to_vec()))
+            .collect();
+        let mut segment = Segment::with_config(metric, m, ef_construction, level_cap, dimensions);
+        let inserted = py
+            .detach(|| segment.bulk_load(&entries))
+            .map_err(runtime_error)?;
+        if inserted != rows {
+            return Err(runtime_error(format!(
+                "built {inserted} of {rows} vectors; the index is incomplete"
+            )));
+        }
+        Ok(Self { segment })
+    }
+
+    /// Write the index to `path` as an ANNex segment snapshot. The file loads
+    /// with `Index(path)` here and with `Segment::load_from_path` in Rust.
+    fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        py.detach(|| self.segment.save_to_path(path))
+            .map_err(runtime_error)
+    }
+
+    /// The distance metric: `"cosine"`, `"dot"` or `"euclidean"`.
+    fn metric(&self) -> &'static str {
+        metric_name(self.hnsw().metric())
     }
 
     fn __len__(&self) -> usize {
-        self.inner.len()
+        self.hnsw().len()
     }
 
     fn dim(&self) -> usize {
-        self.inner.dim()
+        self.hnsw().dim()
     }
 
     /// Search one query. Returns `(ids uint64[k], scores float32[k])`.
@@ -157,10 +270,10 @@ impl Index {
         patience: usize,
     ) -> PySearchResult<'py> {
         let query = query.as_slice()?;
-        if query.len() != self.inner.dim() {
+        if query.len() != self.hnsw().dim() {
             return Err(value_error(format!(
                 "query dimension mismatch: expected {}, got {}",
-                self.inner.dim(),
+                self.hnsw().dim(),
                 query.len()
             )));
         }
@@ -175,11 +288,11 @@ impl Index {
             ));
         }
 
-        let search_k = k.min(self.inner.len());
-        let search_ef = ef.max(search_k).min(self.inner.len());
+        let search_k = k.min(self.hnsw().len());
+        let search_ef = ef.max(search_k).min(self.hnsw().len());
         let options = opts(search_k, search_ef, sq8_screen, scan_cap, patience);
         let results = py
-            .detach(|| self.inner.search_with_options(&query, search_k, &options))
+            .detach(|| self.hnsw().search_with_options(&query, search_k, &options))
             .map_err(runtime_error)?;
         let ids = results.iter().map(|result| result.id).collect();
         let scores = results.iter().map(|result| result.raw_score).collect();
@@ -207,10 +320,10 @@ impl Index {
         let shape = queries.shape();
         let rows = shape[0];
         let dimensions = shape[1];
-        if dimensions != self.inner.dim() {
+        if dimensions != self.hnsw().dim() {
             return Err(value_error(format!(
                 "query dimension mismatch: expected {}, got {}",
-                self.inner.dim(),
+                self.hnsw().dim(),
                 dimensions
             )));
         }
@@ -229,8 +342,8 @@ impl Index {
 
         // Own all Python-backed input before releasing the GIL.
         let queries = queries.to_vec();
-        let search_k = k.min(self.inner.len());
-        let search_ef = ef.max(search_k).min(self.inner.len());
+        let search_k = k.min(self.hnsw().len());
+        let search_ef = ef.max(search_k).min(self.hnsw().len());
         let options = opts(search_k, search_ef, sq8_screen, scan_cap, patience);
         let available_threads = std::thread::available_parallelism()
             .map(usize::from)
@@ -248,7 +361,7 @@ impl Index {
                 let offset = row * dimensions;
                 let query = &queries[offset..offset + dimensions];
                 let results = with_query_buf(query, |buffer| {
-                    self.inner.search_with_options(buffer, search_k, &options)
+                    self.hnsw().search_with_options(buffer, search_k, &options)
                 })
                 .map_err(|error| error.to_string())?;
                 let result_count = results.len().min(k);

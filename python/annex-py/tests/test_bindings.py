@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -160,6 +161,111 @@ for position, (actual_ids, actual_scores) in enumerate(concurrent):
         environment = os.environ.copy()
         environment["VECTORDB_EXACT_FALLBACK_ENABLED"] = "false"
         subprocess.run([sys.executable, "-c", script], env=environment, check=True)
+
+
+def unit_rows(values):
+    return values / np.linalg.norm(values, axis=-1, keepdims=True)
+
+
+class BuildTests(unittest.TestCase):
+    """Indexes built from NumPy arrays; these need no snapshot fixture."""
+
+    @classmethod
+    def setUpClass(cls):
+        rng = np.random.default_rng(7)
+        cls.vectors = rng.standard_normal((300, 12)).astype(np.float32)
+        cls.query = rng.standard_normal(12).astype(np.float32)
+
+    # What each metric reports as its score, and which direction is closer.
+    def oracle(self, metric):
+        if metric == "cosine":
+            return 1.0 - unit_rows(self.vectors) @ unit_rows(self.query), False
+        if metric == "dot":
+            return self.vectors @ self.query, True
+        return ((self.vectors - self.query) ** 2).sum(axis=1), False
+
+    def test_matches_numpy_for_every_metric(self):
+        for metric in ("cosine", "dot", "euclidean"):
+            with self.subTest(metric=metric):
+                index = annexdb.Index.build(self.vectors, metric=metric)
+                self.assertEqual(index.metric(), metric)
+                self.assertEqual(len(index), len(self.vectors))
+                self.assertEqual(index.dim(), self.vectors.shape[1])
+                # ef >= n explores the whole graph, so results are exact.
+                ids, scores = index.search(self.query, k=5, ef=len(self.vectors))
+                values, higher_is_closer = self.oracle(metric)
+                order = np.argsort(-values if higher_is_closer else values)[:5]
+                np.testing.assert_array_equal(ids, order.astype(np.uint64))
+                np.testing.assert_allclose(scores, values[order], rtol=1e-4, atol=1e-4)
+
+    def test_default_ids_are_row_numbers_and_custom_ids_are_kept(self):
+        index = annexdb.Index.build(self.vectors)
+        ids, _ = index.search(self.vectors[0], k=1, ef=300)
+        self.assertEqual(int(ids[0]), 0)
+        custom = np.arange(len(self.vectors), dtype=np.uint64) * 3 + 1000
+        index = annexdb.Index.build(self.vectors, ids=custom)
+        ids, _ = index.search(self.vectors[5], k=1, ef=300)
+        self.assertEqual(int(ids[0]), 1015)
+
+    def test_save_and_reload_round_trip(self):
+        index = annexdb.Index.build(self.vectors, metric="euclidean")
+        before = index.search(self.query, k=10, ef=300)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "index.bin")
+            index.save(path)
+            reloaded = annexdb.Index(path)
+            self.assertEqual(len(reloaded), len(index))
+            self.assertEqual(reloaded.dim(), index.dim())
+            self.assertEqual(reloaded.metric(), "euclidean")
+            after = reloaded.search(self.query, k=10, ef=300)
+            np.testing.assert_array_equal(before[0], after[0])
+            np.testing.assert_array_equal(before[1], after[1])
+            # A loaded index can be saved again.
+            second = os.path.join(directory, "again.bin")
+            reloaded.save(second)
+            np.testing.assert_array_equal(
+                before[0], annexdb.Index(second).search(self.query, k=10, ef=300)[0]
+            )
+            # And loaded with SQ8 screening.
+            quantized = annexdb.Index(path, quantize=True)
+            ids, _ = quantized.search(self.query, k=3, sq8_screen=True)
+            self.assertEqual(ids.shape, (3,))
+
+    def test_batch_search_on_a_built_index(self):
+        index = annexdb.Index.build(self.vectors)
+        ids, scores = index.search_batch(self.vectors[:40], k=3, ef=300, threads=4)
+        self.assertEqual(ids.shape, (40, 3))
+        np.testing.assert_array_equal(ids[:, 0], np.arange(40, dtype=np.uint64))
+
+    def test_rejects_bad_input(self):
+        build = annexdb.Index.build
+        cases = {
+            "no rows": lambda: build(np.zeros((0, 4), dtype=np.float32)),
+            "no dimensions": lambda: build(np.zeros((3, 0), dtype=np.float32)),
+            "non-finite": lambda: build(np.array([[1.0, np.nan]], dtype=np.float32)),
+            "fortran order": lambda: build(np.asfortranarray(self.vectors)),
+            "unknown metric": lambda: build(self.vectors, metric="manhattan"),
+            "wrong id count": lambda: build(self.vectors, ids=np.arange(5, dtype=np.uint64)),
+            "duplicate ids": lambda: build(
+                self.vectors[:4], ids=np.array([1, 2, 2, 3], dtype=np.uint64)
+            ),
+            "m too small": lambda: build(self.vectors, m=1),
+            "zero ef_construction": lambda: build(self.vectors, ef_construction=0),
+        }
+        for label, call in cases.items():
+            with self.subTest(label), self.assertRaises(ValueError):
+                call()
+
+    def test_save_reports_io_errors(self):
+        index = annexdb.Index.build(self.vectors[:10])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(RuntimeError):
+                index.save(os.path.join(directory, "missing", "index.bin"))
+
+    def test_search_validates_query_dimension(self):
+        index = annexdb.Index.build(self.vectors)
+        with self.assertRaises(ValueError):
+            index.search(np.zeros(3, dtype=np.float32))
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ANNexDB"
-version = "0.2.0"
+version = "0.3.0"
 requires-python = ">=3.9"
 description = "Python bindings for the ANNex vector search engine."
 readme = "README.md"
@@ -19,8 +19,8 @@ license = { text = "MIT OR Apache-2.0" }
 dependencies = ["numpy>=1.23"]
 
 [project.urls]
-Homepage = "https://annexsearch.vercel.app"
-Documentation = "https://annexsearch.vercel.app"
+Homepage = "https://annexsearch.dev"
+Documentation = "https://annexsearch.dev"
 Repository = "https://github.com/rosharma719/ANNex"
 Issues = "https://github.com/rosharma719/ANNex/issues"
 

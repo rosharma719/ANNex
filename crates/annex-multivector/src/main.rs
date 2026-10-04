@@ -1,3 +1,5 @@
+mod auth;
+
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
@@ -45,6 +47,14 @@ struct Args {
     analyzer: String,
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
+    /// API key granting write access (upsert, delete, train, build_ann, compact, create_collection).
+    /// Also satisfies read-only routes. Omit to run without authentication.
+    #[arg(long)]
+    write_key: Option<String>,
+    /// API key granting read-only access (retrieve, query, plan, stats, healthz, list).
+    /// Omit to fall back to write_key for reads, or run without authentication.
+    #[arg(long)]
+    read_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -547,7 +557,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::routing::any(collection_request),
         )
         .with_state(collections);
-    let app = index_router(index).merge(collection_routes);
+    let auth_config = auth::AuthConfig {
+        read_key: args.read_key,
+        write_key: args.write_key,
+    };
+    let app =
+        index_router(index)
+            .merge(collection_routes)
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(auth_config),
+                auth::auth_middleware,
+            ));
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     println!("multivector listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app)
@@ -726,5 +746,93 @@ mod tests {
                 assert!(actual["stats"]["fde_maxsim_agreement"].is_null());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn open_server_passes_write_route_on_real_router() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
+        let app = authed_app(None, None);
+        let body = serde_json::to_vec(
+            &serde_json::json!({"documents":[{"id":"x","vectors":[[1.0,0.0]],"metadata":{}}]}),
+        )
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/vectors/upsert")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let s = response.status().as_u16();
+        assert_ne!(
+            s, 401,
+            "open server must not reject unauthenticated request"
+        );
+        assert_ne!(s, 403, "open server must not forbid any request");
+    }
+
+    fn authed_app(read_key: Option<&str>, write_key: Option<&str>) -> axum::Router {
+        use crate::auth::AuthConfig;
+        let (_dir, index) = fixture();
+        let config = AuthConfig {
+            read_key: read_key.map(str::to_owned),
+            write_key: write_key.map(str::to_owned),
+        };
+        index_router(index).layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::new(config),
+            auth::auth_middleware,
+        ))
+    }
+
+    #[tokio::test]
+    async fn authed_server_rejects_upsert_without_key() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
+        let app = authed_app(None, Some("wk-test"));
+        let body = serde_json::to_vec(&serde_json::json!({"documents":[]})).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/vectors/upsert")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn authed_server_accepts_upsert_with_write_key() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
+        let app = authed_app(None, Some("wk-test"));
+        let body = serde_json::to_vec(&serde_json::json!({"documents":[]})).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/vectors/upsert")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer wk-test")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Auth accepted the write key; handler returns 400 (empty batch) not 401/403.
+        let s = response.status().as_u16();
+        assert_ne!(s, 401, "should not be rejected as unauthenticated");
+        assert_ne!(s, 403, "should not be rejected as forbidden");
     }
 }

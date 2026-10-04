@@ -3,6 +3,7 @@ pub mod config;
 mod core;
 mod filter;
 mod insert;
+mod neighbor_block;
 mod scratch;
 mod search;
 mod snapshot;

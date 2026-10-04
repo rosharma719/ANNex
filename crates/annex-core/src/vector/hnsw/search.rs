@@ -1051,8 +1051,48 @@ impl HNSWIndex {
                 let current = scratch.candidate_queue.pop().unwrap();
                 expanded += 1;
 
-                let neighbors_lock_opt = layer_view.as_ref().and_then(|v| v.get_opt(current.idx));
-                if let Some(neighbors_lock) = neighbors_lock_opt {
+                if level == 0
+                    && let Some(blocks) = self.neighbor_blocks_sq8.get(current.idx)
+                {
+                    for block in blocks {
+                        let scores = block.score(query_q, self.metric);
+                        for (slot, &approx_dot) in scores.iter().enumerate().take(block.len()) {
+                            let idx = block.id(slot);
+                            if idx >= node_bound
+                                || !is_live_via(&state_view, idx)
+                                || !scratch.mark_visited(idx)
+                            {
+                                continue;
+                            }
+                            visited_count += 1;
+                            let score_val = -(approx_dot as f32);
+                            let improves = scratch.result_set.len() < ef || score_val < worst_score;
+                            if improves {
+                                let candidate = NodeCandidate {
+                                    idx,
+                                    raw_score: 0.0,
+                                    sort_key: score_val,
+                                };
+                                scratch.candidate_queue.push(candidate);
+                                scratch.result_set.push(NodeResult(candidate));
+                                if scratch.result_set.len() > ef {
+                                    scratch.result_set.pop();
+                                }
+                                if let Some(result) = scratch.result_set.peek() {
+                                    worst_score = result.0.sort_key;
+                                }
+                            } else {
+                                scratch.candidate_queue.push(NodeCandidate {
+                                    idx,
+                                    raw_score: 0.0,
+                                    sort_key: score_val,
+                                });
+                            }
+                        }
+                    }
+                } else if let Some(neighbors_lock) =
+                    layer_view.as_ref().and_then(|v| v.get_opt(current.idx))
+                {
                     let neighbors = neighbors_lock.read();
                     const BATCH: usize = 16;
                     let mut batch = [0usize; BATCH];

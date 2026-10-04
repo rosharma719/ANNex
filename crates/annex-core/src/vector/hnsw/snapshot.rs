@@ -272,6 +272,7 @@ impl HNSWIndex {
             edge_dists_l0,
             // SQ8 quantization is not persisted; rebuilt lazily via quantize_all().
             quantized: Vec::new(),
+            neighbor_blocks_sq8: super::neighbor_block::NeighborBlockStore::default(),
             quant_min: Vec::new(),
             quant_scale: Vec::new(),
             node_state: node_state_arr,

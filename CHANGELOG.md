@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-04
+
+### Added
+
+- **Python: build and save indexes** (`annex-py`). `annexdb.Index.build(vectors, ids=None,
+  metric="cosine", m=16, ef_construction=64, level_cap=16)` builds an index from a float32 NumPy
+  array of shape `[n, dim]` (row `i` gets id `i` unless `ids` is given), `Index.save(path)` writes
+  a snapshot that `Index(path)` and Rust's `Segment::load_from_path` both load, and
+  `Index.metric()` reports the metric. Python no longer needs a Rust-built snapshot to get
+  started. Dense search only; hybrid retrieval, payload filters and multivector search remain in
+  the Rust API and the `annex-multivector` HTTP server.
+- **Query planner for hybrid retrieval** (`annex-multivector`). `POST /v1/plan` compiles a
+  `/v1/retrieve` request into the physical plan the engine would run, without scoring documents:
+  each channel's operator, selection reason, limits, filter strategy and eligible-document
+  count. Retrieval traces embed the same plan. Adaptive planning allocates retrieval budgets by
+  query intent, learns operator costs from runtime observations, measures field coverage within
+  filters, and supports an optional `latency_budget_ms` objective (`planning_mode`, `query` and
+  `objective` on the retrieve request). Design: `docs/query-planner-spec.md`.
+- **Calibration persistence.** The planner's learned cost calibration is saved with the index
+  (atomically alongside the manifest, and autosaved every 50 observations) and restored when the
+  index is opened. `flush_calibration()` forces a save.
+- **ANN graph persistence** (`annex-multivector`). HNSW graphs built with `build_ann()` are saved
+  to `<root>/ann/<field>.ann` and reloaded on open when the stored graph matches the index
+  generation exactly; otherwise retrieval falls back to exact scoring until the graph is rebuilt.
+  `auto_compact_fde_ann` and `auto_compact_dense_ann` rebuild a graph only when its unmerged
+  delta exceeds a given fraction of the base (0.20 recommended).
+- **`annex::VectorIndex`**: a single-file persistent vector index (`build`, `open`, `save`,
+  `search`, `search_with_ef`) without planner overhead, for direct embedding queries such as
+  hard-negative mining. Writes `index.ann` and `index.ids`.
+
+### Changed
+
+- **Distance kernels**: AVX-512 (with VNNI for SQ8) and AVX2+FMA kernels for f32 dot, L2 and SQ8
+  scoring, selected at runtime with a scalar fallback; NEON is unchanged. HNSW scoring and the
+  multivector x86 dot path use them. MaxSim gets a register-tiled kernel over a packed query
+  (`MaxSimQuery`, exported from `annex-multivector`) so a query is packed once per rescoring call.
+- **BF16 compute** is selected automatically on CPUs that support it (Sapphire Rapids, Zen 4).
+- Query planning and batch retrieval in `annex-multivector` were reworked for performance.
+- Python: `Index(path)` keeps the loaded segment instead of copying its graph, so loading a
+  snapshot no longer holds two copies of it at once.
+
+### Fixed
+
+- Python README: cosine scores were documented as higher-is-better. They are reported as
+  `1 - similarity`, so lower is closer; dot product is a similarity (higher is closer) and
+  Euclidean is squared distance (lower is closer).
+
 ## [0.2.0] - 2026-09-30
 
 ### Added

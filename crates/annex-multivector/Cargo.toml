@@ -6,7 +6,7 @@ edition = "2024"
 rust-version.workspace = true
 description = "Late-interaction retrieval built on annex: MUVERA fixed-dimensional candidate generation, packed 2-bit residuals, ColBERT MaxSim rescoring."
 license = "MIT OR Apache-2.0"
-homepage = "https://annexsearch.vercel.app"
+homepage = "https://annexsearch.dev"
 repository = "https://github.com/rosharma719/annex"
 
 [lib]

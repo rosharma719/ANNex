@@ -4,7 +4,7 @@
 
 ANNex is a Rust workspace for vector and late-interaction retrieval.
 
-[Website](https://annexsearch.vercel.app) · [Documentation](https://docs.rs/annex) · [Python package](https://pypi.org/project/ANNexDB/)
+[Website](https://annexsearch.dev) · [Documentation](https://docs.rs/annex) · [Python package](https://pypi.org/project/ANNexDB/)
 
 | Component | Purpose | Documentation |
 | --- | --- | --- |

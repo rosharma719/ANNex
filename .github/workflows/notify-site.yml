@@ -1,0 +1,29 @@
+# Rebuild the website after a release so its changelog and version pick it up.
+#
+# Listens for the Release workflow finishing rather than for a `release` event: releases created
+# by release.yml use GITHUB_TOKEN, and GitHub does not start workflow runs for events caused by
+# that token.
+#
+# Needs a repository secret ANNEX_SITE_DEPLOY_HOOK holding a Vercel Deploy Hook URL
+# (Vercel project, Settings, Git, Deploy Hooks). Without it this workflow does nothing.
+name: Notify site
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+
+jobs:
+  rebuild-site:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger a site rebuild
+        env:
+          HOOK: ${{ secrets.ANNEX_SITE_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "ANNEX_SITE_DEPLOY_HOOK is not set; skipping the site rebuild."
+            exit 0
+          fi
+          curl -fsS -X POST "$HOOK"

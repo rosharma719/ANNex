@@ -3,6 +3,20 @@ use annex::vector::simd::{CpuLevel, cpu_level};
 
 pub type Vector = Vec<f32>;
 
+/// Whether [`dot`] and [`maxsim_flat`] are using the AVX-512 BF16 kernels. That needs a CPU
+/// with the instructions and an explicit opt-in (`VECTORDB_BF16=1`); see
+/// `annex::vector::simd::bf16_enabled` for why it is not automatic.
+fn bf16_active() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        matches!(cpu_level(), CpuLevel::Avx512Bf16)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 pub fn normalize(vector: &[f32]) -> Vector {
     let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
     if !norm.is_finite() {
@@ -56,7 +70,7 @@ pub fn dot(left: &[f32], right: &[f32]) -> f32 {
         dot_scalar(&left[..n], &right[..n])
     }
     #[cfg(target_arch = "x86_64")]
-    if n > 0 && matches!(cpu_level(), CpuLevel::Avx512Bf16) {
+    if n > 0 && bf16_active() {
         return unsafe { dot_avx512_bf16_len(left.as_ptr(), right.as_ptr(), n) };
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -168,7 +182,7 @@ pub fn maxsim_flat(query: &[Vector], document: &[f32], dimension: usize) -> f32 
         }
     }
     #[cfg(target_arch = "x86_64")]
-    if dimension > 0 && matches!(cpu_level(), CpuLevel::Avx512Bf16) {
+    if dimension > 0 && bf16_active() {
         return maxsim_flat_avx512_bf16(query, document, dimension);
     }
     #[cfg(target_arch = "x86_64")]
@@ -197,6 +211,10 @@ pub fn maxsim_flat(query: &[Vector], document: &[f32], dimension: usize) -> f32 
 /// dimension-major panel, so each document is scored with a register-tiled
 /// kernel that needs no horizontal reductions. Elsewhere it forwards to
 /// [`maxsim_flat`].
+///
+/// `score` always equals [`maxsim_flat`] on the same inputs. When the BF16 kernels are in use
+/// (see [`bf16_active`]) nothing is packed and every call goes through the same BF16 path, so
+/// the two never disagree about a document's score.
 pub struct MaxSimQuery<'a> {
     tokens: &'a [Vector],
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
@@ -209,7 +227,7 @@ impl<'a> MaxSimQuery<'a> {
     pub fn new(tokens: &'a [Vector], dimension: usize) -> Self {
         #[cfg(target_arch = "x86_64")]
         let packed = x86::PackedKernel::detect()
-            .filter(|_| dimension > 0 && !tokens.is_empty())
+            .filter(|_| dimension > 0 && !tokens.is_empty() && !bf16_active())
             .map(|kernel| {
                 let mut panel = x86::Panel::new();
                 x86::pack(tokens, dimension, kernel.lanes(), &mut panel);
@@ -665,18 +683,6 @@ mod tests {
     /// `bf16_operand_rounding_stays_within_the_documented_bound`).
     const BF16_UNIT_DOT_TOL: f32 = 8.2e-3;
 
-    /// Whether `fde::dot` and `maxsim_flat` currently dispatch to the BF16 kernels.
-    fn bf16_dispatch_active() -> bool {
-        #[cfg(target_arch = "x86_64")]
-        {
-            matches!(cpu_level(), CpuLevel::Avx512Bf16)
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
-        }
-    }
-
     /// Round an f32 to the nearest bfloat16 (ties to even) and back, as `vcvtneps2bf16` does to
     /// each operand before the fused multiply-accumulate.
     fn bf16_round(x: f32) -> f32 {
@@ -757,17 +763,9 @@ mod tests {
                         (got - want).abs() <= tol,
                         "flat dim={dim} nq={nq} nd={nd}: {got} vs {want}"
                     );
-                    // `want` comes from `dot`, which is a BF16 kernel on BF16 CPUs, while the
-                    // prepared query always scores with the f32 packed kernel. Each query token
-                    // contributes at most one BF16 dot error, so allow nq of them there.
-                    let prepared_tol = if bf16_dispatch_active() {
-                        nq as f32 * BF16_UNIT_DOT_TOL
-                    } else {
-                        tol
-                    };
                     let prepared = MaxSimQuery::new(&query, dim).score(&flat_doc, dim);
                     assert!(
-                        (prepared - want).abs() <= prepared_tol,
+                        (prepared - want).abs() <= tol,
                         "prepared dim={dim} nq={nq} nd={nd}: {prepared} vs {want}"
                     );
                 }
@@ -815,15 +813,13 @@ mod tests {
     }
 
     #[test]
-    fn maxsim_flat_bf16_agrees_with_scalar_on_dim128() {
-        if cfg!(not(target_arch = "x86_64")) {
+    fn maxsim_flat_bf16_agrees_with_exact_f64_on_dim128() {
+        // Only meaningful when the BF16 kernels are in use (CPU support plus VECTORDB_BF16=1).
+        if !bf16_active() {
             return;
         }
-        #[cfg(target_arch = "x86_64")]
-        if !std::arch::is_x86_feature_detected!("avx512bf16") {
-            return;
-        }
-
+        // Compare with a plain f64 reference, not `maxsim_flat_scalar`: that calls `dot`, which
+        // is the BF16 kernel here, so it would only compare BF16 with itself.
         let mut rng = 0xcafe_babe_u64;
         let mut next = || -> f32 {
             rng ^= rng << 13;
@@ -832,28 +828,64 @@ mod tests {
             (rng as f32 / u64::MAX as f32) * 2.0 - 1.0
         };
         let query: Vec<_> = (0..8)
-            .map(|_| (0..128).map(|_| next()).collect::<Vec<f32>>())
+            .map(|_| normalize(&(0..128).map(|_| next()).collect::<Vec<f32>>()))
             .collect();
         let doc_tokens: Vec<_> = (0..50)
-            .map(|_| (0..128).map(|_| next()).collect::<Vec<f32>>())
+            .map(|_| normalize(&(0..128).map(|_| next()).collect::<Vec<f32>>()))
             .collect();
         let flat_doc: Vec<f32> = doc_tokens.iter().flat_map(|v| v.iter().copied()).collect();
-        let scalar = maxsim_flat_scalar(&query, &flat_doc, 128);
+        let exact: f64 = query
+            .iter()
+            .map(|q| {
+                doc_tokens
+                    .iter()
+                    .map(|d| {
+                        q.iter()
+                            .zip(d)
+                            .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                            .sum::<f64>()
+                    })
+                    .fold(f64::NEG_INFINITY, f64::max)
+            })
+            .sum();
         let dispatch = maxsim_flat(&query, &flat_doc, 128);
-        let tol = 1e-3_f32 * scalar.abs().max(1.0);
+        // One BF16 dot error per query token at most.
+        let tol = query.len() as f64 * f64::from(BF16_UNIT_DOT_TOL);
         assert!(
-            (dispatch - scalar).abs() <= tol,
-            "bf16 maxsim mismatch: scalar={scalar} dispatch={dispatch}"
+            (f64::from(dispatch) - exact).abs() <= tol,
+            "bf16 maxsim {dispatch} vs exact {exact} (tolerance {tol})"
         );
+    }
+
+    /// `MaxSimQuery::score` is documented as equal to `maxsim_flat`. That has to hold on every
+    /// CPU and with BF16 on or off, because retrieval scores through the former and exact
+    /// scoring through the latter.
+    #[test]
+    fn prepared_query_scores_exactly_like_maxsim_flat() {
+        for &dim in &[1usize, 16, 33, 100, 128, 384] {
+            for &nq in &[1usize, 4, 17] {
+                let query: Vec<_> = (0..nq)
+                    .map(|i| normalize(&deterministic(0x31 + i as u64, dim)))
+                    .collect();
+                let doc: Vec<_> = (0..9)
+                    .map(|i| normalize(&deterministic(0x7000 + i as u64, dim)))
+                    .collect();
+                let (flat_doc, _) = flat(&doc);
+                let prepared = MaxSimQuery::new(&query, dim).score(&flat_doc, dim);
+                let direct = maxsim_flat(&query, &flat_doc, dim);
+                assert_eq!(
+                    prepared.to_bits(),
+                    direct.to_bits(),
+                    "dim={dim} nq={nq}: prepared {prepared} != maxsim_flat {direct}"
+                );
+            }
+        }
     }
 
     #[test]
     fn dot_self_is_near_one_after_normalize_on_bf16() {
-        if cfg!(not(target_arch = "x86_64")) {
-            return;
-        }
-        #[cfg(target_arch = "x86_64")]
-        if !std::arch::is_x86_feature_detected!("avx512bf16") {
+        // Only meaningful when the BF16 kernels are in use (CPU support plus VECTORDB_BF16=1).
+        if !bf16_active() {
             return;
         }
         for dim in [64usize, 128, 384, 768] {

@@ -51,8 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scoring, selected at runtime with a scalar fallback; NEON is unchanged. HNSW scoring and the
   multivector x86 dot path use them. MaxSim gets a register-tiled kernel over a packed query
   (`MaxSimQuery`, exported from `annex-multivector`) so a query is packed once per rescoring call.
-- **BF16 compute**: an AVX-512 BF16 dot kernel, used for scoring and MaxSim on CPUs that report
-  AVX-512 BF16 (Sapphire Rapids, Zen 4). Compute only: vectors are still stored as f32.
+- **BF16 compute is opt-in**: set `VECTORDB_BF16=1` to use an AVX-512 BF16 dot kernel for FDE
+  scoring and MaxSim on CPUs that report AVX-512 BF16 (Sapphire Rapids, Zen 4). It is off by
+  default because BF16 rounds each operand to bfloat16: scores differ from f32 by up to about
+  2^-7 of the vectors' magnitudes, and the exact backend (BF16) and the ANN backend (f32) then
+  disagree about a document's score. Compute only: vectors are still stored as f32.
+  `MaxSimQuery::score` now always equals `maxsim_flat`; with BF16 on it skips the packed f32
+  kernel so both use the same BF16 path.
 - Batched four-vector dot scoring and SIMD normalization in HNSW search, and cached collection
   statistics in the planner.
 - Python: `Index(path)` keeps the loaded segment instead of copying its graph, so loading a

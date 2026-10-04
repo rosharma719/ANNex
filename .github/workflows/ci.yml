@@ -52,6 +52,13 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+      - name: test (AVX-512 BF16 kernels opted in)
+        # BF16 scoring is off unless VECTORDB_BF16=1. Runners whose CPU has AVX-512 BF16
+        # exercise the kernels here; on other runners this repeats the normal tests.
+        env:
+          VECTORDB_BF16: '1'
+        run: cargo test -p annex -p annex-multivector
+
       - name: Benchmark and HTTP integration tests
         env:
           ANNEX_TEST_BINARY: target/debug/annex-multivector

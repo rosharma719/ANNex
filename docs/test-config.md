@@ -13,6 +13,7 @@ Configuration has one source of truth:
 | Filter seeding | [filtered search](../crates/annex-core/src/vector/hnsw/filter.rs) |
 | Progress and query traces | [telemetry](../crates/annex-core/src/utils/telemetry.rs) |
 | Durability, recovery and RSS policy | [operations](operations.md) |
+| AVX-512 BF16 scoring (`VECTORDB_BF16`, opt-in) | [CPU level selection](../crates/annex-core/src/vector/simd.rs) |
 
 [.env.example](../.env.example) contains example settings, not an independent
 copy of runtime defaults. Set experiment parameters explicitly and capture the

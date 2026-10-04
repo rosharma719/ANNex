@@ -773,7 +773,7 @@ fn randomized_mutation_restart_state_machine_matches_scalar_oracle() {
                     let (vectors, metadata) = model.get(&hit.id).expect("ANN returned a stale ID");
                     assert_eq!(&hit.metadata, metadata);
                     assert!(
-                        (hit.score - reference_score(&query, vectors)).abs() < 1e-5,
+                        (hit.score - reference_score(&query, vectors)).abs() < tolerance,
                         "ANN score: seed={seed} step={step}"
                     );
                 }

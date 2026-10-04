@@ -85,6 +85,7 @@ impl fmt::Display for Isa {
 
 type F32Fn = unsafe fn(&[f32], &[f32]) -> f32;
 type Sq8Fn = unsafe fn(&[i8], &[u8]) -> i32;
+type Sq4Fn = unsafe fn(&[i8], &[i8], &[u8]) -> i32;
 type ManyFn = unsafe fn(&[f32], &[&[f32]], &mut [f32]);
 
 /// A table of kernels for one ISA. Obtain one with [`Kernels::detect`] or
@@ -95,6 +96,7 @@ pub struct Kernels {
     dot: F32Fn,
     l2_squared: F32Fn,
     dot_i8_u8_centered: Sq8Fn,
+    dot_i8_u4_deinterleaved: Sq4Fn,
     dot_many: ManyFn,
     l2_squared_many: ManyFn,
 }
@@ -124,6 +126,7 @@ impl Kernels {
             dot: dot_scalar_unsafe,
             l2_squared: l2_squared_scalar_unsafe,
             dot_i8_u8_centered: dot_i8_u8_centered_scalar_unsafe,
+            dot_i8_u4_deinterleaved: dot_i8_u4_deinterleaved_scalar_unsafe,
             dot_many: dot_many_scalar,
             l2_squared_many: l2_squared_many_scalar,
         };
@@ -135,6 +138,7 @@ impl Kernels {
                 dot: x86::dot_avx2,
                 l2_squared: x86::l2_avx2,
                 dot_i8_u8_centered: x86::sq8_avx2,
+                dot_i8_u4_deinterleaved: dot_i8_u4_deinterleaved_scalar_unsafe,
                 dot_many: x86::dot_many_avx2,
                 l2_squared_many: x86::l2_many_avx2,
             },
@@ -144,6 +148,7 @@ impl Kernels {
                 dot: x86::dot_avx512,
                 l2_squared: x86::l2_avx512,
                 dot_i8_u8_centered: x86::sq8_avx512bw,
+                dot_i8_u4_deinterleaved: dot_i8_u4_deinterleaved_scalar_unsafe,
                 dot_many: x86::dot_many_avx512,
                 l2_squared_many: x86::l2_many_avx512,
             },
@@ -153,6 +158,7 @@ impl Kernels {
                 dot: x86::dot_avx512,
                 l2_squared: x86::l2_avx512,
                 dot_i8_u8_centered: x86::sq8_avx512vnni,
+                dot_i8_u4_deinterleaved: dot_i8_u4_deinterleaved_scalar_unsafe,
                 dot_many: x86::dot_many_avx512,
                 l2_squared_many: x86::l2_many_avx512,
             },
@@ -162,6 +168,7 @@ impl Kernels {
                 dot: neon::dot,
                 l2_squared: neon::l2,
                 dot_i8_u8_centered: neon::sq8,
+                dot_i8_u4_deinterleaved: dot_i8_u4_deinterleaved_scalar_unsafe,
                 dot_many: neon::dot_many,
                 l2_squared_many: neon::l2_many,
             },
@@ -195,6 +202,18 @@ impl Kernels {
     pub fn dot_i8_u8_centered(&self, query: &[i8], stored: &[u8]) -> i32 {
         // SAFETY: as above.
         unsafe { (self.dot_i8_u8_centered)(query, stored) }
+    }
+
+    /// SQ4 screening product over packed low/high nibbles, exact in `i32`.
+    ///
+    /// `even[j]` scores the low nibble of `packed[j]`; `odd[j]` scores the
+    /// high nibble. The current implementation is the scalar reference for
+    /// every ISA. Architecture-specific implementations can replace the
+    /// corresponding table entry without changing callers.
+    #[inline]
+    pub fn dot_i8_u4_deinterleaved(&self, even: &[i8], odd: &[i8], packed: &[u8]) -> i32 {
+        // SAFETY: construction verified CPU support for `self.isa`.
+        unsafe { (self.dot_i8_u4_deinterleaved)(even, odd, packed) }
     }
 
     /// `out[i] = dot(query, vectors[i])`. Panics if `out` is shorter than `vectors`.
@@ -299,6 +318,14 @@ pub fn dot_i8_u8_centered(query: &[i8], stored: &[u8]) -> i32 {
     }
 }
 
+/// SQ4 screening product over deinterleaved query weights and packed codes.
+///
+/// This is the scalar baseline used to validate future SIMD implementations.
+#[inline]
+pub fn dot_i8_u4_deinterleaved(even: &[i8], odd: &[i8], packed: &[u8]) -> i32 {
+    detected().dot_i8_u4_deinterleaved(even, odd, packed)
+}
+
 /// Scores `query` against every vector in `vectors`, writing `out[i] =
 /// dot(query, vectors[i])`. Processes four vectors per pass so each query
 /// load feeds four FMAs; results match [`dot`] to rounding. Panics if `out`
@@ -358,6 +385,29 @@ pub fn dot_i8_u8_centered_scalar(query: &[i8], stored: &[u8]) -> i32 {
     acc
 }
 
+/// Scalar reference for [`dot_i8_u4_deinterleaved`].
+pub fn dot_i8_u4_deinterleaved_scalar(even: &[i8], odd: &[i8], packed: &[u8]) -> i32 {
+    let n = packed.len().min(even.len()).min(odd.len());
+    let mut acc = [0i32; 4];
+    let mut i = 0;
+    while i + 4 <= n {
+        for lane in 0..4 {
+            let code = packed[i + lane];
+            acc[lane] += i32::from(even[i + lane]) * i32::from(code & 0x0f)
+                + i32::from(odd[i + lane]) * i32::from(code >> 4);
+        }
+        i += 4;
+    }
+    let mut sum = acc.into_iter().sum();
+    while i < n {
+        let code = packed[i];
+        sum +=
+            i32::from(even[i]) * i32::from(code & 0x0f) + i32::from(odd[i]) * i32::from(code >> 4);
+        i += 1;
+    }
+    sum
+}
+
 unsafe fn dot_many_scalar(query: &[f32], vectors: &[&[f32]], out: &mut [f32]) {
     for (o, v) in out.iter_mut().zip(vectors) {
         *o = dot_scalar(query, v);
@@ -380,6 +430,10 @@ unsafe fn l2_squared_scalar_unsafe(a: &[f32], b: &[f32]) -> f32 {
 
 unsafe fn dot_i8_u8_centered_scalar_unsafe(query: &[i8], stored: &[u8]) -> i32 {
     dot_i8_u8_centered_scalar(query, stored)
+}
+
+unsafe fn dot_i8_u4_deinterleaved_scalar_unsafe(even: &[i8], odd: &[i8], packed: &[u8]) -> i32 {
+    dot_i8_u4_deinterleaved_scalar(even, odd, packed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,6 +1190,21 @@ mod tests {
                     "{} sq8 dim={dim}",
                     k.isa()
                 );
+
+                let packed_len = dim.div_ceil(2);
+                let even: Vec<i8> = (0..packed_len)
+                    .map(|i| [-127, -17, 0, 23, 127][i % 5])
+                    .collect();
+                let odd: Vec<i8> = (0..packed_len)
+                    .map(|i| [127, 11, 0, -29, -127][i % 5])
+                    .collect();
+                let packed: Vec<u8> = (0..packed_len).map(|i| ((i * 13) & 0xff) as u8).collect();
+                assert_eq!(
+                    k.dot_i8_u4_deinterleaved(&even, &odd, &packed),
+                    dot_i8_u4_deinterleaved_scalar(&even, &odd, &packed),
+                    "{} sq4 dim={dim}",
+                    k.isa()
+                );
             }
         }
     }
@@ -1193,6 +1262,13 @@ mod tests {
         let q: Vec<i8> = (0..257i32).map(|i| (i - 128) as i8).collect();
         let s: Vec<u8> = (0..257).map(|i| (i * 7 % 256) as u8).collect();
         assert_eq!(dot_i8_u8_centered(&q, &s), k.dot_i8_u8_centered(&q, &s));
+        let even: Vec<i8> = q.iter().copied().step_by(2).collect();
+        let odd: Vec<i8> = q.iter().copied().skip(1).step_by(2).collect();
+        let packed: Vec<u8> = (0..even.len()).map(|i| (i * 11 % 256) as u8).collect();
+        assert_eq!(
+            dot_i8_u4_deinterleaved(&even, &odd, &packed),
+            k.dot_i8_u4_deinterleaved(&even, &odd, &packed)
+        );
     }
 
     #[test]

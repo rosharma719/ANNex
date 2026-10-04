@@ -4,3 +4,4 @@ pub mod kernels;
 pub mod metric;
 pub mod simd;
 pub mod sparse;
+pub mod sq4;

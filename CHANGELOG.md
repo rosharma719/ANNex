@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Experimental SQ4 codec and exact scalar `i8 × u4` scoring baseline in `annex`. The codec
+  trains per-dimension ranges, packs two 4-bit codes per byte, prepares integer query weights,
+  and exposes reconstruction error. It is not yet connected to HNSW traversal; neighbor-local
+  layout, SIMD expansion and FP32 reranking remain follow-up work.
+
 ## [0.3.0] - 2026-10-04
 
 ### Added

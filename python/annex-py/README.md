@@ -1,51 +1,91 @@
-# Python snapshot search
+# ANNexDB: Python bindings for ANNex
 
-[ANNex website](https://annexsearch.vercel.app)
+[ANNex website](https://annexsearch.dev)
 
-`annexdb.Index` loads an ANNex core `Segment` snapshot and provides native
-single-query and batch HNSW search. Python 3.9+ and NumPy are required.
-The [multivector HTTP API](../../crates/annex-multivector/README.md) owns hybrid
-queries and collections; this binding currently exposes snapshot search only.
+`annexdb.Index` builds, saves, loads and searches an ANNex dense vector index from NumPy
+arrays, with native HNSW search for single queries and threaded batches. Python 3.9+ and NumPy
+are required. Embeddings are supplied by the caller.
 
-Install from PyPI:
+These bindings cover dense vector search. Hybrid retrieval (BM25 + dense + sparse), payload
+filters and multivector search live in the Rust API and in the
+[`annex-multivector` HTTP server](../../crates/annex-multivector/README.md).
+
+## Install
 
 ```sh
 python -m pip install ANNexDB
 ```
 
-To build from source, run this from the workspace root in an activated virtual
-environment:
+To build from source, run this from the workspace root in an activated virtual environment:
 
 ```sh
 python -m pip install 'maturin>=1.8,<2' numpy
 maturin develop --release --manifest-path python/annex-py/Cargo.toml
 ```
 
+## Quickstart
+
 ```python
 import annexdb
 import numpy as np
 
-index = annexdb.Index("segment.bin", quantize=False)
-query = np.zeros(index.dim(), dtype=np.float32)  # replace with your embedding
-ids, scores = index.search(query, k=10, ef=128)
-ids, scores = index.search_batch(query[None, :], k=10, ef=128, threads=4)
+# One row per item: your embeddings, float32 and C-contiguous.
+vectors = np.array(
+    [
+        [0.9, 0.1, 0.0, 0.0],
+        [0.8, 0.2, 0.1, 0.0],
+        [0.0, 0.1, 0.9, 0.2],
+        [0.1, 0.0, 0.8, 0.3],
+    ],
+    dtype=np.float32,
+)
+
+index = annexdb.Index.build(vectors, metric="cosine")  # row i gets id i
+query = np.array([0.85, 0.15, 0.05, 0.0], dtype=np.float32)
+ids, scores = index.search(query, k=3)
+
+index.save("segment.bin")                  # a snapshot Rust can load too
+index = annexdb.Index("segment.bin")       # reload it later
+ids, scores = index.search_batch(query[None, :], k=3, threads=4)
 ```
 
-Inputs must be C-contiguous float32 NumPy arrays with the index's dimension and
-finite values. Inputs are copied before releasing the GIL; batch workers are
-capped to available hardware threads. Single searches return up to `k` results.
-Batches have shape `(queries, k)` and pad missing matches with `uint64`'s maximum
-value and `NaN`. Empty batches and `k=0` preserve these shapes. Combined batch
-output is limited to 1 GiB; oversized shapes raise `OverflowError` before native
-allocation. Errors propagate to Python rather than becoming empty result rows.
+`Index.build(vectors, ids=None, metric="cosine", m=16, ef_construction=64, level_cap=16)`
+takes a float32 array of shape `[n, dim]`. `ids` is an optional uint64 array of `n` unique ids;
+by default row `i` gets id `i`. `metric` is `"cosine"`, `"dot"` or `"euclidean"`. `m` and
+`ef_construction` are the usual HNSW build parameters. `index.save(path)` writes a snapshot
+that `Index(path)` and Rust's `Segment::load_from_path` both load, and `index.metric()` reports
+the metric. Snapshots written by the Rust library load the same way.
 
-Scores retain the snapshot metric: squared Euclidean distance is lower-is-better;
-cosine and dot-product similarities are higher-is-better. SQ8 screening requires
-loading with `quantize=True` and querying with `sq8_screen=True`. Runtime options
-`scan_cap` and `patience` keep the core search meanings; results remain approximate.
+## Search
 
-CI builds and installs the wheel on Linux and macOS, generates a deterministic
-Rust snapshot, and checks the Python results against an independent NumPy oracle:
+Inputs must be C-contiguous float32 NumPy arrays with the index's dimension and finite values
+(use `array.astype(np.float32)` for float64 data). Inputs are copied before releasing the GIL;
+batch workers are capped to available hardware threads. Single searches return up to `k`
+results. Batches have shape `(queries, k)` and pad missing matches with `uint64`'s maximum
+value and `NaN`. Empty batches and `k=0` preserve these shapes. Combined batch output is limited
+to 1 GiB; oversized shapes raise `OverflowError` before native allocation. Errors propagate to
+Python rather than becoming empty result rows.
+
+### Scores
+
+Scores follow the index metric, and which direction is closer depends on it:
+
+| Metric | Score | Closer is |
+| --- | --- | --- |
+| `cosine` | `1 - cosine similarity` | lower |
+| `dot` | dot product | higher |
+| `euclidean` | squared Euclidean distance | lower |
+
+Results are returned best first. SQ8 screening requires loading with `quantize=True` and
+querying with `sq8_screen=True`. Runtime options `scan_cap` and `patience` keep the core search
+meanings; results remain approximate (use `ef` at least the index size for exact results on
+small indexes).
+
+## Tests
+
+CI builds and installs the wheel on Linux and macOS, generates a deterministic Rust snapshot,
+and checks the Python results against an independent NumPy oracle. The build tests need no
+fixture; the snapshot-loading tests use one built by Rust:
 
 ```sh
 cargo run -p annex-py --example make_test_fixture -- /tmp/annex-fixture.bin

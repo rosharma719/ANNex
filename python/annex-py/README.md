@@ -49,12 +49,15 @@ index = annexdb.Index("segment.bin")       # reload it later
 ids, scores = index.search_batch(query[None, :], k=3, threads=4)
 ```
 
-`Index.build(vectors, ids=None, metric="cosine", m=16, ef_construction=64, level_cap=16)`
-takes a float32 array of shape `[n, dim]`. `ids` is an optional uint64 array of `n` unique ids;
-by default row `i` gets id `i`. `metric` is `"cosine"`, `"dot"` or `"euclidean"`. `m` and
-`ef_construction` are the usual HNSW build parameters. `index.save(path)` writes a snapshot
-that `Index(path)` and Rust's `Segment::load_from_path` both load, and `index.metric()` reports
-the metric. Snapshots written by the Rust library load the same way.
+`Index.build(vectors, *, ids=None, metric="cosine", m=16, ef_construct=200, level_cap=16, quantize=False)`
+takes a float32 array of shape `[n, dim]`; everything after `vectors` is keyword-only. `ids` is
+an optional uint64 array of `n` unique ids; by default row `i` gets id `i`. `metric` is
+`"cosine"`, `"dot"` or `"euclidean"` (aliases `"angular"`, `"ip"` and `"l2"`). `m` and
+`ef_construct` are the usual HNSW build parameters, spelled as in the Rust API and the HTTP
+server. `quantize=True` builds the SQ8 codes used by `sq8_screen` searches; they live in memory
+and are not stored in the snapshot, so pass `quantize=True` again when loading. `index.save(path)`
+writes a snapshot that `Index(path)` and Rust's `Segment::load_from_path` both load, and
+`index.metric()` reports the metric. Snapshots written by the Rust library load the same way.
 
 ## Search
 

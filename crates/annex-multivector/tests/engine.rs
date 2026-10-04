@@ -303,9 +303,31 @@ fn document(id: &str, vector: Vec<f32>, version: usize) -> UpsertDocument {
     }
 }
 
+/// Whether the AVX-512 BF16 kernels are in use on this CPU.
+fn bf16_kernels_active() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        matches!(
+            annex::vector::simd::cpu_level(),
+            annex::vector::simd::CpuLevel::Avx512Bf16
+        )
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Compare two scores that may have been computed through different kernels.
+///
+/// On CPUs with AVX-512 BF16 the exact backend scores through the BF16 kernels, which round
+/// each operand to bfloat16 (relative error at most 2^-8), while the ANN candidate path scores
+/// in f32. The same document then scores differently by up to about 2^-7 of the vectors'
+/// magnitudes, so the f32 tolerance of 1e-4 cannot hold there.
 fn assert_close(actual: f32, expected: f32) {
+    let relative = if bf16_kernels_active() { 8.2e-3 } else { 1e-4 };
     assert!(
-        (actual - expected).abs() <= 1e-4 * expected.abs().max(1.),
+        (actual - expected).abs() <= relative * expected.abs().max(1.),
         "actual score {actual} differs from oracle {expected}"
     );
 }

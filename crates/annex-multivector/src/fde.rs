@@ -651,6 +651,39 @@ mod x86 {
 mod tests {
     use super::*;
 
+    /// Worst-case error of a BF16 dot product of two unit vectors.
+    ///
+    /// The BF16 kernels round each operand to bfloat16 (8 significant bits, so a relative error
+    /// of at most 2^-8) and then multiply-accumulate in f32. Each product therefore has a
+    /// relative error of at most 2 * 2^-8 (plus a second-order 2^-16), which gives
+    /// `|bf16_dot - dot| <= (2^-7 + 2^-16) * sum|a_i * b_i|`. For unit vectors
+    /// `sum|a_i * b_i| <= |a| * |b| = 1` (Cauchy-Schwarz), so the bound is about 7.8e-3 and does
+    /// not grow with the dimension. The constant adds slack for f32 accumulation.
+    ///
+    /// A tolerance of 1e-3 is not attainable in BF16: the self-dot of a normalised
+    /// `1/(i+1)` vector is off by 3.9e-3 at dim 64 (see
+    /// `bf16_operand_rounding_stays_within_the_documented_bound`).
+    const BF16_UNIT_DOT_TOL: f32 = 8.2e-3;
+
+    /// Whether `fde::dot` and `maxsim_flat` currently dispatch to the BF16 kernels.
+    fn bf16_dispatch_active() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            matches!(cpu_level(), CpuLevel::Avx512Bf16)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
+    /// Round an f32 to the nearest bfloat16 (ties to even) and back, as `vcvtneps2bf16` does to
+    /// each operand before the fused multiply-accumulate.
+    fn bf16_round(x: f32) -> f32 {
+        let bits = x.to_bits();
+        f32::from_bits(bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) & 0xFFFF_0000)
+    }
+
     fn deterministic(seed: u64, dim: usize) -> Vector {
         let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         (0..dim)
@@ -724,9 +757,17 @@ mod tests {
                         (got - want).abs() <= tol,
                         "flat dim={dim} nq={nq} nd={nd}: {got} vs {want}"
                     );
+                    // `want` comes from `dot`, which is a BF16 kernel on BF16 CPUs, while the
+                    // prepared query always scores with the f32 packed kernel. Each query token
+                    // contributes at most one BF16 dot error, so allow nq of them there.
+                    let prepared_tol = if bf16_dispatch_active() {
+                        nq as f32 * BF16_UNIT_DOT_TOL
+                    } else {
+                        tol
+                    };
                     let prepared = MaxSimQuery::new(&query, dim).score(&flat_doc, dim);
                     assert!(
-                        (prepared - want).abs() <= tol,
+                        (prepared - want).abs() <= prepared_tol,
                         "prepared dim={dim} nq={nq} nd={nd}: {prepared} vs {want}"
                     );
                 }
@@ -820,9 +861,60 @@ mod tests {
             let normed = normalize(&raw);
             let self_dot = dot(&normed, &normed);
             assert!(
-                (self_dot - 1.0).abs() < 1e-3,
+                (self_dot - 1.0).abs() < BF16_UNIT_DOT_TOL,
                 "dim={dim}: self_dot={self_dot}"
             );
         }
+    }
+
+    /// Runs on every CPU. Emulates BF16 operand rounding in software to check the documented
+    /// error bound, so the BF16 tolerances above are validated without BF16 hardware.
+    #[test]
+    fn bf16_operand_rounding_stays_within_the_documented_bound() {
+        let emulated_dot = |a: &[f32], b: &[f32]| -> f64 {
+            a.iter()
+                .zip(b)
+                .map(|(&x, &y)| f64::from(bf16_round(x)) * f64::from(bf16_round(y)))
+                .sum()
+        };
+        let exact_dot = |a: &[f32], b: &[f32]| -> f64 {
+            a.iter()
+                .zip(b)
+                .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                .sum()
+        };
+
+        // Reference case: the self-dot of a normalised 1/(i+1) vector at dim 64 was observed as
+        // 1.0038899 on a BF16 runner, which is why 1e-3 cannot be the tolerance.
+        let raw: Vec<f32> = (0..64).map(|i| (i as f32 + 1.0).recip()).collect();
+        let normed = normalize(&raw);
+        let self_dot = emulated_dot(&normed, &normed);
+        assert!(
+            (self_dot - 1.0038899).abs() < 1e-5,
+            "emulation no longer matches the hardware observation: {self_dot}"
+        );
+        assert!((self_dot - 1.0).abs() > 1e-3);
+
+        let mut worst = 0.0f64;
+        for &dim in &[1usize, 7, 16, 33, 64, 100, 128, 129, 384, 768] {
+            let vectors: Vec<_> = (0..24)
+                .map(|i| normalize(&deterministic(0xB0 + i, dim)))
+                .collect();
+            for a in &vectors {
+                for b in &vectors {
+                    let error = (emulated_dot(a, b) - exact_dot(a, b)).abs();
+                    worst = worst.max(error);
+                    assert!(
+                        error < f64::from(BF16_UNIT_DOT_TOL),
+                        "dim={dim}: BF16 rounding error {error} exceeds the bound"
+                    );
+                }
+            }
+        }
+        // The bound is tight enough to mean something: real errors reach a good fraction of it.
+        assert!(
+            worst > 1e-3,
+            "worst observed error {worst} is suspiciously small"
+        );
     }
 }

@@ -24,11 +24,12 @@ fn value_error(message: impl Into<String>) -> PyErr {
 
 fn parse_metric(name: &str) -> PyResult<DistanceMetric> {
     match name.to_ascii_lowercase().as_str() {
-        "cosine" => Ok(DistanceMetric::Cosine),
-        "dot" => Ok(DistanceMetric::Dot),
+        "cosine" | "angular" => Ok(DistanceMetric::Cosine),
+        "dot" | "ip" | "inner_product" => Ok(DistanceMetric::Dot),
         "euclidean" | "l2" => Ok(DistanceMetric::Euclidean),
         other => Err(value_error(format!(
-            "unknown metric {other:?}; expected \"cosine\", \"dot\" or \"euclidean\""
+            "unknown metric {other:?}; expected \"cosine\" (or \"angular\"), \"dot\" (or \"ip\") \
+             or \"euclidean\" (or \"l2\")"
         ))),
     }
 }
@@ -162,20 +163,26 @@ impl Index {
 
     /// Build an index from a C-contiguous float32 array of shape `[n, dim]`.
     ///
-    /// `ids` is an optional uint64 array of `n` unique ids; by default row `i`
-    /// gets id `i`. `metric` is `"cosine"`, `"dot"` or `"euclidean"`. `m` and
-    /// `ef_construction` are the usual HNSW build parameters. Save the result
-    /// with `Index.save` and reload it with `Index(path)`.
+    /// Everything after `vectors` is keyword-only. `ids` is an optional uint64
+    /// array of `n` unique ids; by default row `i` gets id `i`. `metric` is
+    /// `"cosine"`, `"dot"` or `"euclidean"` (aliases `"angular"`, `"ip"` and
+    /// `"l2"`). `m` and `ef_construct` are the usual HNSW build parameters, named
+    /// as in the Rust API and the HTTP server. With `quantize=True` the SQ8 codes
+    /// for `sq8_screen` searches are built in memory; they are not stored in the
+    /// snapshot, so pass `quantize=True` again when loading. Save the result with
+    /// `Index.save` and reload it with `Index(path)`.
     #[staticmethod]
-    #[pyo3(signature = (vectors, ids = None, metric = "cosine", m = 16, ef_construction = 64, level_cap = 16))]
+    #[pyo3(signature = (vectors, *, ids = None, metric = "cosine", m = 16, ef_construct = 200, level_cap = 16, quantize = false))]
+    #[allow(clippy::too_many_arguments)] // Flat keyword arguments are the public Python API.
     fn build<'py>(
         py: Python<'py>,
         vectors: PyReadonlyArray2<'py, f32>,
         ids: Option<PyReadonlyArray1<'py, u64>>,
         metric: &str,
         m: usize,
-        ef_construction: usize,
+        ef_construct: usize,
         level_cap: usize,
+        quantize: bool,
     ) -> PyResult<Self> {
         let shape = vectors.shape();
         let (rows, dimensions) = (shape[0], shape[1]);
@@ -193,8 +200,8 @@ impl Index {
         if m < 2 {
             return Err(value_error("m must be at least 2"));
         }
-        if ef_construction == 0 {
-            return Err(value_error("ef_construction must be at least 1"));
+        if ef_construct == 0 {
+            return Err(value_error("ef_construct must be at least 1"));
         }
         let metric = parse_metric(metric)?;
 
@@ -222,9 +229,15 @@ impl Index {
             .zip(flat.chunks_exact(dimensions))
             .map(|(id, row)| (*id, row.to_vec()))
             .collect();
-        let mut segment = Segment::with_config(metric, m, ef_construction, level_cap, dimensions);
+        let mut segment = Segment::with_config(metric, m, ef_construct, level_cap, dimensions);
         let inserted = py
-            .detach(|| segment.bulk_load(&entries))
+            .detach(|| -> Result<usize, annex::DBError> {
+                let inserted = segment.bulk_load(&entries)?;
+                if quantize {
+                    segment.hnsw_mut().quantize_all();
+                }
+                Ok(inserted)
+            })
             .map_err(runtime_error)?;
         if inserted != rows {
             return Err(runtime_error(format!(

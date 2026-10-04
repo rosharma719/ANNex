@@ -250,11 +250,49 @@ class BuildTests(unittest.TestCase):
                 self.vectors[:4], ids=np.array([1, 2, 2, 3], dtype=np.uint64)
             ),
             "m too small": lambda: build(self.vectors, m=1),
-            "zero ef_construction": lambda: build(self.vectors, ef_construction=0),
+            "zero ef_construct": lambda: build(self.vectors, ef_construct=0),
         }
         for label, call in cases.items():
             with self.subTest(label), self.assertRaises(ValueError):
                 call()
+
+    def test_metric_aliases_build_the_same_index(self):
+        aliases = (("angular", "cosine"), ("ip", "dot"), ("inner_product", "dot"), ("l2", "euclidean"))
+        for alias, canonical in aliases:
+            with self.subTest(alias=alias):
+                aliased = annexdb.Index.build(self.vectors, metric=alias)
+                self.assertEqual(aliased.metric(), canonical)
+                reference = annexdb.Index.build(self.vectors, metric=canonical)
+                ids, _ = aliased.search(self.query, k=5, ef=len(self.vectors))
+                expected, _ = reference.search(self.query, k=5, ef=len(self.vectors))
+                np.testing.assert_array_equal(ids, expected)
+
+    def test_options_after_vectors_are_keyword_only(self):
+        with self.assertRaises(TypeError):
+            annexdb.Index.build(self.vectors, None)
+        with self.assertRaises(TypeError):
+            annexdb.Index.build(self.vectors, ef_construction=64)  # the old spelling
+
+    def test_quantize_builds_sq8_codes_for_screened_search(self):
+        index = annexdb.Index.build(self.vectors, metric="cosine", quantize=True)
+        exact = annexdb.Index.build(self.vectors, metric="cosine")
+        rng = np.random.default_rng(11)
+        overlap = 0
+        for query in rng.standard_normal((20, self.vectors.shape[1])).astype(np.float32):
+            screened, _ = index.search(query, k=5, ef=len(self.vectors), sq8_screen=True)
+            truth, _ = exact.search(query, k=5, ef=len(self.vectors))
+            overlap += len(set(screened.tolist()) & set(truth.tolist()))
+        # SQ8 screening is approximate, but it must find most of the true neighbours.
+        self.assertGreaterEqual(overlap / (20 * 5), 0.8)
+
+    def test_quantized_build_round_trips_and_reloads_with_quantize(self):
+        index = annexdb.Index.build(self.vectors, quantize=True)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "index.bin")
+            index.save(path)
+            reloaded = annexdb.Index(path, quantize=True)
+            ids, _ = reloaded.search(self.query, k=3, ef=len(self.vectors), sq8_screen=True)
+            self.assertEqual(ids.shape, (3,))
 
     def test_save_reports_io_errors(self):
         index = annexdb.Index.build(self.vectors[:10])

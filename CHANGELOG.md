@@ -11,9 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Python: build and save indexes** (`annex-py`). `annexdb.Index.build(vectors, ids=None,
-  metric="cosine", m=16, ef_construction=64, level_cap=16)` builds an index from a float32 NumPy
-  array of shape `[n, dim]` (row `i` gets id `i` unless `ids` is given). `Index.save(path)` writes
+- **Python: build and save indexes** (`annex-py`). `annexdb.Index.build(vectors, *, ids=None,
+  metric="cosine", m=16, ef_construct=200, level_cap=16, quantize=False)` builds an index from a
+  float32 NumPy array of shape `[n, dim]` (row `i` gets id `i` unless `ids` is given; the metric
+  also accepts the aliases `angular`, `ip` and `l2`; `quantize=True` builds the SQ8 codes used by
+  `sq8_screen` searches). `Index.save(path)` writes
   a snapshot that `Index(path)` and Rust's `Segment::load_from_path` both load, and
   `Index.metric()` reports the metric. Python no longer needs a Rust-built snapshot to get
   started. Dense search only: hybrid retrieval, payload filters and multivector search remain in

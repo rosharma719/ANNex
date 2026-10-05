@@ -935,3 +935,34 @@ fn concurrent_stress_writers_deleter_readers_hold_invariants() {
         );
     }
 }
+
+#[test]
+fn bounded_batch_linking_rejects_zero_and_builds_searchable_graphs() {
+    let entries: Vec<_> = (0..32u64)
+        .map(|id| {
+            let mut v = vec![0.0; 32];
+            v[id as usize] = 1.0;
+            (id, v)
+        })
+        .collect();
+    for threads in [1, 2] {
+        let index = HNSWIndex::new(DistanceMetric::Cosine, 16, 64, 16, 32);
+        assert!(index.par_insert_batch_with_threads(&entries, 0).is_err());
+        assert_eq!(index.len(), 0);
+        assert_eq!(
+            index
+                .par_insert_batch_with_threads(&entries, threads)
+                .unwrap(),
+            32
+        );
+        assert_eq!(
+            index
+                .par_insert_batch_with_threads(&entries, threads)
+                .unwrap(),
+            0
+        );
+        for (id, vector) in &entries {
+            assert_eq!(index.search(vector, 1).unwrap()[0].id, *id);
+        }
+    }
+}

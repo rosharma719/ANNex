@@ -334,6 +334,25 @@ impl HNSWIndex {
     /// New nodes allocated in the same batch do not see each other as candidates during Phase 2
     /// (they have no graph edges yet), which is the standard trade-off for batch HNSW builds.
     pub fn par_insert_batch(&self, entries: &[(PointId, Vector)]) -> Result<usize, DBError> {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        self.par_insert_batch_with_threads(entries, threads)
+    }
+
+    /// Insert a batch with at most `threads` linking workers. A single worker
+    /// runs on the caller, allowing bounded executors to retain CPU ownership.
+    pub fn par_insert_batch_with_threads(
+        &self,
+        entries: &[(PointId, Vector)],
+        threads: usize,
+    ) -> Result<usize, DBError> {
+        if threads == 0 {
+            return Err(DBError::IOError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "linking thread count must be positive",
+            )));
+        }
         use super::config::lid_sort_enabled;
         let sort_order: Vec<usize> = if lid_sort_enabled() && entries.len() > 3 {
             let mut owned: Vec<(u64, Vec<f32>)> =
@@ -399,32 +418,32 @@ impl HNSWIndex {
         let n_link = link_slice.len();
         let first_error: std::sync::Mutex<Option<DBError>> = std::sync::Mutex::new(None);
         if n_link > 0 {
-            let parallelism = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .min(n_link);
-            let chunk_size = n_link.div_ceil(parallelism);
-            let self_ref: &Self = self;
-            let error_ref = &first_error;
-            std::thread::scope(|s| {
-                for chunk in link_slice.chunks(chunk_size) {
-                    s.spawn(move || {
-                        for &(idx, level) in chunk {
-                            if let Err(e) = self_ref.search_and_link(idx, level, initial_entry) {
-                                let mut slot = error_ref.lock().unwrap();
-                                if slot.is_none() {
-                                    *slot = Some(e);
-                                }
-                                return;
-                            }
-                            // PUBLISH each reserved node as soon as its own
-                            // links (both directions) are written. Concurrent
-                            // BFS readers will then observe it as LIVE.
-                            self_ref.publish_live(idx);
+            let parallelism = threads.min(n_link);
+            let link = |chunk: &[(usize, usize)]| {
+                for &(idx, level) in chunk {
+                    if let Err(e) = self.search_and_link(idx, level, initial_entry) {
+                        let mut slot = first_error.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(e);
                         }
-                    });
+                        return;
+                    }
+                    // Publish only after both directions of the links exist;
+                    // concurrent readers can then safely visit this node.
+                    self.publish_live(idx);
                 }
-            });
+            };
+            if parallelism == 1 {
+                link(link_slice);
+            } else {
+                let chunk_size = n_link.div_ceil(parallelism);
+                std::thread::scope(|scope| {
+                    for chunk in link_slice.chunks(chunk_size) {
+                        let link = &link;
+                        scope.spawn(move || link(chunk));
+                    }
+                });
+            }
         }
         if let Some(e) = first_error.into_inner().unwrap() {
             return Err(e);

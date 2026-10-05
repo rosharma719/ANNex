@@ -1,9 +1,11 @@
 mod auth;
+mod request_path;
+mod serving;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::DefaultBodyLimit,
     extract::State,
     http::StatusCode,
@@ -17,6 +19,7 @@ use multivector::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use serving::{AdmittedWork, PoolConfig, Serving};
 use tower::ServiceExt;
 
 #[derive(Parser)]
@@ -47,6 +50,20 @@ struct Args {
     analyzer: String,
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
+    /// Query worker threads (nested Rayon work shares this pool).
+    #[arg(long, default_value_t = query_threads(), value_parser = clap::value_parser!(u16).range(1..=256))]
+    query_threads: u16,
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=256))]
+    ingest_threads: u16,
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=256))]
+    maintenance_threads: u16,
+    /// Maximum admitted query requests, including body parsing and queued jobs.
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u16).range(1..))]
+    query_concurrency: u16,
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..))]
+    ingest_concurrency: u16,
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    maintenance_concurrency: u16,
     /// API key granting write access (upsert, delete, train, build_ann, compact, create_collection).
     /// Also satisfies read-only routes. Omit to run without authentication.
     #[arg(long)]
@@ -112,6 +129,14 @@ struct BuildAnnRequest {
     #[serde(default = "two_fifty_six")]
     ef_construct: usize,
 }
+fn query_threads() -> u16 {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .saturating_sub(2)
+        .clamp(1, 256) as u16
+}
+
 fn ten() -> usize {
     10
 }
@@ -161,8 +186,15 @@ fn bounded(name: &str, value: usize, max: usize) -> Result<(), ApiError> {
 
 async fn delete(
     State(index): State<Arc<MultiVectorIndex>>,
+    Extension(work): Extension<AdmittedWork>,
     Json(body): Json<DeleteRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    work.run(move || delete_sync(index, body).map_err(|error| error.0))
+        .await
+        .map_err(ApiError)
+}
+
+fn delete_sync(index: Arc<MultiVectorIndex>, body: DeleteRequest) -> Result<Json<Value>, ApiError> {
     bounded("document id bytes", body.id.len(), 4096)?;
     Ok(Json(json!({"deleted": index.delete(&body.id)?})))
 }
@@ -170,13 +202,28 @@ async fn delete(
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok", "version": env!("CARGO_PKG_VERSION")}))
 }
-async fn stats(State(index): State<Arc<MultiVectorIndex>>) -> Json<Value> {
-    Json(serde_json::to_value(index.stats()).unwrap())
+async fn runtime_stats(Extension(serving): Extension<Arc<Serving>>) -> Json<Value> {
+    Json(serving.snapshot())
+}
+async fn stats(
+    State(index): State<Arc<MultiVectorIndex>>,
+    Extension(work): Extension<AdmittedWork>,
+) -> Result<Json<Value>, ApiError> {
+    work.run(move || Ok(Json(serde_json::to_value(index.stats()).unwrap())))
+        .await
+        .map_err(ApiError)
 }
 async fn upsert(
     State(index): State<Arc<MultiVectorIndex>>,
+    Extension(work): Extension<AdmittedWork>,
     Json(body): Json<UpsertRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    work.run(move || upsert_sync(index, body).map_err(|error| error.0))
+        .await
+        .map_err(ApiError)
+}
+
+fn upsert_sync(index: Arc<MultiVectorIndex>, body: UpsertRequest) -> Result<Json<Value>, ApiError> {
     bounded("documents", body.documents.len(), 1024)?;
     let mut tokens = 0;
     let mut values = 0;
@@ -195,9 +242,7 @@ async fn upsert(
         bounded("batch vector values", values, 16_777_216)?;
     }
     let count = body.documents.len();
-    tokio::task::spawn_blocking(move || index.upsert_records(body.documents))
-        .await
-        .map_err(|e| ApiError(IndexError::Invalid(format!("ingest task failed: {e}"))))??;
+    index.upsert_records(body.documents)?;
     Ok(Json(json!({"upserted": count})))
 }
 #[derive(Deserialize)]
@@ -211,48 +256,80 @@ struct DenseAnnRequest {
 }
 async fn build_dense(
     State(index): State<Arc<MultiVectorIndex>>,
+    Extension(work): Extension<AdmittedWork>,
     Json(body): Json<DenseAnnRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let nodes = tokio::task::spawn_blocking(move || {
-        index.build_dense_ann(&body.field, body.m, body.ef_construct)
-    })
-    .await
-    .map_err(|e| ApiError(IndexError::Invalid(e.to_string())))??;
+    work.run(move || build_dense_sync(index, body).map_err(|error| error.0))
+        .await
+        .map_err(ApiError)
+}
+
+fn build_dense_sync(
+    index: Arc<MultiVectorIndex>,
+    body: DenseAnnRequest,
+) -> Result<Json<Value>, ApiError> {
+    let nodes = index.build_dense_ann_with_threads(&body.field, body.m, body.ef_construct, 1)?;
     Ok(Json(json!({"nodes":nodes})))
 }
 
-async fn compact(State(index): State<Arc<MultiVectorIndex>>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(
-        tokio::task::spawn_blocking(move || index.compact())
-            .await
-            .map_err(|e| ApiError(IndexError::Invalid(format!("compaction task failed: {e}"))))??,
-    ))
+async fn compact(
+    State(index): State<Arc<MultiVectorIndex>>,
+    Extension(work): Extension<AdmittedWork>,
+) -> Result<Json<Value>, ApiError> {
+    work.run(move || compact_sync(index).map_err(|error| error.0))
+        .await
+        .map_err(ApiError)
+}
+
+fn compact_sync(index: Arc<MultiVectorIndex>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(index.compact()?))
 }
 
 async fn retrieve(
     State(index): State<Arc<MultiVectorIndex>>,
+    Extension(work): Extension<AdmittedWork>,
     Json(body): Json<RetrieveRequest>,
 ) -> Result<Json<RetrievalResponse>, ApiError> {
-    let result = tokio::task::spawn_blocking(move || index.retrieve(&body))
+    work.run(move || retrieve_sync(index, body).map_err(|error| error.0))
         .await
-        .map_err(|e| ApiError(IndexError::Invalid(format!("query task failed: {e}"))))??;
-    Ok(Json(result))
+        .map_err(ApiError)
+}
+
+fn retrieve_sync(
+    index: Arc<MultiVectorIndex>,
+    body: RetrieveRequest,
+) -> Result<Json<RetrievalResponse>, ApiError> {
+    Ok(Json(index.retrieve(&body)?))
 }
 
 async fn plan(
     State(index): State<Arc<MultiVectorIndex>>,
+    Extension(work): Extension<AdmittedWork>,
     Json(body): Json<RetrieveRequest>,
 ) -> Result<Json<RetrievalPlan>, ApiError> {
-    let result = tokio::task::spawn_blocking(move || index.plan(&body))
+    work.run(move || plan_sync(index, body).map_err(|error| error.0))
         .await
-        .map_err(|e| ApiError(IndexError::Invalid(format!("planning task failed: {e}"))))??;
-    Ok(Json(result))
+        .map_err(ApiError)
+}
+
+fn plan_sync(
+    index: Arc<MultiVectorIndex>,
+    body: RetrieveRequest,
+) -> Result<Json<RetrievalPlan>, ApiError> {
+    Ok(Json(index.plan(&body)?))
 }
 
 async fn query(
     State(index): State<Arc<MultiVectorIndex>>,
+    Extension(work): Extension<AdmittedWork>,
     Json(body): Json<QueryRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    work.run(move || query_sync(index, body).map_err(|error| error.0))
+        .await
+        .map_err(ApiError)
+}
+
+fn query_sync(index: Arc<MultiVectorIndex>, body: QueryRequest) -> Result<Json<Value>, ApiError> {
     bounded("query tokens", body.vectors.len(), 1024)?;
     bounded("top_k", body.top_k, 10_000)?;
     for (name, value, limit) in [
@@ -396,8 +473,15 @@ async fn query(
 }
 async fn train(
     State(index): State<Arc<MultiVectorIndex>>,
+    Extension(work): Extension<AdmittedWork>,
     Json(body): Json<TrainRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    work.run(move || train_sync(index, body).map_err(|error| error.0))
+        .await
+        .map_err(ApiError)
+}
+
+fn train_sync(index: Arc<MultiVectorIndex>, body: TrainRequest) -> Result<Json<Value>, ApiError> {
     bounded("training samples", body.vectors.len(), 65_536)?;
     bounded("training iterations", body.iterations, 100)?;
     bounded(
@@ -411,8 +495,15 @@ async fn train(
 }
 async fn score(
     State(index): State<Arc<MultiVectorIndex>>,
+    Extension(work): Extension<AdmittedWork>,
     Json(body): Json<ScoreRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    work.run(move || score_sync(index, body).map_err(|error| error.0))
+        .await
+        .map_err(ApiError)
+}
+
+fn score_sync(index: Arc<MultiVectorIndex>, body: ScoreRequest) -> Result<Json<Value>, ApiError> {
     bounded("query tokens", body.query.len(), 1024)?;
     if let Some(document) = &body.document {
         bounded("document tokens", document.len(), 8192)?;
@@ -430,15 +521,35 @@ async fn score(
 }
 async fn build_ann(
     State(index): State<Arc<MultiVectorIndex>>,
+    Extension(work): Extension<AdmittedWork>,
     Json(body): Json<BuildAnnRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    work.run(move || build_ann_sync(index, body).map_err(|error| error.0))
+        .await
+        .map_err(ApiError)
+}
+
+fn build_ann_sync(
+    index: Arc<MultiVectorIndex>,
+    body: BuildAnnRequest,
+) -> Result<Json<Value>, ApiError> {
     Ok(Json(
-        json!({"nodes": index.build_fde_ann(body.m, body.ef_construct)?}),
+        json!({"nodes": index.build_fde_ann_with_threads(body.m, body.ef_construct, 1)?}),
     ))
 }
 async fn candidates(
     State(index): State<Arc<MultiVectorIndex>>,
+    Extension(work): Extension<AdmittedWork>,
     Json(body): Json<CandidateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    work.run(move || candidates_sync(index, body).map_err(|error| error.0))
+        .await
+        .map_err(ApiError)
+}
+
+fn candidates_sync(
+    index: Arc<MultiVectorIndex>,
+    body: CandidateRequest,
 ) -> Result<Json<Value>, ApiError> {
     bounded("query tokens", body.vectors.len(), 1024)?;
     bounded("count", body.count, 100_000)?;
@@ -466,6 +577,7 @@ fn index_router(index: Arc<MultiVectorIndex>) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/stats", get(stats))
+        .route("/v1/runtime", get(runtime_stats))
         .route("/v1/train", post(train))
         .route("/v1/debug/score", post(score))
         .route("/v1/debug/candidates", post(candidates))
@@ -489,25 +601,41 @@ struct CreateCollection {
     name: String,
     config: IndexConfig,
 }
-async fn list_collections(State(collections): State<Arc<Collections>>) -> Json<Value> {
-    Json(json!({"collections":collections.names()}))
+async fn list_collections(
+    State(collections): State<Arc<Collections>>,
+    Extension(work): Extension<AdmittedWork>,
+) -> Result<Json<Value>, ApiError> {
+    work.run(move || Ok(Json(json!({"collections":collections.names()}))))
+        .await
+        .map_err(ApiError)
 }
 async fn create_collection(
     State(collections): State<Arc<Collections>>,
+    Extension(work): Extension<AdmittedWork>,
     Json(body): Json<CreateCollection>,
 ) -> Result<Json<Value>, ApiError> {
-    tokio::task::spawn_blocking(move || collections.create(&body.name, body.config))
+    work.run(move || create_collection_sync(collections, body).map_err(|error| error.0))
         .await
-        .map_err(|e| ApiError(IndexError::Invalid(e.to_string())))??;
+        .map_err(ApiError)
+}
+
+fn create_collection_sync(
+    collections: Arc<Collections>,
+    body: CreateCollection,
+) -> Result<Json<Value>, ApiError> {
+    collections.create(&body.name, body.config)?;
     Ok(Json(json!({"created":true})))
 }
 async fn collection_request(
     State(collections): State<Arc<Collections>>,
     axum::extract::Path((name, operation)): axum::extract::Path<(String, String)>,
+    Extension(work): Extension<AdmittedWork>,
     mut request: axum::extract::Request,
 ) -> Response {
-    let Some(index) = collections.get(&name) else {
-        return (StatusCode::NOT_FOUND, "collection not found").into_response();
+    let index = match work.run(move || Ok(collections.get(&name))).await {
+        Ok(Some(index)) => index,
+        Ok(None) => return (StatusCode::NOT_FOUND, "collection not found").into_response(),
+        Err(error) => return ApiError(error).into_response(),
     };
     let suffix = request
         .uri()
@@ -527,6 +655,20 @@ async fn collection_request(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let serving = Serving::new(
+        PoolConfig {
+            threads: args.query_threads as usize,
+            capacity: args.query_concurrency as usize,
+        },
+        PoolConfig {
+            threads: args.ingest_threads as usize,
+            capacity: args.ingest_concurrency as usize,
+        },
+        PoolConfig {
+            threads: args.maintenance_threads as usize,
+            capacity: args.maintenance_concurrency as usize,
+        },
+    )?;
     let config = IndexConfig {
         dimension: args.dimension,
         centroids: args.centroids,
@@ -561,13 +703,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         read_key: args.read_key,
         write_key: args.write_key,
     };
-    let app =
-        index_router(index)
-            .merge(collection_routes)
-            .layer(axum::middleware::from_fn_with_state(
-                std::sync::Arc::new(auth_config),
-                auth::auth_middleware,
-            ));
+    let app = index_router(index)
+        .merge(collection_routes)
+        .layer(axum::middleware::from_fn_with_state(
+            serving,
+            serving::admission,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::new(auth_config),
+            auth::auth_middleware,
+        ));
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     println!("multivector listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app)
@@ -581,6 +726,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serving_cli_rejects_zero_limits_and_excessive_threads() {
+        for flag in [
+            "--query-threads",
+            "--ingest-threads",
+            "--maintenance-threads",
+            "--query-concurrency",
+            "--ingest-concurrency",
+            "--maintenance-concurrency",
+        ] {
+            assert!(Args::try_parse_from(["annex-multivector", flag, "0"]).is_err());
+        }
+        assert!(Args::try_parse_from(["annex-multivector", "--query-threads", "257"]).is_err());
+    }
+
+    fn test_serving() -> Arc<Serving> {
+        let config = PoolConfig {
+            threads: 1,
+            capacity: 2,
+        };
+        Serving::new(config, config, config).unwrap()
+    }
 
     fn fixture() -> (tempfile::TempDir, Arc<MultiVectorIndex>) {
         let directory = tempfile::tempdir().unwrap();
@@ -607,13 +775,9 @@ mod tests {
     }
 
     async fn query_value(index: &Arc<MultiVectorIndex>, body: Value) -> Value {
-        query(
-            State(Arc::clone(index)),
-            Json(serde_json::from_value(body).unwrap()),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("query failed: {}", error.0))
-        .0
+        query_sync(Arc::clone(index), serde_json::from_value(body).unwrap())
+            .unwrap_or_else(|error| panic!("query failed: {}", error.0))
+            .0
     }
 
     #[tokio::test]
@@ -627,8 +791,7 @@ mod tests {
         let expected = index
             .exact_fde_candidates(&body.vectors, body.count)
             .unwrap();
-        let actual = candidates(State(index), Json(body))
-            .await
+        let actual = candidates_sync(index, body)
             .unwrap_or_else(|error| panic!("candidate request failed: {}", error.0));
         assert_eq!(actual.0, json!({"candidates": expected}));
     }
@@ -645,8 +808,7 @@ mod tests {
             "limit": 1
         }))
         .unwrap();
-        let actual = plan(State(Arc::clone(&index)), Json(body.clone()))
-            .await
+        let actual = plan_sync(Arc::clone(&index), body.clone())
             .unwrap_or_else(|error| panic!("planning failed: {}", error.0));
         assert_eq!(
             actual.0.parallel_channels()[0].operator,
@@ -659,9 +821,8 @@ mod tests {
         assert_eq!(actual.0.stats.documents, 2);
 
         index.build_fde_ann(4, 16).unwrap();
-        let actual = plan(State(index), Json(body))
-            .await
-            .unwrap_or_else(|error| panic!("planning failed: {}", error.0));
+        let actual =
+            plan_sync(index, body).unwrap_or_else(|error| panic!("planning failed: {}", error.0));
         // 2-doc corpus: cost model prefers exact over HNSW.
         assert_eq!(
             actual.0.parallel_channels()[0].operator,
@@ -689,12 +850,8 @@ mod tests {
             assert_eq!(implicit["matches"][0]["id"], "a");
 
             body["candidate_backend"] = json!("auto");
-            let error = query(
-                State(Arc::clone(&index)),
-                Json(serde_json::from_value(body).unwrap()),
-            )
-            .await
-            .expect_err("explicit auto must reject legacy backend knobs");
+            let error = query_sync(Arc::clone(&index), serde_json::from_value(body).unwrap())
+                .expect_err("explicit auto must reject legacy backend knobs");
             assert!(matches!(error.0, IndexError::Invalid(_)));
         }
     }
@@ -784,10 +941,15 @@ mod tests {
             read_key: read_key.map(str::to_owned),
             write_key: write_key.map(str::to_owned),
         };
-        index_router(index).layer(axum::middleware::from_fn_with_state(
-            std::sync::Arc::new(config),
-            auth::auth_middleware,
-        ))
+        index_router(index)
+            .layer(axum::middleware::from_fn_with_state(
+                test_serving(),
+                serving::admission,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(config),
+                auth::auth_middleware,
+            ))
     }
 
     #[tokio::test]

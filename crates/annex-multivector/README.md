@@ -27,6 +27,7 @@ Reopening the default index requires the same index configuration.
 | Route | Purpose |
 | --- | --- |
 | `GET /healthz` | Process liveness and version |
+| `GET /v1/runtime` | Global worker-pool counters and capacities |
 | `GET /v1/stats` | Counts, generation, storage segments and ANN overlay sizes |
 | `POST /v1/train` | `vectors`, optional `iterations` |
 | `POST /v1/vectors/upsert` | Atomic `documents` batch; complete replacement by `id` |
@@ -54,8 +55,8 @@ failures return 5xx. An uncertain commit requires the recovery procedure in the
 [durability contract](../../docs/multivector-durability.md).
 Request/work limits are enforced in [main.rs](src/main.rs) and
 [retrieval.rs](src/retrieval.rs); the body limit is 256 MiB. Blocking retrieval,
-ingest and compaction run outside Tokio's async workers, but do not yet have
-separate bounded execution pools, admission control or cancellation.
+ingest and maintenance run in separate bounded worker pools. See the
+[serving controls](../../docs/serving.md) for admission limits and cancellation behavior.
 
 ## Document representations
 

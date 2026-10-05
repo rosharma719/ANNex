@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Bounded multivector serving with separate query, ingest and maintenance worker
+  pools, global admission limits, overload responses and runtime timing counters.
+  Server graph linking stays inside the maintenance pool; library callers can
+  select an explicit linking thread limit.
+
 - SQ8 `NeighborBlock` baseline for HNSW L0 traversal. Quantization now materializes immutable
   32-neighbor expansion blocks with neighbor IDs and copied SQ8 codes, so compressed traversal
   reads codes sequentially instead of gathering every neighbor from the global code array. The

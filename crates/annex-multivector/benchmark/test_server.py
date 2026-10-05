@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import urllib.request
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -22,6 +23,67 @@ class ServerTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.binary = Path(os.environ["ANNEX_TEST_BINARY"]).resolve()
+
+    def test_serving_configuration_and_global_runtime_counters(self):
+        flags = (
+            "--query-threads",
+            "2",
+            "--query-concurrency",
+            "3",
+            "--ingest-threads",
+            "1",
+            "--ingest-concurrency",
+            "2",
+            "--maintenance-threads",
+            "1",
+            "--maintenance-concurrency",
+            "1",
+        )
+        with annex_server(self.binary, self.root, 2, centroids=2, extra=flags) as base:
+            before = http(base, "/v1/runtime")
+            for name, threads, capacity in [
+                ("query", 2, 3),
+                ("ingest", 1, 2),
+                ("maintenance", 1, 1),
+            ]:
+                self.assertEqual(before[name]["threads"], threads)
+                self.assertEqual(before[name]["capacity"], capacity)
+                self.assertEqual(before[name]["admitted"], 0)
+            http(base, "/v1/collections", {"name": "a", "config": {"dimension": 2}})
+            body = {
+                "documents": [
+                    {
+                        "id": "a",
+                        "representations": {
+                            "semantic": {"kind": "dense", "vector": [1, 0]}
+                        },
+                    }
+                ]
+            }
+            http(base, "/v1/collections/a/vectors/upsert", body)
+            http(
+                base,
+                "/v1/collections/a/dense/index",
+                {"field": "semantic", "m": 4, "ef_construct": 16},
+            )
+            with urllib.request.urlopen(base + "/v1/collections/a/stats") as response:
+                self.assertEqual(response.status, 200)
+                for header in [
+                    "x-annex-queue-ms",
+                    "x-annex-work-ms",
+                    "x-annex-request-ms",
+                ]:
+                    self.assertGreaterEqual(float(response.headers[header]), 0)
+            after = http(base, "/v1/runtime")
+            self.assertEqual(after["ingest"]["admitted"], 2)
+            self.assertEqual(after["maintenance"]["admitted"], 1)
+            self.assertEqual(after["query"]["admitted"], 1)
+            # Named routing performs a lookup and engine job under one permit.
+            self.assertEqual(after["query"]["completed_jobs"], 2)
+            for pool in after.values():
+                self.assertEqual(pool["in_flight"], 0)
+                self.assertEqual(pool["queued_jobs"], 0)
+                self.assertEqual(pool["running_jobs"], 0)
 
     def test_http_contract_delete_and_reopen(self):
         with annex_server(self.binary, self.root, 2, centroids=2) as base:
@@ -191,7 +253,9 @@ class ServerTests(unittest.TestCase):
                 {
                     "id": "d",
                     "text": "The runners are running",
-                    "representations": {"semantic": {"kind": "dense", "vector": [1, 0]}},
+                    "representations": {
+                        "semantic": {"kind": "dense", "vector": [1, 0]}
+                    },
                 }
             ]
         }

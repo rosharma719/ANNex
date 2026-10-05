@@ -597,7 +597,12 @@ Possible designs include a dedicated query-level pool plus operator-local serial
 
 ## Offline plan enumerator and regret evaluation
 
-Build an offline tool before sophisticated heuristics. It takes stored queries and executes a declared finite plan set, for example:
+The offline execution/journal/replay tool is now implemented; see
+[the evaluation guide](plan-evaluation.md). Held-out regret evidence and
+utility-model training remain future work. The finite-grid requirements below
+remain the evaluation contract.
+
+The offline tool takes stored queries and executes a declared finite plan set, for example:
 
 ```text
 dense exact

@@ -2,6 +2,12 @@
 
 Commands run from the workspace root. Reporting rules live in [BENCHMARK_POLICY.md](../BENCHMARK_POLICY.md); historical corrections live in [RESULTS.md](../crates/annex-multivector/benchmark/RESULTS.md).
 
+## Counterfactual physical-plan evaluation
+
+Run a declared request grid against a quiescent service and replay its durable
+observations into Pareto/regret reports. See [plan evaluation](plan-evaluation.md)
+for inputs, commands, failure accounting and measurement limits.
+
 ## NYTimes (256-D Angular)
 
 Download instructions live in [data-download.md](./data-download.md).

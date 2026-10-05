@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Offline counterfactual physical-plan evaluation against the HTTP service, with
+  frozen initial planner decisions, durable per-query observations, replayable
+  Pareto/regret reports, failure accounting and snapshot checks.
+
 - SQ8 `NeighborBlock` baseline for HNSW L0 traversal. Quantization now materializes immutable
   32-neighbor expansion blocks with neighbor IDs and copied SQ8 codes, so compressed traversal
   reads codes sequentially instead of gathering every neighbor from the global code array. The

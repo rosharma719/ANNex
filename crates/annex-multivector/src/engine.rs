@@ -1560,7 +1560,7 @@ impl MultiVectorIndex {
     }
     /// Build an HNSW index over persisted FDEs. Exact FDE scan remains available as an oracle.
     pub fn build_fde_ann(&self, m: usize, ef_construct: usize) -> Result<usize, IndexError> {
-        self.build_ann(None, m, ef_construct)
+        self.build_ann(None, m, ef_construct, None)
     }
 
     /// Rebuild the FDE ANN graph if the delta overlay has grown past
@@ -1617,14 +1617,41 @@ impl MultiVectorIndex {
         m: usize,
         ef_construct: usize,
     ) -> Result<usize, IndexError> {
-        self.build_ann(Some(field), m, ef_construct)
+        self.build_ann(Some(field), m, ef_construct, None)
     }
+    /// Build FDE ANN with a bounded linking worker count.
+    pub fn build_fde_ann_with_threads(
+        &self,
+        m: usize,
+        ef_construct: usize,
+        threads: usize,
+    ) -> Result<usize, IndexError> {
+        self.build_ann(None, m, ef_construct, Some(threads))
+    }
+
+    /// Build dense ANN with a bounded linking worker count.
+    pub fn build_dense_ann_with_threads(
+        &self,
+        field: &str,
+        m: usize,
+        ef_construct: usize,
+        threads: usize,
+    ) -> Result<usize, IndexError> {
+        self.build_ann(Some(field), m, ef_construct, Some(threads))
+    }
+
     fn build_ann(
         &self,
         field: Option<&str>,
         m: usize,
         ef_construct: usize,
+        threads: Option<usize>,
     ) -> Result<usize, IndexError> {
+        if threads == Some(0) {
+            return Err(IndexError::Invalid(
+                "linking thread count must be positive".into(),
+            ));
+        }
         if !(1..=128).contains(&m) || !(1..=65_536).contains(&ef_construct) {
             return Err(IndexError::Invalid(
                 "HNSW m must be in 1..=128 and ef_construct in 1..=65536".into(),
@@ -1646,8 +1673,8 @@ impl MultiVectorIndex {
         let mut hnsw = HNSWIndex::new(DistanceMetric::Dot, m, ef_construct, 16, dimension);
         // Build in chunks so peak memory stays bounded regardless of corpus
         // size (each chunk holds only its own decoded vectors). Each chunk is
-        // handed to par_insert_batch, which uses annex-core's concurrent
-        // &self insert path to parallelise linking across threads.
+        // linked through annex-core's concurrent insert path. HTTP serving
+        // selects one caller-thread worker; library defaults remain parallel.
         const CHUNK: usize = 4096;
         for (chunk_idx, chunk_ids) in ids.chunks(CHUNK).enumerate() {
             let base = chunk_idx * CHUNK;
@@ -1668,7 +1695,11 @@ impl MultiVectorIndex {
                     Ok::<_, IndexError>(((base + offset) as u64, vector))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            hnsw.par_insert_batch(&entries).map_err(|error| {
+            let inserted = match threads {
+                Some(threads) => hnsw.par_insert_batch_with_threads(&entries, threads),
+                None => hnsw.par_insert_batch(&entries),
+            };
+            inserted.map_err(|error| {
                 IndexError::Invalid(format!("HNSW par_insert_batch failed: {error}"))
             })?;
         }
